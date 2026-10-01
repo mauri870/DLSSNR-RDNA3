@@ -1,0 +1,47 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_GOOGLE_include_directive : require
+#include "e4m3_emul.glsl"
+// Every f32 bit pattern, and every pair of f16 bit patterns, against the bit-level rounding the
+// RDNA3 build used before the magic-constant forms: round to nearest even by integer arithmetic.
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) buffer Params { uint base; uint mode; } params;
+layout(set = 0, binding = 1) buffer Result { uint count; uint first_input; uint first_got; uint first_want; } result;
+
+float reference(float x) {
+    const float a = abs(x);
+    float q;
+    if (a < 0.015625) {
+        q = roundEven(a * 512.0) * (1.0 / 512.0);
+    } else {
+        uint u = floatBitsToUint(a);
+        u += 0x7FFFFu + ((u >> 20) & 1u);
+        q = uintBitsToFloat(u & 0xFFF00000u);
+    }
+    q = a >= 448.0 ? 448.0 : q;
+    return x < 0.0 ? -q : q;
+}
+
+void report(uint input_bits, float got, float want) {
+    if (floatBitsToUint(got) == floatBitsToUint(want) || (got == 0.0 && want == 0.0)) return;
+    if (atomicAdd(result.count, 1u) == 0u) {
+        result.first_input = input_bits;
+        result.first_got = floatBitsToUint(got);
+        result.first_want = floatBitsToUint(want);
+    }
+}
+
+void main() {
+    const uint i = params.base + gl_GlobalInvocationID.x;
+    if (params.mode == 0u) {                          // f32
+        const float x = uintBitsToFloat(i);
+        if (isnan(x)) return;
+        report(i, nr_e4m3_round(x), reference(x));
+    } else {                                          // f16 pair: low and high halves
+        const f16vec2 v = unpackFloat2x16(i);
+        if (isnan(float(v.x)) || isnan(float(v.y))) return;
+        const f16vec2 r = nr_e4m3_round_pair(v);
+        report(i, float(r.x), reference(float(v.x)));
+        report(i, float(r.y), reference(float(v.y)));
+    }
+}

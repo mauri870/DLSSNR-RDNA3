@@ -232,7 +232,7 @@
 // directly; an f16 input is already on f16's grid, so it is the same function.
 #include "e4m3_emul.glsl"
 
-f16vec2 nr_quant_pair(f16vec2 v) { return f16vec2(nr_quant_e4m3(v.x), nr_quant_e4m3(v.y)); }
+f16vec2 nr_quant_pair(f16vec2 v) { return nr_e4m3_round_pair(v); }
 f16vec2 nr_quant_pair32(vec2 x)  { return f16vec2(nr_quant_e4m3(x.x), nr_quant_e4m3(x.y)); }
 f16vec2 nr_quant_pair_bare(f16vec2 v) { return nr_quant_pair(v); }
 #define NR_HAVE_QUANT_PAIR32 1
