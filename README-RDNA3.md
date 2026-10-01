@@ -21,20 +21,20 @@ The network's time per frame on an RX 7900 XTX, one pass, measured from submit t
 
 | | 1080p | 1440p | 4K |
 | --- | --- | --- | --- |
-| RDNA3 (this branch) | 22 ms | 39 ms | 84 ms |
+| RDNA3 (this branch) | 17 ms | 30 ms | 63 ms |
 | RDNA4, RX 9070 XT (main README) | 5.6 ms | 9.7 ms | 21.9 ms |
 
-That is about four times the RDNA4 cost, and it is only starting to be optimised for the card. Running the
+That is about three times the RDNA4 cost, and optimisation for the card is under way. Running the
 network at a lower resolution than the frame is the lever that exists today: `model_scale` in
 `dlssnr-amd.ini` ("Model Resolution" on the add-on's page in the game, 25 to 100 %) runs the network on a
 smaller copy of the frame and carries its edit back onto the full-resolution frame. At 4K:
 
 | Model resolution | Network extent (about) | Time | PSNR vs NVIDIA's full-resolution output |
 | --- | --- | --- | --- |
-| 100 % | 3840x2160 | 84 ms | 49.02 dB |
-| 75 % | 2880x1620 | 50 ms | 38.38 dB |
-| 50 % | 1920x1080 | 23 ms | 32.86 dB |
-| 37.5 % | 1440x810 | 16 ms | 30.93 dB |
+| 100 % | 3840x2160 | 63 ms | 49.02 dB |
+| 75 % | 2880x1620 | 38 ms | 38.38 dB |
+| 50 % | 1920x1080 | 18 ms | 32.86 dB |
+| 37.5 % | 1440x810 | 12 ms | 30.93 dB |
 
 The PSNR column compares against NVIDIA's output at full resolution, so it measures how much of the
 network's fine detail is lost, not how the frame looks. The network needs about 5.3 GB of video memory
