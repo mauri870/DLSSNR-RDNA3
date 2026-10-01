@@ -32,10 +32,11 @@ smaller copy of the frame and carries its edit back onto the full-resolution fra
 
 | Model resolution | Network extent (about) | Time | PSNR vs NVIDIA's full-resolution output |
 | --- | --- | --- | --- |
-| 100 % | 3840x2160 | 58 ms | 49.02 dB |
+| 100 % | 3840x2160 | 57 ms | 49.02 dB |
 | 75 % | 2880x1620 | 35 ms | 38.38 dB |
-| 50 % | 1920x1080 | 17 ms | 32.86 dB |
-| 37.5 % | 1440x810 | 12 ms | 30.93 dB |
+| 50 % | 1920x1080 | 16 ms | 32.86 dB |
+| 37.5 % | 1440x810 | 11 ms | 30.93 dB |
+| 25 % | 960x540 | 8 ms | 29.19 dB |
 
 The PSNR column compares against NVIDIA's output at full resolution, so it measures how much of the
 network's fine detail is lost, not how the frame looks; at 50 % the colour, contrast and edge treatment
@@ -197,15 +198,21 @@ timings meaningless.
 
 ## In-game results
 
-Call to Arms - Gates of Hell (Direct3D 11 under Proton, ReShade route with the VORT motion vectors and
-generic depth), 3840x2160 on an RX 7900 XTX, Mesa 26.2.3:
+Call to Arms - Gates of Hell: Ostfront (Direct3D 11 under Proton, ReShade route with the VORT motion
+vectors and generic depth), 3840x2160 with every setting at maximum, RX 7900 XTX, Mesa 26.2.3, this
+build:
 
-| Setting | Frame rate |
-| --- | --- |
-| Neural rendering off | 86 fps (11.6 ms) |
-| Model resolution 100 % (a build whose network took about 117 ms) | 8 fps (130 ms) |
-| Model resolution 50 % (a build whose network took about 23 ms) | 23 fps |
+| Setting | Frame rate | Frame time | Added by the network | Offline, same setting |
+| --- | --- | --- | --- | --- |
+| Neural rendering off | 112 fps | 8.9 ms | | |
+| Model resolution 100 % | 15 fps | 66.7 ms | 57.8 ms | 57.5 ms |
+| Model resolution 50 % | 37 fps | 27.0 ms | 18.1 ms | 16.4 ms |
 
-The add-on found the motion vectors and the depth buffer, and reported a GPU cost of 119.7 ms a frame at
-100 %, which matches the 117 ms measured offline. The build described here is faster than both builds
-listed (58 ms at 100 %, 17 ms at 50 %) and has not been run in a game yet.
+The time the network adds in the game is what `check_rdna3.py --perf` and `run_frame` measure offline, to
+within a millisecond or two, so a millisecond saved in the harness is a millisecond in the game. That
+also gives the frame rates to expect from the other settings in this game, which have not been run:
+about 45 fps at 37.5 % (8.9 + 11 ms) and about 60 fps at 25 % (8.9 + 8 ms); 75 % would be about 23 fps.
+The add-on finds the motion vectors and the depth buffer and reports its own GPU cost, which agrees.
+
+An earlier build, in the Gates of Hell scene it was first tried in (86 fps with neural rendering off),
+gave 8 fps at 100 % and 23 fps at 50 % when its network took about 117 and 23 ms.
