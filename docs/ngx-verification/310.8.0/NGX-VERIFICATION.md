@@ -66,6 +66,25 @@ frame and a close-up.
 Raw outputs (`single-frame-outputs/`): both sides at every resolution as lossless 8-bit PNG, exactly the
 pixels compared above.
 
+### The RDNA3 build
+
+The same three inputs and settings through the RDNA3 build (`linux/shaders/rdna3/`) on an AMD Radeon
+RX 7900 XTX (Mesa 26.2.3 RADV), against the same NVIDIA outputs, measured the same way. The RDNA3 build
+has no FP8 instructions: it holds the network's e4m3 values as FP16 and multiplies them in the FP16 matrix
+instructions with FP32 accumulation, so the products are the ones the FP8 build forms and the activation
+arena and weights take twice the memory. The run goes through `nr::Runtime` the way a game does
+(8-bit RGBA input, the defaults above, one network pass, 8-bit output); the output is the same on every
+run. Single frames only: the moving sequences have not been run on RDNA3.
+
+| Resolution | PSNR vs NVIDIA | SSIM vs NVIDIA | Correlation of the edits | Mean difference (1/255, R G B) | Pixels with all channels within one 8-bit step |
+|---|---|---|---|---|---|
+| 1920x1080 | 45.21 dB | 0.9959 | 0.9940 | +0.31 +0.43 +0.41 | 65.4% |
+| 2560x1440 | 47.99 dB | 0.9968 | 0.9953 | +0.10 +0.10 +0.08 | 80.7% |
+| 3840x2160 | 48.95 dB | 0.9969 | 0.9953 | +0.04 +0.05 +0.04 | 85.6% |
+
+Outputs: `single-frame-outputs/<resolution>_dlssnr-amd-rdna3.png`; numbers in
+`single-frame-results-rdna3.json`.
+
 ## Moving sequences
 
 ### Input and settings
