@@ -938,7 +938,11 @@
             const f16vec2 x=NR_N2_XB(NR_OPK(xb[m][n],c),NR_OPK(xb[m][n],c+1));
 #endif
             const uint off=pc.rs_off+uint(n)*16u+NR_ROW(c);
+#if NR_RESIDUAL_F32
+            const vec2 residual=vec2(x)*vec2(wgt_f32[off],wgt_f32[off+2u]);
+#else
             const f16vec2 residual=x*nr_residual_scale(off);
+#endif
             stream_contract[n][m][c]=float(residual.x);
             stream_contract[n][m][c+1]=float(residual.y);
         }
