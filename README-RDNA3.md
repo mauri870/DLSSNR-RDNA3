@@ -33,10 +33,16 @@ smaller copy of the frame and carries its edit back onto the full-resolution fra
 | Model resolution | Network extent (about) | Time | PSNR vs NVIDIA's full-resolution output |
 | --- | --- | --- | --- |
 | 100 % | 3840x2160 | 57 ms | 49.02 dB |
-| 75 % | 2880x1620 | 35 ms | 38.38 dB |
-| 50 % | 1920x1080 | 16 ms | 32.86 dB |
-| 37.5 % | 1440x810 | 11 ms | 30.93 dB |
-| 25 % | 960x540 | 8 ms | 29.19 dB |
+| 75 % | 2880x1620 | 35 ms | 39.39 dB |
+| 50 % | 1920x1080 | 16 ms | 35.29 dB |
+| 37.5 % | 1440x810 | 11 ms | 33.83 dB |
+| 25 % | 960x540 | 8 ms | 32.66 dB |
+
+The edit of a network run below the frame's size is stronger than the full-size run's (at half size its RMS
+is about a third higher, and it is contrast, not detail), so the transfer pass scales it by
+`0.49 + 0.52 * model_scale`; that fit is worth 1.0 dB at 75 %, 2.4 dB at 50 %, 2.9 dB at 37.5 % and 3.5 dB at
+25 %, and costs no time. The rest of the loss is the network itself: a perfectly band-limited copy of the full-size
+edit would score 46 to 47 dB at 50 %, so no way of upsampling the answer can recover it.
 
 The PSNR column compares against NVIDIA's output at full resolution, so it measures how much of the
 network's fine detail is lost, not how the frame looks; at 50 % the colour, contrast and edge treatment
