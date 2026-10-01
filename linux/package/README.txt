@@ -7,7 +7,8 @@ runtime is neither needed nor called.
 
 Requirements
 ------------
-- RX 9000 series (RDNA4) graphics card
+- RX 9000 series (RDNA4) graphics card; or RX 7000 series (RDNA3) with the package whose name ends in -rdna3
+  (about five times slower than RDNA4: see README-RDNA3.md in the source tree)
 - Mesa 26.2 or newer (RADV driver)
 - Proton: tested on GE-Proton 11-7
 - python3 (the installer and the model extraction use it)
