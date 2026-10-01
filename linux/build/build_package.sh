@@ -11,6 +11,8 @@
 #   NR_MODEL=dlssnr.bin put this model in the package (made from your own DLL by
 #                       linux/package/model-tools/extract_model.sh); without it
 #                       install.sh needs --dll
+#   NR_GPU=rdna3|rdna4  the network to build (linux/build/arch/); default rdna4. An rdna3 package
+#                       carries -rdna3 in its name
 #   NR_VERSION=...      override the version (default: from the git tags, linux/build/version.sh)
 set -euo pipefail
 model=${NR_MODEL:+$(realpath -- "$NR_MODEL")}
@@ -30,7 +32,9 @@ reshade_inc=artifacts/ref/DLSS5-Feeder/external/reshade/include
 for dir in "$minhook" "$reshade_inc" artifacts/ref/reshade-shaders artifacts/ref/vort_Shaders; do
     [[ -d "$dir" ]] || { echo "missing reference tree: $dir" >&2; exit 1; }
 done
-source linux/build/arch/rdna4.sh
+gpu=${NR_GPU:-rdna4}
+[[ -f "linux/build/arch/$gpu.sh" ]] || { echo "NR_GPU must be rdna3 or rdna4" >&2; exit 2; }
+source "linux/build/arch/$gpu.sh"
 
 # ---- compile ----------------------------------------------------------------
 common=(-std=c++17 -O2 -DNDEBUG -Itoolchain/Vulkan-Headers/include -Ilinux/src -Ilinux/src/core -Ilinux/src/layer -Ilinux/src/pe -I"$out")
@@ -213,7 +217,7 @@ chmod +x "$pkg/install.sh" "$mt/extract_model.sh"
 
 # ---- archive ------------------------------------------------------------------
 version=$(bash linux/build/version.sh)
-archive="DLSSNR-AMD-Vulkan-Linux-$version-$arch.tar.gz"
+archive="DLSSNR-AMD-Vulkan-Linux-$version-$arch$([[ "$gpu" == rdna4 ]] || echo "-$gpu").tar.gz"
 tar -C "$pkg" -czf "$out/$archive" .
 # The finished package goes beside the installer sources in linux/package/ (not in git).
 mv -f -- "$out/$archive" "linux/package/$archive"   # one copy only; package-build/ is scratch

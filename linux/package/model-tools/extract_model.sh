@@ -5,7 +5,7 @@
 #
 # Only reads the weight data in the DLL; never loads or runs it. Every entry is checked
 # against model-files.sha256, and the file is written only if it matches the tested model
-# byte for byte.
+# byte for byte, whichever build of the DLL it came from.
 set -euo pipefail
 here=$(cd -- "$(dirname -- "$0")" && pwd)
 src=${1:?usage: extract_model.sh <nvngx_dlssnr.dll or .zip> <output .bin>}
@@ -20,13 +20,15 @@ mkdir -p -- "$work/graph"
 cp -- "$here/descriptor.json" "$work/graph/"
 
 if ! python3 "$here/inspect_nr.py" "$src" --output "$work/inventory" --extract > "$work/inspect.json" 2> "$work/inspect.err"; then
-    echo "Cannot read nvngx_dlssnr weights from $src (needs nvngx_dlssnr.dll version 310.8.0, or its zip)." >&2
+    echo "Cannot read nvngx_dlssnr weights from $src (needs nvngx_dlssnr.dll with the 310.8.0 weights, or its zip)." >&2
     exit 1
 fi
 got=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["dll_sha256"])' "$work/inspect.json")
 if [[ "$got" != "$want" ]]; then
-    echo "This is not nvngx_dlssnr 310.8.0 (SHA256 $got). The 310.8.0 DLL is required." >&2
-    exit 1
+    # Another build of the DLL can carry the same weights (the streamline package's does); the
+    # check that decides is pack_model.py --verify below, which writes nothing unless every entry
+    # matches model-files.sha256.
+    echo "note: this DLL is not 310.8.0 (SHA256 $got); using it only if its weights are identical." >&2
 fi
 
 cd -- "$here"
