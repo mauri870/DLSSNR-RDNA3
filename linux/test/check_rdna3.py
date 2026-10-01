@@ -4,6 +4,7 @@
     python3 linux/test/check_rdna3.py --model dlssnr.bin             # check against the golden
     python3 linux/test/check_rdna3.py --model dlssnr.bin --perf      # also the time per frame
     python3 linux/test/check_rdna3.py --model dlssnr.bin --profile   # and the time of every kernel at 4K
+    python3 linux/test/check_rdna3.py --model dlssnr.bin --isa       # and instruction mix, VGPRs, spills
     python3 linux/test/check_rdna3.py --model dlssnr.bin --update-golden   # record the current state
 
 What it runs, on the first discrete GPU:
@@ -227,6 +228,29 @@ def profile(name="4k"):
     print("\n".join(keep))
 
 
+def isa(name="1080p"):
+    """Instruction mix, peak VGPRs and spills of every pipeline (RADV_DEBUG=shaders + isa_stats.py)."""
+    sys.path.insert(0, str(ROOT / "linux" / "test"))
+    import isa_stats
+    w, h = FRAMES[name]
+    in_path, _ = frame_inputs(name)
+    plan = BUILD / f"plan_{name}.txt"
+    plan.write_text(run([str(BUILD / "mkplan"), str(w), str(h)]))
+    blob = BUILD / f"in_{name}.f32"
+    (np.fromfile(in_path, np.uint8).reshape(-1, 4).astype(np.float32) / 255).tofile(blob)
+    argv = [str(BUILD / "nr_graph"), "--plan", str(plan), "--model-pack", str(BUILD / "inst/dlssnr-amd/dlssnr.bin"),
+            "--spv-dir", str(ROOT / "build/linux/rdna3/network"), "--host-boundary", "--reuse",
+            "--source-width", str(w), "--source-height", str(h), "--in-image", str(blob)]
+    wiring = run(argv + ["--wiring"])
+    order = []
+    for line in wiring.splitlines():
+        t = line.split()
+        if len(t) > 1 and re.fullmatch(r"b\d+l\d+", t[0]) and t[1] not in order:
+            order.append(t[1])
+    r = subprocess.run(argv, cwd=ROOT, capture_output=True, text=True, env=dict(os.environ, RADV_DEBUG="shaders"))
+    print(isa_stats.render(isa_stats.stats(r.stdout + r.stderr, ["noisefield"] + order)))
+
+
 def check_layers(golden_rows, record):
     rows = layer_hashes()
     if record:
@@ -248,6 +272,8 @@ def main():
     ap.add_argument("--perf", type=int, nargs="?", const=20, default=0, help="also time N passes per frame (default 20)")
     ap.add_argument("--tolerance", choices=["exact", "close"], default="exact")
     ap.add_argument("--skip-build", action="store_true")
+    ap.add_argument("--isa", nargs="?", const="1080p", choices=list(FRAMES),
+                    help="also print instruction mix, VGPRs and spills of every pipeline (default 1080p)")
     ap.add_argument("--profile", nargs="?", const="4k", choices=list(FRAMES), help="also print the time of every kernel (default 4k)")
     args = ap.parse_args()
     os.chdir(ROOT)
@@ -269,6 +295,8 @@ def main():
         print("layers: " + ("identical" if layer_note is None else layer_note))
     if args.profile:
         profile(args.profile)
+    if args.isa:
+        isa(args.isa)
     if perf:
         print("time per frame (network, wall): " + "  ".join(f"{k} {v:.1f} ms" for k, v in perf.items()))
     if args.update_golden:
