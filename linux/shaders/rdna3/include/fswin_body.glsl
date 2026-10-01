@@ -679,11 +679,19 @@
         // of LDS. Processing h in pairs halves the loads: 4 loads and 8 MMAs a
         // k step where it was 4 and 4. The accumulators double to 8 (64 VGPRs).
         // Same k order into each accumulator, so the arithmetic is unchanged.
+        // NR_EXPAND_KLOOP=[[dont_unroll]] keeps the k loop of this stage rolled. NIR
+        // otherwise unrolls it at C=64 and C=128 (4 and 8 steps): the 16 live
+        // accumulators plus the unrolled fragments then spill (pds128 1202 scratch
+        // instructions, 286 rolled) and the code outgrows the instruction cache.
+        // C=256 (16 steps) is rolled already.
+#ifndef NR_EXPAND_KLOOP
+#define NR_EXPAND_KLOOP
+#endif
         for (int h = 0; h < NR_HGF; h += NR_EXPAND_GROUP) {
             NR_ACCF a[NR_EXPAND_GROUP][NR_MF];
             for (int p = 0; p < NR_EXPAND_GROUP; ++p)
                 for (int m = 0; m < NR_MF; ++m) a[p][m] = NR_ACCZERO;
-            for (int k = 0; k < NR_CF; ++k) {
+            NR_EXPAND_KLOOP for (int k = 0; k < NR_CF; ++k) {
                 NR_FRAG_B xbk[NR_MF];
                 for (int m = 0; m < NR_MF; ++m)
                     NR_LOAD_B(xbk[m], lds_x, NR_LXB_
