@@ -233,7 +233,11 @@
 #define NR_XB(m, k) xb[m][k]
 #endif
 #ifdef NR_INPUT_F16
+#if NR_XH_ACC
+    NR_F16 xh[NR_MF][NR_CF][8];
+#else
     NR_FRAG_B16 xh[NR_MF][NR_CF];
+#endif
 #endif
 #ifdef NR_FUSED_IMAGE_INPUT
     NR_FRAG_B16 image_features[NR_MF];
@@ -428,10 +432,10 @@
             // tile branch NR_PRE_FULL removes (see the bit-64 note below).
             for(int j=0;j<8;j+=2) {
                 precise NR_F16 nr_lh=NR_F16(lifted[j]); precise NR_F16 nr_lh1=NR_F16(lifted[j+1]);
-                NR_OPPUT(xh[m][k], j, f16vec2(nr_lh, nr_lh1))
+                NR_XHPUT(xh[m][k], j, f16vec2(nr_lh, nr_lh1))
             }
 #else
-            for(int j=0;j<8;j+=2) NR_OPPUT(xh[m][k], j, f16vec2(NR_F16(lifted[j]), NR_F16(lifted[j+1])))
+            for(int j=0;j<8;j+=2) NR_XHPUT(xh[m][k], j, f16vec2(NR_F16(lifted[j]), NR_F16(lifted[j+1])))
 #endif
 #elif defined(NR_FUSED_UPS_BLEND)
             const uint q=(tok0+uint(m)*16u)/16u;
@@ -590,21 +594,21 @@
             {
                 // a store behind a condition that is never true keeps this
                 // a scalar branch; flattened, it was four v_cndmask a fragment.
-                for (int j=0;j<16;++j) xh[m][k][j]=NR_F16(0.0);
+                for (int j=0;j<NR_XH_N;++j) xh[m][k][j]=NR_F16(0.0);
                 if (gl_NumWorkGroups.x == 0xffffffffu) act_e4m3[pc.o_off] = NR_E4M3(0.0);
             }
 #else
-                for (int j=0;j<16;++j) xh[m][k][j]=NR_F16(0.0);
+                for (int j=0;j<NR_XH_N;++j) xh[m][k][j]=NR_F16(0.0);
 #endif
 #endif
 #if !NR_OOB_BRANCH
             if(NR_TOOB((tok0+uint(m)*16u)/16u))
-                for (int j=0;j<16;++j) xh[m][k][j]=NR_F16(0.0);
+                for (int j=0;j<NR_XH_N;++j) xh[m][k][j]=NR_F16(0.0);
 #endif
             // Quantise the pair of components that are accumulator components j, j+1 of
             // this lane (rows 2j+h, 2j+2+h) and hand them to the operand across the halves.
             for (int j=0;j<8;j+=2) {
-                const fe4m3vec2 q=NR_QP_XB(f16vec2(NR_OPK(xh[m][k],j),NR_OPK(xh[m][k],j+1)));
+                const fe4m3vec2 q=NR_QP_XB(f16vec2(NR_XHK(xh[m][k],j),NR_XHK(xh[m][k],j+1)));
                 NR_OPPUT(xb[m][k], j, q)
             }
 #else
@@ -679,11 +683,19 @@
         // of LDS. Processing h in pairs halves the loads: 4 loads and 8 MMAs a
         // k step where it was 4 and 4. The accumulators double to 8 (64 VGPRs).
         // Same k order into each accumulator, so the arithmetic is unchanged.
+        // NR_EXPAND_KLOOP=[[dont_unroll]] keeps the k loop of this stage rolled. NIR
+        // otherwise unrolls it at C=64 and C=128 (4 and 8 steps): the 16 live
+        // accumulators plus the unrolled fragments then spill (pds128 1202 scratch
+        // instructions, 286 rolled) and the code outgrows the instruction cache.
+        // C=256 (16 steps) is rolled already.
+#ifndef NR_EXPAND_KLOOP
+#define NR_EXPAND_KLOOP
+#endif
         for (int h = 0; h < NR_HGF; h += NR_EXPAND_GROUP) {
             NR_ACCF a[NR_EXPAND_GROUP][NR_MF];
             for (int p = 0; p < NR_EXPAND_GROUP; ++p)
                 for (int m = 0; m < NR_MF; ++m) a[p][m] = NR_ACCZERO;
-            for (int k = 0; k < NR_CF; ++k) {
+            NR_EXPAND_KLOOP for (int k = 0; k < NR_CF; ++k) {
                 NR_FRAG_B xbk[NR_MF];
                 for (int m = 0; m < NR_MF; ++m)
                     NR_LOAD_B(xbk[m], lds_x, NR_LXB_
@@ -933,7 +945,7 @@
     for(int n=0;n<NR_CF;++n) for(int m=0;m<NR_MF;++m)
         for(int c=0;c<8;c+=2) {
 #ifdef NR_INPUT_F16
-            const f16vec2 x=f16vec2(NR_OPK(xh[m][n],c),NR_OPK(xh[m][n],c+1));
+            const f16vec2 x=f16vec2(NR_XHK(xh[m][n],c),NR_XHK(xh[m][n],c+1));
 #else
             const f16vec2 x=NR_N2_XB(NR_OPK(xb[m][n],c),NR_OPK(xb[m][n],c+1));
 #endif
@@ -1153,7 +1165,7 @@
         for (int m=0;m<NR_MF;++m) for(int c=0;c<8;c+=2) {
 #if NR_RESIDUAL_F32
 #ifdef NR_INPUT_F16
-            const vec2 x=vec2(NR_OPK(xh[m][n],c),NR_OPK(xh[m][n],c+1));
+            const vec2 x=vec2(NR_XHK(xh[m][n],c),NR_XHK(xh[m][n],c+1));
 #else
             const vec2 x=vec2(NR_OPK(NR_XB(m,n),c),NR_OPK(NR_XB(m,n),c+1));
 #endif
@@ -1161,7 +1173,7 @@
             const vec2 residual=x*vec2(wgt_f32[off],wgt_f32[off+2u]);
 #else
 #ifdef NR_INPUT_F16
-            const f16vec2 x=f16vec2(NR_OPK(xh[m][n],c),NR_OPK(xh[m][n],c+1));
+            const f16vec2 x=f16vec2(NR_XHK(xh[m][n],c),NR_XHK(xh[m][n],c+1));
 #else
             const f16vec2 x=NR_N2_XB(NR_OPK(NR_XB(m,n),c),NR_OPK(NR_XB(m,n),c+1));
 #endif
@@ -1182,7 +1194,7 @@
 #else
         for (int m=0;m<NR_MF;++m) for(int c=0;c<8;++c) {
 #ifdef NR_INPUT_F16
-            const float x=float(NR_OPK(xh[m][n],c));
+            const float x=float(NR_XHK(xh[m][n],c));
 #else
             const float x=float(NR_OPK(NR_XB(m,n),c));
 #endif
@@ -1242,7 +1254,7 @@
 #elif defined(NR_INPUT_F16)
                 // The adapter retains its FP16 lift/blend for the residual.
                 // PTX mul.f16x2 rounds before add.f16x2; only the MMA input is FP8.
-                const NR_F16 residual = NR_F16(NR_OPK(xh[m][n],c) *
+                const NR_F16 residual = NR_F16(NR_XHK(xh[m][n],c) *
                     NR_F16(wgt_f32[pc.rs_off + uint(n)*16u + NR_ROW(c)]));
                 const float v = float(NR_F16(NR_F16(a[m][c]) + residual));
 #else
@@ -2275,6 +2287,10 @@
 #if NR_HEADS > 1
         // The next head reuses lds_k and lds_v; at one head there is no next.
         NR_BODY_BARRIER();
+#elif defined(NR_DS_PROJECT) && NR_FWAVES > 1
+        // The pooled pixels are staged in lds_v, which the other wave may still be
+        // reading as V.
+        NR_BODY_BARRIER();
 #endif
     }
 
@@ -2923,7 +2939,9 @@
         for (int ol = 0; ol < 2 * NR_DF; ++ol) {
             const int of = nrhw_h * 2 * NR_DF + ol;
 #else
-        for (int of = 0; of < 2 * NR_CF; ++of) {
+        // Two waves share the 2C output fragments; both read the whole pooled block.
+        for (int ofl = 0; ofl < 2 * NR_CF / NR_FWAVES; ++ofl) {
+            const int of = int(wave) * (2 * NR_CF / NR_FWAVES) + ofl;
 #endif
             NR_ACCF acc = NR_ACCZERO;
             for (int kf = 0; kf < NR_CF; ++kf) {
