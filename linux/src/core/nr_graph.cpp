@@ -1328,6 +1328,9 @@ private:
 struct NrSession {
     nrvk::Context ctx;
     nrvk::Buffer act{}, wgt{};
+    // RDNA3: the arenas' FP16 twins, which hold the e4m3 values as FP16 elements at the
+    // same element index (nrvk::Context::fp16_twin; shaders reach them by block name).
+    nrvk::Buffer act_e{}, wgt_e{};
     nrvk::Context::Image tex_in{}, surf0{}, surf1{};
     std::map<std::string, nrvk::Kernel> kern;
     std::vector<Disp> disp;
@@ -3924,7 +3927,9 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     // fetches 16 FP8 weights at once. Original files and K order stay intact.
     if (weight_layout != 0) {
         size_t packed_count=0;
-        auto pack_matrix=[&](uint32_t offset,size_t N,size_t K) {
+        // `plain_tiles` (RDNA3): the two tiles of a pair stay adjacent but each keeps its
+        // [row][k] order; the lane-owned order below is a gfx12 fragment register layout.
+        auto pack_matrix=[&](uint32_t offset,size_t N,size_t K,bool plain_tiles=false) {
             const size_t bytes=N*K;
             if(N%32 || K%16 || size_t(offset)+bytes>wblob.size())
                 throw std::runtime_error("packed weight matrix bounds");
@@ -3933,7 +3938,9 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             for(size_t n=0;n<N/16;n+=2) for(size_t k=0;k<K/16;++k)
                 for(size_t lane=0;lane<32;++lane) for(size_t j=0;j<2;++j) for(size_t c=0;c<8;++c) {
                     const size_t src=((n+j)*(K/16)+k)*256+(lane%16)*16+(lane/16)*8+c;
-                    const size_t dst=((n/2)*(K/16)+k)*512+lane*16+j*8+c;
+                    const size_t dst=plain_tiles
+                        ? ((n/2)*(K/16)+k)*512+j*256+(lane%16)*16+(lane/16)*8+c
+                        : ((n/2)*(K/16)+k)*512+lane*16+j*8+c;
                     packed[dst]=orig[src];
                 }
             wblob.write(offset, packed.data(), bytes); ++packed_count;
@@ -3946,9 +3953,9 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 PushFfwd3 p{};
                 if(pd.push.size()!=sizeof p) throw std::runtime_error("packed FFWD push mismatch");
                 std::memcpy(&p,pd.push.data(),sizeof p);
-                pack_matrix(p.a_off,FF_GROUPS*FF_R,FF_K);
-                pack_matrix(p.q0_off,FF_GROUPS*FF_J,FF_R);
-                pack_matrix(p.q2_off,FF_GROUPS*FF_OUT,FF_J);
+                pack_matrix(p.a_off,FF_GROUPS*FF_R,FF_K,NR_ARCH_RDNA3);
+                pack_matrix(p.q0_off,FF_GROUPS*FF_J,FF_R,NR_ARCH_RDNA3);
+                pack_matrix(p.q2_off,FF_GROUPS*FF_OUT,FF_J,NR_ARCH_RDNA3);
                 continue;
             }
             // NR_ATTN_WPAIR (research): the C=512 attention's QKV matrix [1536][512] in the same pair layout.
@@ -3978,6 +3985,8 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 continue;
             }
             uint32_t C=0;
+            // RDNA3: the fused Swin kernels read plain tile-blocked [row][k] tiles.
+            if(NR_ARCH_RDNA3 && pd.kern.rfind("fswin",0)==0) continue;
             if((weight_layout==3 || weight_layout==5) && pd.kern.rfind("fswin",0)==0 &&
                pd.kern.size()>=2 && pd.kern.substr(pd.kern.size()-2)=="32") {
                 PushFSwin p{};
@@ -4944,6 +4953,12 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         std::printf("NR_PROF region: word offset %zu, %zu words\n", prof_off, prof_words);
     }
     act = ctx.buffer(act_total); wgt = ctx.buffer(wblob.size());
+#if NR_ARCH_RDNA3
+    act_e = ctx.buffer(VkDeviceSize(act_total) * 2); wgt_e = ctx.buffer(VkDeviceSize(wblob.size()) * 2);
+    ctx.fp16_twin[act.handle] = act_e.handle; ctx.fp16_twin[wgt.handle] = wgt_e.handle;
+    nr::logf("fp16 twins for e4m3 data: activation %.1f MB, weights %.1f MB",
+             double(act_total) * 2 / 1e6, double(wblob.size()) * 2 / 1e6);
+#endif
     // **The network's outside edge**: one sampled image in, two storage images
     // out. Sized from the two adapter layers' own plan rows; the extent columns
     // are (H, W) in that order, which is the transposition the gold capture
@@ -5042,6 +5057,20 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     ctx.upload_with(wgt, 0, wblob.size(), [&](VkDeviceSize off, VkDeviceSize n, uint8_t* dst) {
         wblob.read(size_t(off), dst, size_t(n));
     });
+#if NR_ARCH_RDNA3
+    {   // Every byte read as an e4m3 code. Regions that hold f16/f32/u32 data decode to
+        // garbage here, and nothing reads them through an e4m3 view.
+        std::array<uint16_t, 256> to_f16{};
+        for (int i = 0; i < 256; ++i) to_f16[size_t(i)] = tin::f_to_f16(tin::e4m3_to_f(uint8_t(i)));
+        std::vector<uint8_t> codes(size_t(nrvk::Context::kStageBytes / 2));
+        ctx.upload_with(wgt_e, 0, VkDeviceSize(wblob.size()) * 2, [&](VkDeviceSize off, VkDeviceSize n, uint8_t* dst) {
+            const size_t count = size_t(n / 2);
+            wblob.read(size_t(off / 2), codes.data(), count);
+            uint16_t* out = reinterpret_cast<uint16_t*>(dst);
+            for (size_t i = 0; i < count; ++i) out[i] = to_f16[codes[i]];
+        });
+    }
+#endif
     // The host copy is not needed again; free it before the runtime allocates.
     wblob.clear();
     timer.mark("weights-upload");
@@ -5313,6 +5342,9 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     // is exactly zero". Fill now, disarm, and every later submit keeps what the
     // seeder put there.
     runner.zero_buffer = act.handle;
+#if NR_ARCH_RDNA3
+    runner.zero_twin = act_e.handle; runner.zero_twin_bytes = VkDeviceSize(act_total) * 2;
+#endif
     runner.zero_bytes = VkDeviceSize(act_total);
     // **What arena reuse has to keep zero** (diagnostics, off unless asked for,
     // one-value-one-slot layout). NR_ARENA_UNWRITTEN=1 fills the values with a
@@ -5509,6 +5541,7 @@ int main(int argc, char** argv) try {
     const int rc = S.build(argc, argv);
     if (rc) return rc == 2 ? 0 : 1;
     auto& ctx = S.ctx; auto& act = S.act; auto& wgt = S.wgt;
+    auto& act_e = S.act_e; (void)act_e;
     auto& tex_in = S.tex_in; auto& surf0 = S.surf0; auto& surf1 = S.surf1;
     auto& kern = S.kern; auto& disp = S.disp; auto& plan = S.plan;
     auto& voff = S.voff; auto& missing = S.missing; auto& runner = S.runner;
@@ -6783,6 +6816,49 @@ int main(int argc, char** argv) try {
     const double ms = runner.run_graph(steps, repeats);
     const double measured_end = tel.elapsed_ms();
     tel.stop();
+    // `--value-stats`: what every activation value looks like after the run, to find the first
+    // layer whose output is not a believable activation (NaN, all zero, saturated, blown up)
+    // when there is no capture to score against. Each slot is read as FP16 twice, from the
+    // e4m3 twin (RDNA3) and from the arena, because the slot's element type is not recorded.
+    if (flag(argc, argv, "--value-stats")) {
+        std::printf("%-5s %-9s %-14s %-24s %10s %9s %9s %8s %8s\n", "key", "step", "producer", "view",
+                    "elements", "rms", "absmax", "zero%", "nan+sat");
+        for (const auto& kv : S.vsize) {
+            const int key = kv.first; const size_t bytes = kv.second;
+            if (!voff.count(key) || !bytes) continue;
+            const auto use = voff.used.find(key);
+            int first = use == voff.used.end() ? -1 : use->second.first;
+            char who[48] = "-";
+            if (first >= 0 && size_t(first) < run.size())
+                std::snprintf(who, sizeof who, "b%03dl%d %.8s", run[size_t(first)]->block, run[size_t(first)]->layer,
+                              run[size_t(first)]->type.c_str() + std::min<size_t>(2, run[size_t(first)]->type.size()));
+            for (int view = 0; view < (NR_ARCH_RDNA3 ? 2 : 1); ++view) {
+                const size_t n = view == 0 ? bytes : bytes / 2;   // twin: one FP16 per e4m3 byte; arena: FP16 pairs
+                std::vector<uint16_t> h(n);
+#if NR_ARCH_RDNA3
+                if (view == 0) ctx.download(act_e, VkDeviceSize(voff.at(key)) * 2, h.data(), n * 2);
+                else ctx.download(act, voff.at(key), h.data(), n * 2);
+#else
+                ctx.download(act, voff.at(key), h.data(), n * 2);
+#endif
+                double s2 = 0, amax = 0; size_t zero = 0, bad = 0;
+                uint64_t fnv = 14695981039346656037ull;
+                for (uint16_t v : h) { fnv ^= v; fnv *= 1099511628211ull; }
+                for (uint16_t v : h) {
+                    const float x = tin::f16_to_f(v);
+                    if (!std::isfinite(x)) { ++bad; continue; }
+                    if (x == 0.0f) ++zero;
+                    if (std::fabs(x) >= 448.0f) ++bad;
+                    s2 += double(x) * x; amax = std::max(amax, double(std::fabs(x)));
+                }
+                if (zero == n) continue;   // untouched in this view
+                std::printf("%-5d %-9d %-14s %-24s %10zu %9.4g %9.4g %7.2f%% %8zu  %016llx\n", key, first, who,
+                            view == 0 ? (NR_ARCH_RDNA3 ? "e4m3 twin" : "arena as f16") : "arena as f16", n,
+                            std::sqrt(s2 / double(n)), amax, 100.0 * double(zero) / double(n), bad,
+                            (unsigned long long)fnv);
+            }
+        }
+    }
     if (g_prof_words) {
         const size_t prof_words = g_prof_words, prof_off = g_prof_off;
         // One more frame with a clean record region, then the region to a file.
