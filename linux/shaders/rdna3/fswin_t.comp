@@ -180,6 +180,34 @@ spirv_execution_mode(extensions = ["SPV_KHR_float_controls"], capabilities = [44
 //   NR_ROW(c)               the accumulator row (channel) of component c
 //
 // `nr_hi` is the lane half and is declared where the body starts.
+#ifndef NR_OP_DWSEL
+#define NR_OP_DWSEL 0
+#endif
+#if NR_OP_DWSEL
+// The same exchange, selected a dword at a time: the lane's own pair and its
+// partner's swap places in the upper half, so one v_cndmask_b32 each picks the
+// dword whose halves then go to the operand unchanged (OPLIN) or one half each
+// (OPPUT, a v_pack_b32_f16 with op_sel). The per-half selects it replaces were
+// four v_cndmask_b16 an exchange.
+#define NR_OPPUT(dst, c, qp) { \
+    const uint nr_pv = packFloat2x16(qp); \
+    const uint nr_po = subgroupShuffleXor(nr_pv, 16u); \
+    const f16vec2 nr_fa = unpackFloat2x16(nr_hi ? nr_po : nr_pv); \
+    const f16vec2 nr_fb = unpackFloat2x16(nr_hi ? nr_pv : nr_po); \
+    (dst)[2 * (c)]     = nr_fa.x; \
+    (dst)[2 * (c) + 1] = nr_fb.x; \
+    (dst)[2 * (c) + 2] = nr_fa.y; \
+    (dst)[2 * (c) + 3] = nr_fb.y; }
+#define NR_OPLIN(dst, j, qp) { \
+    const uint nr_pv = packFloat2x16(qp); \
+    const uint nr_po = subgroupShuffleXor(nr_pv, 16u); \
+    const f16vec2 nr_fa = unpackFloat2x16(nr_hi ? nr_po : nr_pv); \
+    const f16vec2 nr_fb = unpackFloat2x16(nr_hi ? nr_pv : nr_po); \
+    (dst)[(j)]     = nr_fa.x; \
+    (dst)[(j) + 1] = nr_fa.y; \
+    (dst)[(j) + 8] = nr_fb.x; \
+    (dst)[(j) + 9] = nr_fb.y; }
+#else
 #define NR_OPPUT(dst, c, qp) { \
     const f16vec2 nr_pv = (qp); \
     const f16vec2 nr_po = unpackFloat2x16(subgroupShuffleXor(packFloat2x16(nr_pv), 16u)); \
@@ -194,8 +222,27 @@ spirv_execution_mode(extensions = ["SPV_KHR_float_controls"], capabilities = [44
     (dst)[(j) + 1] = nr_hi ? nr_po.y : nr_pv.y; \
     (dst)[(j) + 8] = nr_hi ? nr_pv.x : nr_po.x; \
     (dst)[(j) + 9] = nr_hi ? nr_pv.y : nr_po.y; }
+#endif
 #define NR_OPK(f, c)  (nr_hi ? (f)[2 * (c) + 1] : (f)[2 * (c)])
 #define NR_ROW(c)     NR_ACC_ROW(lane, c)
+// NR_XH_ACC: the fused image lift's f16 result is only ever read back at this
+// lane's own accumulator components (the residual and the quantiser input),
+// so it stays in accumulator order and never takes the operand exchange.
+#ifndef NR_XH_ACC
+#define NR_XH_ACC 0
+#endif
+#if NR_XH_ACC
+#if !defined(NR_FUSED_IMAGE_INPUT) || NR_LIFT_ACC16
+#error NR_XH_ACC: the fused image input, default lift only
+#endif
+#define NR_XH_N 8
+#define NR_XHK(f, c) ((f)[c])
+#define NR_XHPUT(dst, c, qp) { const f16vec2 nr_xq = (qp); (dst)[(c)] = nr_xq.x; (dst)[(c) + 1] = nr_xq.y; }
+#else
+#define NR_XH_N 16
+#define NR_XHK(f, c) NR_OPK(f, c)
+#define NR_XHPUT(dst, c, qp) NR_OPPUT(dst, c, qp)
+#endif
 #if NR_IO_DOT2
 spirv_instruction(extensions = ["SPV_VALVE_mixed_float_dot_product"], capabilities = [6912], id = 6916)
 float nr_fdot2mix(f16vec2 a, f16vec2 b, float acc);
@@ -2017,7 +2064,7 @@ bool nr_mlive[NR_WIN / 16];
 #error upsample fusion requires FP32 image path
 #endif
 #if NR_C == 32
-#if NR_HWAVES || !defined(NR_INPUT_F16) || NR_FWAVES != 1
+#if NR_HWAVES || !defined(NR_INPUT_F16) || NR_FWAVES > 2
 #error C32 upsample fusion requires one wave and FP16 input
 #endif
 #elif !NR_HWAVES
@@ -2316,7 +2363,7 @@ shared fe4m3vec4 nr_wl[3072];
 #endif
 #ifdef NR_DS_PROJECT
 #if !defined(NR_POOL_F16) || !NR_POOL_VECTOR_STORE || !NR_QUANT_PAIRED || \
-    !((NR_HWAVES == 0 && NR_FWAVES == 1 && NR_C == 32) || (NR_HWAVES && NR_DF == 2))
+    !((NR_HWAVES == 0 && NR_FWAVES <= 2 && NR_C == 32) || (NR_HWAVES && NR_DF == 2))
 #error "NR_DS_PROJECT: the one-wave C=32 body or a head-split body with 32 channels a head"
 #endif
 #if NR_PERSIST && !NR_PERSIST_DS
