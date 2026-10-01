@@ -1456,7 +1456,7 @@ layout(set = 0, binding = 4, std430) readonly buffer WgtU32  { uint    wgt_u32[]
 #ifndef NR_RESIDUAL_F32
 #define NR_RESIDUAL_F32 0
 #endif
-#if NR_RESIDUAL_F32 && (!NR_NATIVE_RESIDUAL || !NR_PTX_ACC || NR_ACC_F16 != 0 || NR_F16_MMA || NR_RESIDUAL_HALF || NR_STREAM_MLP || NR_ABLATE_RESID)
+#if NR_RESIDUAL_F32 && (!NR_NATIVE_RESIDUAL || !NR_PTX_ACC || NR_ACC_F16 != 0 || NR_F16_MMA || NR_RESIDUAL_HALF || NR_ABLATE_RESID)
 #error "FP32 residual experiment requires ordinary FP32 native residuals"
 #endif
 // The scales of the accumulator components c and c+1 of one lane: `off` is the row
