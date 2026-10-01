@@ -5,6 +5,7 @@
     python3 linux/test/check_rdna3.py --model dlssnr.bin --perf      # also the time per frame
     python3 linux/test/check_rdna3.py --model dlssnr.bin --profile   # and the time of every kernel at 4K
     python3 linux/test/check_rdna3.py --model dlssnr.bin --isa       # and instruction mix, VGPRs, spills
+linux/test/sweep_defines.py times a few pipelines rebuilt with other defines, without the full check.
     python3 linux/test/check_rdna3.py --model dlssnr.bin --update-golden   # record the current state
 
 What it runs, on the first discrete GPU:
