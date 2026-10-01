@@ -429,7 +429,7 @@ void Config::save(const std::string& path) {
     auto flag = [](bool b) { return b ? "true" : "false"; };
     const auto& k = controls;
     std::fprintf(f,
-        "; DLSSNR-AMD-Vulkan ReShade add-on settings; edits take effect when saved, also in game.\n"
+        "; DLSSNR-AMD ReShade add-on settings; edits take effect when saved, also in game.\n"
         "; [DlssNr] keys, ranges and defaults are those of OptiScaler DLSS-NR (OptiScaler.ini).\n"
         "[DlssNr]\n"
         "Enabled=%s\n"

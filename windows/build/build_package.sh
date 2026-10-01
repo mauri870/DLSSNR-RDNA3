@@ -204,7 +204,7 @@ printf '\xef\xbb\xbf' > "$pkg/README.txt"; sed 's/$/\r/' windows/package/README.
 sed -i 's/$/\r/' "$pkg/install.bat"
 
 # ---- archive ------------------------------------------------------------------------------------
-name="DLSSNR-AMD-Windows-$stamp-preview-x64"
+name="DLSSNR-AMD-Windows-$stamp-preview-x86_64"
 rm -f -- "$out/$name.zip"
 python3 - "$pkg" "$out/$name.zip" <<'PY'
 import os, sys, zipfile
