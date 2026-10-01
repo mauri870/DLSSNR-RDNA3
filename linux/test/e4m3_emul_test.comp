@@ -1,0 +1,16 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_GOOGLE_include_directive : require
+#include "e4m3_emul.glsl"
+layout(local_size_x = 64) in;
+layout(set=0,binding=0) buffer I { uint in_[]; };
+layout(set=0,binding=1) buffer O { float out_[]; };
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i < 65536u) {
+        float16_t h = unpackFloat2x16(in_[i])[0];
+        out_[i] = float(nr_quant_e4m3(h));
+    } else {
+        out_[i] = float(nr_e4m3_decode(i - 65536u));
+    }
+}
