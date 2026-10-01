@@ -1,4 +1,7 @@
 #pragma once
+#ifndef NR_ARCH_RDNA3
+#define NR_ARCH_RDNA3 0
+#endif
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
 #include <cstdlib>
@@ -60,8 +63,10 @@ public:
             f->subgroupSizeControl = true;
         else get<VkPhysicalDeviceSubgroupSizeControlFeatures>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES)->subgroupSizeControl = true;
         get<VkPhysicalDeviceCooperativeMatrixFeaturesKHR>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR)->cooperativeMatrix = true;
+#if !NR_ARCH_RDNA3
         auto* f = get<VkPhysicalDeviceShaderFloat8FeaturesEXT>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT);
         f->shaderFloat8 = f->shaderFloat8CooperativeMatrix = true;
+#endif
     }
 };
 } // namespace nr
