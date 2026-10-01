@@ -6843,7 +6843,9 @@ int main(int argc, char** argv) try {
 #endif
                 double s2 = 0, amax = 0; size_t zero = 0, bad = 0;
                 uint64_t fnv = 14695981039346656037ull;
-                for (uint16_t v : h) { fnv ^= v; fnv *= 1099511628211ull; }
+                // -0 and +0 hash alike: they multiply alike, and a rounding that returns one for the other
+                // is not a change of the picture.
+                for (uint16_t v : h) { fnv ^= v == 0x8000u ? 0u : v; fnv *= 1099511628211ull; }
                 for (uint16_t v : h) {
                     const float x = tin::f16_to_f(v);
                     if (!std::isfinite(x)) { ++bad; continue; }

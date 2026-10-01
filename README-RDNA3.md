@@ -8,8 +8,8 @@ without warranty.
 
 - **Tested only on an RX 7900 XTX** (Mesa 26.2.3, RADV). Other RDNA3 cards should work and are untested.
 - **Verified on single frames** against NVIDIA's own output, with the frames and settings of
-  [docs/ngx-verification](docs/ngx-verification/NGX-VERIFICATION.md): 45.21 dB at 1080p, 47.99 dB at
-  1440p and 48.95 dB at 4K, against 45.56, 47.99 and 49.06 dB for the RDNA4 build. Moving sequences
+  [docs/ngx-verification](docs/ngx-verification/NGX-VERIFICATION.md): 45.47 dB at 1080p, 47.71 dB at
+  1440p and 49.02 dB at 4K, against 45.56, 47.99 and 49.06 dB for the RDNA4 build. Moving sequences
   have not been run on RDNA3.
 - **Games:** the package for this branch is built and installable. In-game results are listed at the end
   of this file as they are checked.
@@ -21,20 +21,20 @@ The network's time per frame on an RX 7900 XTX, one pass, measured from submit t
 
 | | 1080p | 1440p | 4K |
 | --- | --- | --- | --- |
-| RDNA3 (this branch) | 30 ms | 54 ms | 116 ms |
+| RDNA3 (this branch) | 22 ms | 39 ms | 84 ms |
 | RDNA4, RX 9070 XT (main README) | 5.6 ms | 9.7 ms | 21.9 ms |
 
-That is about five times the RDNA4 cost, and it has not been optimised for the card yet. Running the
+That is about four times the RDNA4 cost, and it is only starting to be optimised for the card. Running the
 network at a lower resolution than the frame is the lever that exists today: `model_scale` in
 `dlssnr-amd.ini` ("Model Resolution" on the add-on's page in the game, 25 to 100 %) runs the network on a
 smaller copy of the frame and carries its edit back onto the full-resolution frame. At 4K:
 
 | Model resolution | Network extent (about) | Time | PSNR vs NVIDIA's full-resolution output |
 | --- | --- | --- | --- |
-| 100 % | 3840x2160 | 117 ms | 48.95 dB |
-| 75 % | 2880x1620 | 70 ms | 38.25 dB |
-| 50 % | 1920x1080 | 33 ms | 32.90 dB |
-| 37.5 % | 1440x810 | 22 ms | 30.96 dB |
+| 100 % | 3840x2160 | 84 ms | 49.02 dB |
+| 75 % | 2880x1620 | 50 ms | 38.38 dB |
+| 50 % | 1920x1080 | 23 ms | 32.86 dB |
+| 37.5 % | 1440x810 | 16 ms | 30.93 dB |
 
 The PSNR column compares against NVIDIA's output at full resolution, so it measures how much of the
 network's fine detail is lost, not how the frame looks. The network needs about 5.3 GB of video memory
