@@ -213,7 +213,7 @@ chmod +x "$pkg/install.sh" "$mt/extract_model.sh"
 
 # ---- archive ------------------------------------------------------------------
 version=$(bash linux/build/version.sh)
-archive="DLSSNR-AMD-Linux-$version-$arch.tar.gz"
+archive="DLSSNR-AMD-Vulkan-Linux-$version-$arch.tar.gz"
 tar -C "$pkg" -czf "$out/$archive" .
 # The finished package goes beside the installer sources in linux/package/ (not in git).
 mv -f -- "$out/$archive" "linux/package/$archive"   # one copy only; package-build/ is scratch

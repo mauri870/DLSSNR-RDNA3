@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# DLSSNR-AMD installer (Linux)
+# DLSSNR-AMD-Vulkan installer (Linux)
 #
 #   bash install.sh <folder with the game's exe> [route] [--dll <nvngx_dlssnr.dll or .zip>]
 #

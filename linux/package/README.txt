@@ -1,5 +1,5 @@
-DLSSNR-AMD (Linux)
-==================
+DLSSNR-AMD-Vulkan (Linux)
+=========================
 
 Runs the neural rendering (NR) model of DLSS 5 in games on AMD graphics cards, under Linux + Proton.
 The network is reimplemented in Vulkan and runs on the game's own Vulkan device; NVIDIA's

@@ -167,7 +167,7 @@ How the routes work in detail, and where the code is: [docs/ARCHITECTURE.md](doc
 
 ## Install (Linux)
 
-Download a `DLSSNR-AMD-Linux-*-x86_64.tar.gz` (64-bit games) or `-i686.tar.gz` (32-bit games) from
+Download a `DLSSNR-AMD-Vulkan-Linux-*-x86_64.tar.gz` (64-bit games) or `-i686.tar.gz` (32-bit games) from
 the releases, unpack it and run:
 
 ```sh
@@ -181,7 +181,7 @@ the extracted model is kept and reused for every later one. Needs `bash` and `py
 
 ## Install (Windows)
 
-Download `DLSSNR-AMD-Windows-*-preview-x86_64.zip` from the releases, unpack it and double-click
+Download `DLSSNR-AMD-Vulkan-Windows-*-preview-x86_64.zip` from the releases, unpack it and double-click
 `install.bat`. Pick the game's exe (the one that actually runs, not a launcher), then the route. The
 first install asks for `nvngx_dlssnr.dll` 310.8.0 or a zip that contains it and extracts the model
 (below); later installs from the same package do not ask again. Read
@@ -270,7 +270,7 @@ bash fetch_deps.sh --windows                # adds GE-Proton 11-7 (DXVK, vkd3d-p
 bash windows/build/build_package.sh
 ```
 
-The result is `windows/package/DLSSNR-AMD-Windows-*-preview-x86_64.zip`; on Windows, run `install.bat` from it.
+The result is `windows/package/DLSSNR-AMD-Vulkan-Windows-*-preview-x86_64.zip`; on Windows, run `install.bat` from it.
 It contains no model; the installer extracts it on the first install. `NR_MODEL=/path/to/dlssnr.bin`
 puts one into the package for your own use. Do not share packages that contain the model.
 

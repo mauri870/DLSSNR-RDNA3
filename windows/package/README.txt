@@ -1,5 +1,5 @@
-DLSSNR-AMD (Windows, experimental preview)
-==========================================
+DLSSNR-AMD-Vulkan (Windows, experimental preview)
+=================================================
 
 Runs the neural rendering (NR) model of DLSS 5 in games on AMD graphics cards. The network is
 reimplemented in Vulkan; NVIDIA's runtime is neither needed nor called.
