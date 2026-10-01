@@ -78,9 +78,9 @@ run. Single frames only: the moving sequences have not been run on RDNA3.
 
 | Resolution | PSNR vs NVIDIA | SSIM vs NVIDIA | Correlation of the edits | Mean difference (1/255, R G B) | Pixels with all channels within one 8-bit step |
 |---|---|---|---|---|---|
-| 1920x1080 | 45.21 dB | 0.9959 | 0.9940 | +0.31 +0.43 +0.41 | 65.4% |
-| 2560x1440 | 47.99 dB | 0.9968 | 0.9953 | +0.10 +0.10 +0.08 | 80.7% |
-| 3840x2160 | 48.95 dB | 0.9969 | 0.9953 | +0.04 +0.05 +0.04 | 85.6% |
+| 1920x1080 | 45.47 dB | 0.9960 | 0.9942 | +0.29 +0.39 +0.38 | 66.3% |
+| 2560x1440 | 47.71 dB | 0.9968 | 0.9950 | +0.05 +0.09 +0.12 | 79.8% |
+| 3840x2160 | 49.02 dB | 0.9970 | 0.9954 | +0.07 +0.05 +0.04 | 85.8% |
 
 Outputs: `single-frame-outputs/<resolution>_dlssnr-amd-rdna3.png`; numbers in
 `single-frame-results-rdna3.json`.
