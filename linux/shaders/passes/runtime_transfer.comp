@@ -239,7 +239,12 @@ void main() {
     // 2 edge-aware (see lighting()), 0 classic (the enlarged model picture, below).
     if (pc.model_w != pc.width || pc.model_h != pc.height) {
         if (pc.mode == 1u) {
-            const vec3 edit = model - proxy;
+            // The edit of a network run below the frame's size is too strong: at half size its RMS is about a
+            // third above the full-size run's, and the extra is not detail but contrast. The least-squares gain
+            // against the full-size output over five frames of two games is 0.83 to 0.93 at 75 %, 0.68 to 0.83 at
+            // 50 % and 0.49 to 0.74 at 25 %; this line is the fit through their means.
+            const float edit_gain = min(1.0, 0.49 + 0.52 * float(pc.model_w) / float(pc.width));
+            const vec3 edit = (model - proxy) * edit_gain;
             const vec3 full = pass_through ? clamp(original, 0.0, 1.0) : clamp(soft_knee(original), 0.0, 1.0);
             proxy = full;
             proxy_luma = dot(proxy, kLuma);
