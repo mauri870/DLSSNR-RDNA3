@@ -48,7 +48,9 @@ common=(-std=c++17 -O2 -DNDEBUG -DNR_BUILD_STAMP="\"$stamp\"" -Itoolchain/Vulkan
 
 # The network the package ships (linux/build/arch/rdna4.sh): the host must be built
 # with the same constants as the shaders in dlssnr-amd/shaders.
-source linux/build/arch/rdna4.sh
+gpu=${NR_GPU:-rdna4}
+[[ -f "linux/build/arch/$gpu.sh" ]] || { echo "NR_GPU must be rdna3 or rdna4" >&2; exit 2; }
+source "linux/build/arch/$gpu.sh"
 "$cxx" "${common[@]}" "${NR_PRODUCT_DEFINES[@]}" -c linux/src/core/nr_runtime.cpp -o "$out/nr_runtime.o"
 "$cxx" "${common[@]}" -c linux/src/core/nr_native_plan.cpp -o "$out/nr_native_plan.o"
 "$cxx" "${common[@]}" -c linux/src/pe/nr_pe_log.cpp -o "$out/log.o"

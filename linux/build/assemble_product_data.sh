@@ -11,7 +11,9 @@ set -euo pipefail
 start=$PWD
 cd -- "$(dirname -- "$0")/../.."
 parent=${1:?usage: assemble_product_data.sh <parent dir> [--model dlssnr.bin]}
-source linux/build/arch/rdna4.sh
+gpu=${NR_GPU:-rdna4}
+[[ -f "linux/build/arch/$gpu.sh" ]] || { echo "NR_GPU must be rdna3 or rdna4" >&2; exit 2; }
+source "linux/build/arch/$gpu.sh"
 dst="$parent/dlssnr-amd"
 rm -rf -- "$dst"; mkdir -p -- "$dst/shaders/runtime" "$dst/shaders/temporal"
 
