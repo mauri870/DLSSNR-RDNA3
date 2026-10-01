@@ -31,6 +31,16 @@ Notes for contributors and coding assistants. README.md covers what the project 
   same SPIR-V bytes every time. After a change that should not alter the arithmetic (refactor,
   comments, scheduling of independent work), compare the `.spv` files before and after.
 
+## RDNA3
+
+- `linux/shaders/rdna3/` is the RDNA3 network (e4m3 values held as FP16, see README-RDNA3.md); `rdna4/` is not
+  touched by it. Build scripts take `NR_GPU=rdna3`; the host is gated by `NR_ARCH_RDNA3`.
+- Run `python3 linux/test/check_rdna3.py --model dlssnr.bin` before and after any change to it. A change that
+  leaves the arithmetic alone must be EXACT; a change that does not is a new golden and needs a reason in the
+  commit. Time kernels with the GPU idle.
+- A raw 32-bit view of an arena (counters, sync words, scale tables) goes at alias binding 16 plus the arena's
+  binding, never next to an e4m3 view: the e4m3 bindings read the FP16 twin buffer.
+
 ## Performance work on RDNA4 (RADV / ACO)
 
 Measured facts worth knowing before changing kernels:
