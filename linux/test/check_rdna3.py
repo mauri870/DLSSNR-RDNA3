@@ -3,6 +3,7 @@
 
     python3 linux/test/check_rdna3.py --model dlssnr.bin             # check against the golden
     python3 linux/test/check_rdna3.py --model dlssnr.bin --perf      # also the time per frame
+    python3 linux/test/check_rdna3.py --model dlssnr.bin --profile   # and the time of every kernel at 4K
     python3 linux/test/check_rdna3.py --model dlssnr.bin --update-golden   # record the current state
 
 What it runs, on the first discrete GPU:
@@ -204,6 +205,28 @@ def layer_hashes():
     return rows
 
 
+def profile(name="4k"):
+    """Time of every kernel family in the network at one resolution (nr_graph --per-layer)."""
+    w, h = FRAMES[name]
+    in_path, _ = frame_inputs(name)
+    plan = BUILD / f"plan_{name}.txt"
+    plan.write_text(run([str(BUILD / "mkplan"), str(w), str(h)]))
+    blob = BUILD / f"in_{name}.f32"
+    (np.fromfile(in_path, np.uint8).reshape(-1, 4).astype(np.float32) / 255).tofile(blob)
+    out = run([str(BUILD / "nr_graph"), "--plan", str(plan), "--model-pack", str(BUILD / "inst/dlssnr-amd/dlssnr.bin"),
+               "--spv-dir", str(ROOT / "build/linux/rdna3/network"), "--host-boundary", "--reuse",
+               "--source-width", str(w), "--source-height", str(h), "--in-image", str(blob),
+               "--warmup", "3", "--repeats", "10", "--per-layer"])
+    keep, started = [], False
+    for line in out.splitlines():
+        started = started or line.startswith("family/kernel")
+        if started:
+            keep.append(line)
+        if started and line.startswith("sum of the dispatches"):
+            break
+    print("\n".join(keep))
+
+
 def check_layers(golden_rows, record):
     rows = layer_hashes()
     if record:
@@ -225,6 +248,7 @@ def main():
     ap.add_argument("--perf", type=int, nargs="?", const=20, default=0, help="also time N passes per frame (default 20)")
     ap.add_argument("--tolerance", choices=["exact", "close"], default="exact")
     ap.add_argument("--skip-build", action="store_true")
+    ap.add_argument("--profile", nargs="?", const="4k", choices=list(FRAMES), help="also print the time of every kernel (default 4k)")
     args = ap.parse_args()
     os.chdir(ROOT)
     if not args.skip_build:
@@ -243,6 +267,8 @@ def main():
         print(f"golden recorded in {GOLDEN} ({len(rows)} layer values)")
     else:
         print("layers: " + ("identical" if layer_note is None else layer_note))
+    if args.profile:
+        profile(args.profile)
     if perf:
         print("time per frame (network, wall): " + "  ".join(f"{k} {v:.1f} ms" for k, v in perf.items()))
     if args.update_golden:
