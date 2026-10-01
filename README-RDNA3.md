@@ -118,6 +118,9 @@ Kept here because each of these looks promising.
   register count rises and the kernel is 10 % slower); removing the hi-lane selects entirely (0 %).
 - A weight-cache-friendlier record layout (1.4 %); the memory system is not the limit anywhere that was
   measured.
+- Hiding vector work behind matrix work by scheduling: a microbenchmark with half the workgroups doing
+  only WMMA and half only vector ALU takes 11.9 ms, where running them one after the other takes 11.8 ms
+  and a real overlap would take about 6.3 ms. The two serialise across waves as well as within one.
 - Turning the e4m3 rounding off altogether is 40 % faster and costs 4.8 dB against NVIDIA: the rounding
   is part of the fidelity, not a cost to remove.
 
