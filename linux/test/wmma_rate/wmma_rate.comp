@@ -1,0 +1,33 @@
+#version 450
+// Eight independent 16x16x16 multiply-add chains per wave in a loop of ITERS, f16 (float accumulator) or, with I8,
+// int8 (int32 accumulator). Built by run.sh, which prepends the #define lines after the #version line.
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_8bit_storage : enable
+layout(local_size_x=128) in;
+#ifdef I8
+#define AT int8_t
+#define CT int32_t
+#else
+#define AT float16_t
+#define CT float
+#endif
+layout(binding=0) buffer O { CT o[]; };
+layout(binding=1) buffer I { AT d[]; };
+void main(){
+  coopmat<AT,gl_ScopeSubgroup,16,16,gl_MatrixUseA> a;
+  coopmat<AT,gl_ScopeSubgroup,16,16,gl_MatrixUseB> b;
+  coopMatLoad(a,d,0,16,gl_CooperativeMatrixLayoutRowMajor);
+  coopMatLoad(b,d,256,16,gl_CooperativeMatrixLayoutRowMajor);
+  coopmat<CT,gl_ScopeSubgroup,16,16,gl_MatrixUseAccumulator> c0=coopmat<CT,gl_ScopeSubgroup,16,16,gl_MatrixUseAccumulator>(CT(0));
+  coopmat<CT,gl_ScopeSubgroup,16,16,gl_MatrixUseAccumulator> c1=c0,c2=c0,c3=c0,c4=c0,c5=c0,c6=c0,c7=c0;
+  for(int i=0;i<ITERS;i++){
+    c0=coopMatMulAdd(a,b,c0); c1=coopMatMulAdd(a,b,c1); c2=coopMatMulAdd(a,b,c2); c3=coopMatMulAdd(a,b,c3);
+    c4=coopMatMulAdd(a,b,c4); c5=coopMatMulAdd(a,b,c5); c6=coopMatMulAdd(a,b,c6); c7=coopMatMulAdd(a,b,c7);
+  }
+  c0=c0+c1+c2+c3+c4+c5+c6+c7;
+  coopMatStore(c0,o,gl_WorkGroupID.x*512+gl_SubgroupID*256,16,gl_CooperativeMatrixLayoutRowMajor);
+}
