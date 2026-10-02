@@ -140,8 +140,11 @@ Each of these looked promising and did not pay off.
 - Hiding vector work behind matrix work by scheduling: a microbenchmark with half the workgroups doing
   only WMMA and half only vector ALU takes 11.9 ms, where running them one after the other takes 11.8 ms
   and a real overlap would take about 6.3 ms. The two serialise across waves as well as within one.
-- Turning the e4m3 rounding off altogether is 40 % faster and costs 4.8 dB against NVIDIA: the rounding
-  is part of the fidelity, not a cost to remove.
+- Turning the e4m3 rounding off. Keeping the values at float16 in every kernel that quantises
+  (`NR_QUANT_F16_ONLY=1`) takes the 4K frame from 59.3 to 53.9 ms (9 %) and the score against NVIDIA from
+  49.0 to 38.5 dB; dropping the clamp to 448 as well gives 53.3 ms and the same score. At 50 % model
+  resolution it saves 1.5 ms for 0.25 dB. The rounding is part of the fidelity, and since it was reduced to
+  a few instructions it is a small part of the time.
 - INT8 matrix instructions instead of FP16: on RDNA3 they are not faster. `linux/test/wmma_rate/run.sh` times
   16x16x16 cooperative-matrix multiplies on an RX 7900 XTX and gets 131 to 135 TFLOPS in f16 and 132 to 140 TOPS
   in int8, so int8 would only change the memory traffic, and a simulated int8 network loses 1 to 2.6 dB
