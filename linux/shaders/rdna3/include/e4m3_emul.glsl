@@ -26,6 +26,12 @@ float16_t nr_e4m3_decode(uint code) {
     return (code & 0x7Fu) == 0x7Fu ? unpackFloat2x16(0x7E00u)[0] : v;
 }
 
+// NR_QUANT_F16_ONLY=1 (diagnostic, off by default): keep the clamp to +-448 and stop rounding onto the e4m3 grid, so a
+// value leaves at the precision of the f16 it is stored in. The picture changes; this measures what the rounding costs.
+#ifndef NR_QUANT_F16_ONLY
+#define NR_QUANT_F16_ONLY 0
+#endif
+
 // Rounding onto the e4m3 grid by adding and subtracting a constant whose ulp is the grid step.
 //
 // Adding M = +-2^(E+20) to x, where 2^E <= |x| < 2^(E+1), leaves a sum whose ulp is 2^(E-3):
@@ -34,6 +40,9 @@ float16_t nr_e4m3_decode(uint code) {
 // the exponent is clamped to -6. |x| is first limited to 448, the largest finite e4m3 value, which
 // is the saturation. Infinity becomes 448. `precise` keeps the compiler from cancelling the pair.
 float nr_e4m3_round(float x) {
+#if NR_QUANT_F16_ONLY
+    return float(float16_t(clamp(x, -448.0, 448.0)));
+#endif
     precise float c = clamp(x, -448.0, 448.0);
     const uint u = floatBitsToUint(c);
     const uint magic = (max(u & 0x7F800000u, 0x3C800000u) + 0x0A000000u) | (u & 0x80000000u);
@@ -47,6 +56,9 @@ float nr_e4m3_round(float x) {
 // for the rounding, about four instructions a value. M = +-2^(E+7), the f16 form of the above.
 // Valid for any f16 pair; the two halves never interact.
 f16vec2 nr_e4m3_round_pair(f16vec2 x) {
+#if NR_QUANT_F16_ONLY
+    return clamp(x, f16vec2(-448.0hf), f16vec2(448.0hf));
+#endif
     precise f16vec2 c = clamp(x, f16vec2(-448.0hf), f16vec2(448.0hf));
     const u16vec2 u = float16BitsToUint16(c);
     const u16vec2 exponent = max(u & u16vec2(0x7C00us), u16vec2(0x2400us)) + u16vec2(0x1C00us);
