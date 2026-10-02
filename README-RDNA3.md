@@ -7,12 +7,10 @@ warnings: this is an early project, do not use it in online games with anti-chea
 without warranty.
 
 - **Tested only on an RX 7900 XTX** (Mesa 26.2.3, RADV). Other RDNA3 cards should work and are untested.
-- **Verified on single frames** against NVIDIA's own output, with the frames and settings of
+- Verified on single frames against NVIDIA's own output, with the frames and settings of
   [docs/ngx-verification](docs/ngx-verification/NGX-VERIFICATION.md): 45.47 dB at 1080p, 47.71 dB at
   1440p and 49.02 dB at 4K, against 45.56, 47.99 and 49.06 dB for the RDNA4 build. Moving sequences
   have not been run on RDNA3.
-- **Runs in a game** (Proton, ReShade route), see [In-game results](#in-game-results). It is too slow
-  for native 4K: use a lower model resolution.
 
 ## What it costs
 
@@ -32,7 +30,7 @@ smaller copy of the frame and carries its edit back onto the full-resolution fra
 
 | Model resolution | Network extent (about) | Time | PSNR vs NVIDIA's full-resolution output |
 | --- | --- | --- | --- |
-| 100 % | 3840x2160 | 57 ms | 49.02 dB |
+| 100 % | 3840x2160 | 58 ms | 49.02 dB |
 | 75 % | 2880x1620 | 35 ms | 39.39 dB |
 | 50 % | 1920x1080 | 16 ms | 35.29 dB |
 | 37.5 % | 1440x810 | 11 ms | 33.83 dB |
@@ -42,12 +40,26 @@ The edit of a network run below the frame's size is stronger than the full-size 
 is about a third higher, and it is contrast, not detail), so the transfer pass scales it by
 `0.49 + 0.52 * model_scale`; that fit is worth 1.0 dB at 75 %, 2.4 dB at 50 %, 2.9 dB at 37.5 % and 3.5 dB at
 25 %, and costs no time. The rest of the loss is the network itself: a perfectly band-limited copy of the full-size
-edit would score 46 to 47 dB at 50 %, so no way of upsampling the answer can recover it.
+edit would score 46 to 47 dB at 50 %, so the loss is in what the network does at the smaller size, not in the upsampling.
 
 The PSNR column compares against NVIDIA's output at full resolution, so it measures how much of the
 network's fine detail is lost, not how the frame looks; at 50 % the colour, contrast and edge treatment
 of the full-resolution output are kept and fine texture is slightly softer. The network needs about
 5.3 GB of video memory at 4K, twice what the RDNA4 build uses for the same values.
+
+The matrix work itself is about 38 ms at 4K. Native 4K at a playable frame rate is
+out of reach on this card with this network; a model resolution of 50 % or lower is the setting to use.
+
+## Companion project
+
+[dlssnr-pytorch](https://github.com/mauri870/dlssnr-pytorch) is an independent PyTorch implementation of the
+same network. It reads the weights out of your own copy of `nvngx_dlssnr.dll` and reproduces NVIDIA's output on
+the frames of [docs/ngx-verification](docs/ngx-verification/NGX-VERIFICATION.md) to 45.5 to 49.1 dB. It served
+here as a second implementation to check this one against, and as the place to run the experiments that need
+a network that can be modified: the gain of the edit at a reduced model resolution, the upper bound set by a
+band-limited edit, which blocks the picture depends on, what an int8 or low-rank network would lose, and what
+replacing a layer would cost. Where both ran, they agree: the 50 % model resolution frame scores 35.29 dB
+against NVIDIA in the PyTorch test that fitted the gain and in the Vulkan build.
 
 ## How it works on a card without FP8
 
@@ -81,18 +93,18 @@ bit-identical before and after. 4K network time, ms:
 | C=32 kernels on two waves a window instead of one, the MLP streamed through its hidden fragments, the stage-1 k loop kept rolled at C=64 and C=128, the C=256 upsample projection k-outermost | 84 | 62 |
 | ViT contraction GEMM and C=512 attention in 256 VGPRs | 62 | 58 |
 
-What the work taught, in the order it mattered:
+What mattered, most important first:
 
-- **Register spills were the main cost.** An f16 fragment takes eight VGPRs, twice what an FP8 fragment
+- Register spills were the main cost. An f16 fragment takes eight VGPRs, twice what an FP8 fragment
   took on RDNA4, and the RDNA4 tile shapes sat at the 256-VGPR limit and spilled hundreds of scratch
   instructions each. Fewer fragments a wave (two waves a window, a smaller GEMM tile, a loop that the
   compiler must not unroll) removed the spills and gave 1.5 to 3 times on the kernels concerned. The
   ViT contraction ran at a third of its sibling's speed for the same arithmetic until its tile was fixed.
-- **On this hardware matrix and vector instructions do not overlap**, not even within a wave: a kernel's
+- On this hardware matrix and vector instructions do not overlap, not even within a wave: a kernel's
   time is its matrix cost plus its vector cost (a WMMA is about 36 cycles of SIMD time), and the C=32
   kernels are about 91 % busy on that sum. Occupancy stops mattering once the spills are gone, which is
   why the remaining gains are in cutting vector instructions, not in scheduling.
-- **The persistent C=64/128/256 runs are better than per-layer dispatches** on this card too (8.6 ms
+- The persistent C=64/128/256 runs are faster than per-layer dispatches on this card too (8.6 ms
   against about 12.4 ms for the C=64 layers).
 
 ## Where the time goes now, and the floor
@@ -113,7 +125,7 @@ both 64-token buffers are live in the same stage and every wave reads both.
 
 ## What did not work
 
-Kept here because each of these looks promising.
+Each of these looked promising and did not pay off.
 
 - Quantising an f32 accumulator through f16 (a packed rounding) in place of rounding it directly: no
   faster, and the same fidelity against NVIDIA.
@@ -130,22 +142,29 @@ Kept here because each of these looks promising.
   and a real overlap would take about 6.3 ms. The two serialise across waves as well as within one.
 - Turning the e4m3 rounding off altogether is 40 % faster and costs 4.8 dB against NVIDIA: the rounding
   is part of the fidelity, not a cost to remove.
+- INT8 matrix instructions instead of FP16: on RDNA3 they are not faster. `linux/test/wmma_rate/run.sh` times
+  16x16x16 cooperative-matrix multiplies on an RX 7900 XTX and gets 131 to 135 TFLOPS in f16 and 132 to 140 TOPS
+  in int8, so int8 would only change the memory traffic, and a simulated int8 network loses 1 to 2.6 dB
+  against NVIDIA.
+- Other tile shapes for the `gemmprojw` GEMM that keep the host's 64x128 tile: the best gains 0.15 ms on
+  one of its two uses and loses 0.4 ms on the other. The frame time itself varies by about 0.1 ms from
+  run to run.
 
 ## What is left
 
-Rough gains at 4K, none of them large:
+Gains still available at 4K, none of them large:
 
 - Swapping the two elements of a k pair per lane half so a B operand needs one permute and two packs:
   bit-identical, needs a weight repack in `nr_graph.cpp`, about 1 ms.
-- The attention softmax epilogue still spills (about 0.3 ms); `vitattn` is vector-bound at about 44 % of
-  the matrix peak (0.2 to 0.4 ms, with a risk to exactness).
-- Host constants that gate better tiles: `gemmprojw` with two waves along N, `vitattn` with 64-token
-  chunks, `ffwd3w` with two waves a workgroup (about 0.3 ms together).
+- The attention softmax epilogue still spills (about 0.3 ms), and `vitattn` is vector-bound at about 44 % of
+  the matrix peak.
+- Skipping the e4m3 rounding in selected kernels. `NR_QUANT_F16_ONLY=1` (off by default, in
+  `linux/shaders/rdna3/include/e4m3_emul.glsl`) keeps the clamp to 448 and stops rounding onto the e4m3
+  grid. Built into the post block, `fswindsp32nh`, `fswinfusedup32nh`, `fswin32` and `fswinpup64` it takes the
+  4K frame from 60.2 to 58.5 ms and the score against NVIDIA from 49.02 to 48.38 dB. The picture changes,
+  so using it means a new golden; no pipeline uses it.
 - An f16 activation instead of the f32 one in the C=32 body would save about 0.5 ms and is a new golden
   (the three frames then score 45.50, 48.11 and 49.00 dB), so it is a decision, not a free change.
-
-Past that the floor is the matrix work itself, about 38 ms at 4K. Native 4K at a playable frame rate is
-out of reach on this card with this network; a model resolution of 50 % or lower is the setting to use.
 
 ## Getting the model
 
@@ -156,17 +175,38 @@ The weights are NVIDIA's and are not in this repository. The installer extracts 
 weights are byte for byte the ones this project is tested with, and the installer only accepts a DLL
 whose extracted model matches the pinned hashes. Do not commit the zip or anything made from it.
 
-## Building the package
+## Building
+
+Everything that goes into a package is cross-compiled on Linux. Needed: git, curl, tar, python3, cmake,
+ninja, g++ and the mingw-w64 cross compiler (`x86_64-w64-mingw32-g++`; `i686-w64-mingw32-g++` as well for a
+32-bit package). On Ubuntu: `sudo apt install git curl python3 cmake ninja-build mingw-w64 g++`. This
+branch was built and tested on an Arch-based system with Mesa 26.2.3. Do not substitute your distribution's
+glslang: `fetch_deps.sh` puts glslang 16.5.0 into `toolchain/`, the build uses that one, and the SPIR-V is
+reproducible only with it.
 
 ```
-bash fetch_deps.sh                       # pinned third-party sources and glslang 16.5.0
-NR_GPU=rdna3 bash linux/build/build_optiscaler_nr.sh
-bash linux/build/build_vulkan_loader.sh
+git clone <this repository> && cd DLSSNR-AMD && git checkout rdna3
+bash fetch_deps.sh                        # pinned third-party sources and glslang 16.5.0 -> toolchain/, artifacts/ref/
+bash linux/build/build_vulkan_loader.sh   # the patched Vulkan loader the vulkan and dx9 routes ship
 NR_GPU=rdna3 bash linux/build/build_package.sh
 ```
 
-This needs a mingw-w64 cross compiler (`x86_64-w64-mingw32-g++`). The package is written to
-`linux/package/DLSSNR-AMD-Vulkan-Linux-<version>-x86_64-rdna3.tar.gz`, without the model.
+`build_package.sh` builds the network shaders (`linux/build/build_network.py rdna3`), the host code, the
+ReShade add-on, the OptiScaler DLLs and the model tools, and writes
+`linux/package/DLSSNR-AMD-Vulkan-Linux-<version>-x86_64-rdna3.tar.gz`. The version comes from the git tags
+(`linux/build/version.sh`; `-dirty` is appended when the tree has changes). `toolchain/`, `artifacts/` and
+`build/` hold downloaded and generated files and are never committed.
+
+- `NR_GPU=rdna3` selects the RDNA3 network: the host is compiled with the defines in
+  `linux/build/arch/rdna3.sh` and the shaders with `linux/shaders/rdna3/pipelines.json`. They have to
+  agree (`shader-constants.txt` ties them together) and the runtime refuses a shader folder that does not.
+  Without it the build is the RDNA4 one.
+- The package carries no model; `install.sh --dll` extracts it from your own DLL. To build one with a model
+  you extracted yourself, for your own use, set `NR_MODEL=/path/to/dlssnr.bin`. Do not share it.
+- `NR_ARCH=i686` builds the 32-bit package for 32-bit games. It has no OptiScaler route and has not been
+  built or run on RDNA3.
+- Only the network shaders: `python3 linux/build/build_network.py rdna3 --out build/linux/rdna3/network`.
+- `windows/` is not part of this port.
 
 ## Installing
 
@@ -198,8 +238,8 @@ network. A change that does not alter the arithmetic (tile shape, occupancy, reg
 scheduling) must come out EXACT; one that reorders a sum may come out CLOSE (`--tolerance close`);
 anything else fails and the first changed layer is named. `--update-golden` records a new golden, which is
 a decision to make and explain in the commit. The tools it uses are in `linux/test/`: `run_frame` (one
-frame through `nr::Runtime`, with a timing loop and a model scale), `mkplan`, `isa_stats.py`, and the two
-exhaustive rounding tests. Run it with the GPU otherwise idle: a game running on the same card makes the
+frame through `nr::Runtime`, with a timing loop and a model scale), `mkplan`, `isa_stats.py`, `sweep_defines.py`,
+the two exhaustive rounding tests and `wmma_rate/` (the matrix throughput of the card). Run it with the GPU otherwise idle: a game running on the same card makes the
 timings meaningless.
 
 ## In-game results
@@ -219,6 +259,3 @@ within a millisecond or two, so a millisecond saved in the harness is a millisec
 also gives the frame rates to expect from the other settings in this game, which have not been run:
 about 45 fps at 37.5 % (8.9 + 11 ms) and about 60 fps at 25 % (8.9 + 8 ms); 75 % would be about 23 fps.
 The add-on finds the motion vectors and the depth buffer and reports its own GPU cost, which agrees.
-
-An earlier build, in the Gates of Hell scene it was first tried in (86 fps with neural rendering off),
-gave 8 fps at 100 % and 23 fps at 50 % when its network took about 117 and 23 ms.

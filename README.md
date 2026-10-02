@@ -1,5 +1,9 @@
 # DLSSNR-AMD
 
+> **This is a fork that ports DLSSNR-AMD to RDNA3 (Radeon RX 7000) on Linux.**, see
+> [README-RDNA3.md](README-RDNA3.md). The rest of this file describes the upstream project
+> ([mochizuki0323/DLSSNR-AMD](https://github.com/mochizuki0323/DLSSNR-AMD)) for RDNA4 (RX 9000).
+
 Runs the neural rendering (NR) model of NVIDIA DLSS 5 in games on AMD Radeon RX 9000 (RDNA4)
 graphics cards.
 
