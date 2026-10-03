@@ -858,6 +858,11 @@ struct Kernel {
     VkDescriptorPool pool{};
     VkDescriptorSet set{};
     uint32_t push_range{};   // the layout's push constant bytes
+    // RDNA3: which bindings read the FP16 twin of their arena and which are raw alias views, and the
+    // context's twin map. A second descriptor set over this layout (nr_runtime.cpp kernel_set) has to
+    // bind the same way `create` does, or the kernel reads and writes an arena in the wrong format.
+    std::vector<uint32_t> twin_bindings, alias_bindings;
+    const std::map<VkBuffer, VkBuffer>* twin_map{};
 
     // **Image bindings follow the buffers**, in set 0, continuing the binding
     // numbers. The two image adapters are the only layers that need them - a
@@ -878,6 +883,8 @@ struct Kernel {
         std::vector<VkBuffer> bound(bindings);
         std::set<uint32_t> declared;
         const std::set<uint32_t> e4m3 = e4m3_view_bindings(code, &declared);
+        twin_map = &ctx.fp16_twin;
+        twin_bindings.assign(e4m3.begin(), e4m3.end());
         if (!ctx.fp16_twin.empty())
             for (uint32_t b : e4m3) {
                 const auto twin = b < bound.size() ? ctx.fp16_twin.find(bound[b]) : ctx.fp16_twin.end();
@@ -889,6 +896,7 @@ struct Kernel {
         for (uint32_t b : declared)
             if (b >= kAliasBase && b - kAliasBase < bindings.size())
                 aliases.push_back({b, bindings[b - kAliasBase]});
+        for (const auto& alias : aliases) alias_bindings.push_back(alias.first);
         const uint32_t nb = uint32_t(bindings.size());
         const uint32_t ni = uint32_t(images.size());
         const uint32_t na = uint32_t(aliases.size());
