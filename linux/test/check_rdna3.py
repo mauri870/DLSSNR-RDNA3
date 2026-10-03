@@ -252,6 +252,30 @@ def isa(name="1080p"):
     print(isa_stats.render(isa_stats.stats(r.stdout + r.stderr, ["noisefield"] + order)))
 
 
+def check_engine_path(floor_db=45.0):
+    """The engine path an upscaler host uses (the OptiScaler route): the frame as FP16 with sampled and storage
+    usage and a motion image, so the network reads the caller's images in place through descriptor sets of its own.
+    Those sets must bind the FP16 twins and alias views exactly as the kernels' own do (nrvk::Kernel::create); a set
+    that does not makes the pre and post blocks read and write the wrong arena and the picture comes out as a colour
+    cast (10 dB against the plain path). The plain path's 1080p output is the reference; a temporal blend with zero
+    motion moves it by a few dB at most (50 dB when right)."""
+    w, h = FRAMES["1080p"]
+    out = BUILD / "out_engine_1080p.rgba8"
+    env = dict(os.environ, RUN_FRAME_ENGINE="1")
+    r = subprocess.run([str(BUILD / "run_frame"), str(BUILD / "inst"), str(BUILD / "in_1080p.rgba8"), str(w), str(h),
+                        str(out), "0", "1.0"], cwd=ROOT, capture_output=True, text=True, env=env, timeout=300)
+    if r.returncode or not out.exists():
+        print(f"engine path (in place, FP16): FAIL, run_frame exited {r.returncode}: {r.stderr.strip()[-200:]}")
+        return False
+    got = np.fromfile(out, np.uint8).reshape(-1, 4)[:, :3].astype(np.float64)
+    ref = np.fromfile(BUILD / "out_1080p_1.rgba8", np.uint8).reshape(-1, 4)[:, :3].astype(np.float64)
+    mse = ((got - ref) ** 2).mean()
+    psnr = 99.0 if mse == 0 else 10 * np.log10(255.0 ** 2 / mse)
+    ok = psnr >= floor_db
+    print(f"engine path (in place, FP16): {psnr:.2f} dB against the plain path   {'ok' if ok else 'FAIL (floor %.0f dB)' % floor_db}")
+    return ok
+
+
 def check_layers(golden_rows, record):
     rows = layer_hashes()
     if record:
@@ -286,6 +310,7 @@ def main():
     layers_file = GOLDEN / "layers-1080.txt"
     golden_rows = layers_file.read_text().split("\n") if layers_file.exists() and not args.update_golden else []
     verdicts, fresh, perf = check_frames(args, golden, args.update_golden)
+    engine_ok = True if args.update_golden else check_engine_path()
     rows, layer_note = check_layers([r for r in golden_rows if r], args.update_golden)
     if args.update_golden:
         GOLDEN.mkdir(parents=True, exist_ok=True)
@@ -302,7 +327,7 @@ def main():
         print("time per frame (network, wall): " + "  ".join(f"{k} {v:.1f} ms" for k, v in perf.items()))
     if args.update_golden:
         return 0
-    bad = [v for v in verdicts.values() if v.startswith("FAIL")] + ([] if quantiser_ok else ["FAIL (quantiser)"])
+    bad = [v for v in verdicts.values() if v.startswith("FAIL")] + ([] if quantiser_ok else ["FAIL (quantiser)"]) + ([] if engine_ok else ["FAIL (engine path)"])
     close = [v for v in verdicts.values() if v.startswith("CLOSE")]
     if bad or (close and args.tolerance == "exact"):
         print("RESULT: FAIL" + ("  (rerun with --tolerance close to accept a reordered sum)" if close and not bad else ""))
