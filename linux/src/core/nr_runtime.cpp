@@ -95,7 +95,9 @@ void dispatch(VkCommandBuffer cmd, const nrvk::Kernel& k, uint32_t x, uint32_t y
 
 // Another descriptor set for a kernel's layout, over other resources: buffers
 // first, then images in binding order, exactly as nrvk::Kernel::create writes
-// its own (a sampler makes a combined image sampler, none a storage image).
+// its own (a sampler makes a combined image sampler, none a storage image). The e4m3 bindings
+// read the FP16 twin of their arena and the alias bindings the arena itself, as `create` binds
+// them (RDNA3); a set that skipped this made the kernel treat a byte arena as FP16.
 VkDescriptorSet kernel_set(VkDevice device, VkDescriptorPool pool, const nrvk::Kernel& k,
                            const std::vector<VkBuffer>& buffers,
                            const std::vector<const nrvk::Context::Image*>& images) {
@@ -104,11 +106,21 @@ VkDescriptorSet kernel_set(VkDevice device, VkDescriptorPool pool, const nrvk::K
     VkDescriptorSet set{};
     if (vkAllocateDescriptorSets(device, &ai, &set) != VK_SUCCESS) return VK_NULL_HANDLE;
     const uint32_t nb = uint32_t(buffers.size()), ni = uint32_t(images.size());
-    std::vector<VkDescriptorBufferInfo> bi(nb);
+    std::vector<VkBuffer> bound(buffers);
+    if (k.twin_map && !k.twin_map->empty())
+        for (uint32_t b : k.twin_bindings) {
+            const auto twin = b < nb ? k.twin_map->find(buffers[b]) : k.twin_map->end();
+            if (twin != k.twin_map->end()) bound[b] = twin->second;
+        }
+    std::vector<uint32_t> alias_slots;
+    for (uint32_t a : k.alias_bindings)
+        if (a >= nrvk::Kernel::kAliasBase && a - nrvk::Kernel::kAliasBase < nb) alias_slots.push_back(a);
+    const uint32_t na = uint32_t(alias_slots.size());
+    std::vector<VkDescriptorBufferInfo> bi(nb + na);
     std::vector<VkDescriptorImageInfo> ii(ni);
-    std::vector<VkWriteDescriptorSet> w(nb + ni);
+    std::vector<VkWriteDescriptorSet> w(nb + ni + na);
     for (uint32_t i = 0; i < nb; ++i) {
-        bi[i] = {buffers[i], 0, VK_WHOLE_SIZE};
+        bi[i] = {bound[i], 0, VK_WHOLE_SIZE};
         w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         w[i].dstSet = set; w[i].dstBinding = i; w[i].descriptorCount = 1;
         w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = &bi[i];
@@ -121,7 +133,13 @@ VkDescriptorSet kernel_set(VkDevice device, VkDescriptorPool pool, const nrvk::K
                                                       : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         w[nb + i].pImageInfo = &ii[i];
     }
-    vkUpdateDescriptorSets(device, nb + ni, w.data(), 0, nullptr);
+    for (uint32_t i = 0; i < na; ++i) {
+        bi[nb + i] = {buffers[alias_slots[i] - nrvk::Kernel::kAliasBase], 0, VK_WHOLE_SIZE};
+        w[nb + ni + i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w[nb + ni + i].dstSet = set; w[nb + ni + i].dstBinding = alias_slots[i]; w[nb + ni + i].descriptorCount = 1;
+        w[nb + ni + i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[nb + ni + i].pBufferInfo = &bi[nb + i];
+    }
+    vkUpdateDescriptorSets(device, nb + ni + na, w.data(), 0, nullptr);
     return set;
 }
 
