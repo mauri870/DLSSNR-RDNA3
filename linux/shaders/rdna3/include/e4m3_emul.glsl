@@ -34,18 +34,21 @@ float16_t nr_e4m3_decode(uint code) {
 
 // Rounding onto the e4m3 grid by adding and subtracting a constant whose ulp is the grid step.
 //
-// Adding M = +-2^(E+20) to x, where 2^E <= |x| < 2^(E+1), leaves a sum whose ulp is 2^(E-3):
+// Adding M = 1.5 * 2^(E+20) to x, where 2^E <= |x| < 2^(E+1), leaves a sum whose ulp is 2^(E-3):
 // exactly three mantissa bits of x survive, rounded to nearest even by the adder, and subtracting
-// M gives that value back. Below 2^-6 the grid is the fixed step 2^-9 of e4m3's subnormals, so
-// the exponent is clamped to -6. |x| is first limited to 448, the largest finite e4m3 value, which
-// is the saturation. Infinity becomes 448. `precise` keeps the compiler from cancelling the pair.
+// M gives that value back. M is positive whatever the sign of x: x + M lies within 2^(E+1) of
+// 1.5 * 2^(E+20), inside M's binade either way, so no sign has to be copied into it (one
+// v_and_or_b32 a value). Bit-identical to the sign-matched constant over every f32 and f16 input.
+// Below 2^-6 the grid is the fixed step 2^-9 of e4m3's subnormals, so the exponent is clamped
+// to -6. |x| is first limited to 448, the largest finite e4m3 value, which is the saturation.
+// Infinity becomes 448. `precise` keeps the compiler from cancelling the pair.
 float nr_e4m3_round(float x) {
 #if NR_QUANT_F16_ONLY
     return float(float16_t(clamp(x, -448.0, 448.0)));
 #endif
     precise float c = clamp(x, -448.0, 448.0);
     const uint u = floatBitsToUint(c);
-    const uint magic = (max(u & 0x7F800000u, 0x3C800000u) + 0x0A000000u) | (u & 0x80000000u);
+    const uint magic = max(u & 0x7F800000u, 0x3C800000u) + 0x0A400000u;
     precise float sum = c + uintBitsToFloat(magic);
     precise float r = sum - uintBitsToFloat(magic);
     return r;
@@ -53,7 +56,7 @@ float nr_e4m3_round(float x) {
 
 // The same for two f16 values at once, in packed 16-bit arithmetic: ACO emits v_pk_max_f16 /
 // v_pk_min_f16 for the limit, v_pk_max_u16 / v_pk_add_u16 for the constant and two v_pk_add_f16
-// for the rounding, about four instructions a value. M = +-2^(E+7), the f16 form of the above.
+// for the rounding, about four instructions a value. M = 1.5 * 2^(E+7), the f16 form of the above.
 // Valid for any f16 pair; the two halves never interact.
 f16vec2 nr_e4m3_round_pair(f16vec2 x) {
 #if NR_QUANT_F16_ONLY
@@ -61,8 +64,7 @@ f16vec2 nr_e4m3_round_pair(f16vec2 x) {
 #endif
     precise f16vec2 c = clamp(x, f16vec2(-448.0hf), f16vec2(448.0hf));
     const u16vec2 u = float16BitsToUint16(c);
-    const u16vec2 exponent = max(u & u16vec2(0x7C00us), u16vec2(0x2400us)) + u16vec2(0x1C00us);
-    const f16vec2 magic = uint16BitsToFloat16(exponent | (u & u16vec2(0x8000us)));
+    const f16vec2 magic = uint16BitsToFloat16(max(u & u16vec2(0x7C00us), u16vec2(0x2400us)) + u16vec2(0x1E00us));
     precise f16vec2 sum = c + magic;
     precise f16vec2 r = sum - magic;
     return r;
