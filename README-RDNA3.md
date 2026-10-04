@@ -17,21 +17,23 @@ without warranty.
 The network's time per frame on an RX 7900 XTX, one pass, measured from submit to completion
 (`linux/test/check_rdna3.py --perf`):
 
-| | 1080p | 1440p | 4K |
-| --- | --- | --- | --- |
-| RDNA3 (this branch) | 16 ms | 27 ms | 58 ms |
-| RDNA3, first working version | 30 ms | 54 ms | 116 ms |
-| RDNA4, RX 9070 XT (main README) | 5.6 ms | 9.7 ms | 21.9 ms |
+| | 720p | 1080p | 1440p | 4K |
+| --- | --- | --- | --- | --- |
+| RDNA3 (this branch) | 8.5 ms | 15 ms | 26 ms | 56 ms |
+| RDNA3, first working version | | 30 ms | 54 ms | 116 ms |
+| RDNA4, RX 9070 XT (main README) | | 5.6 ms | 9.7 ms | 21.9 ms |
 
-That is about 2.7 times the RDNA4 cost. The part of the frame the game itself needs is on top of this.
+That is about 2.6 times the RDNA4 cost. 1280x720 has 44 % of the pixels of 1080p and takes 57 % of
+the time, so the cost does not fall in step with the pixel count. There is no NVIDIA output at 720p to
+score against, so that column is time only. The part of the frame the game itself needs is on top of this.
 Running the network at a lower resolution than the frame is the lever for 4K: `model_scale` in
 `dlssnr-amd.ini` ("Model resolution" on the add-on's page in the game, 25 to 100 %) runs the network on a
 smaller copy of the frame and carries its edit back onto the full-resolution frame. At 4K:
 
 | Model resolution | Network extent (about) | Time | PSNR vs NVIDIA's full-resolution output |
 | --- | --- | --- | --- |
-| 100 % | 3840x2160 | 58 ms | 49.02 dB |
-| 75 % | 2880x1620 | 35 ms | 39.39 dB |
+| 100 % | 3840x2160 | 56 ms | 49.02 dB |
+| 75 % | 2880x1620 | 34 ms | 39.39 dB |
 | 50 % | 1920x1080 | 16 ms | 35.29 dB |
 | 37.5 % | 1440x810 | 11 ms | 33.83 dB |
 | 25 % | 960x540 | 8 ms | 32.66 dB |
@@ -67,8 +69,9 @@ The network is e4m3 (FP8) at every operation boundary. Every e4m3 value is exact
 RDNA3 build holds them as FP16 and multiplies them in the FP16 matrix instructions with FP32
 accumulation. The products are the ones the FP8 instructions form. What the FP8 hardware did in a
 conversion (round to nearest even, saturate at 448) is done in ALU instructions: a constant whose ulp is
-the e4m3 step is added and subtracted, which the adder rounds to nearest even by construction. It is
-checked against a bit-level rounding over every f32 bit pattern and every pair of f16 patterns
+the e4m3 step is added and subtracted, which the adder rounds to nearest even by construction. The constant
+is the same positive 1.5 * 2^(E+20) (2^(E+7) in f16) whatever the sign of the value, so no sign has to be
+copied into it. It is checked against a bit-level rounding over every f32 bit pattern and every pair of f16 patterns
 (`linux/test/e4m3_round_test`), and against the reference over every f16 input. A NaN input is not
 preserved; none reaches a quantiser in the network.
 
@@ -92,6 +95,7 @@ bit-identical before and after. 4K network time, ms:
 | e4m3 rounding by a magic constant instead of about sixteen ALU instructions a value | 116 | 84 |
 | C=32 kernels on two waves a window instead of one, the MLP streamed through its hidden fragments, the stage-1 k loop kept rolled at C=64 and C=128, the C=256 upsample projection k-outermost | 84 | 62 |
 | ViT contraction GEMM and C=512 attention in 256 VGPRs | 62 | 58 |
+| the e4m3 rounding constant positive for either sign (about 7 % fewer vector instructions in all, 2 % of the frame) | 58 | 56 |
 
 What mattered, most important first:
 
@@ -110,7 +114,7 @@ What mattered, most important first:
 ## Where the time goes now, and the floor
 
 The network is about 3.5 TFLOP at 4K. At the 123 TFLOPS matrix peak that is 28 ms, and 38 ms at a
-realistic 75 %, against 58 ms now. By family at 4K (ms of the frame, share of the matrix peak reached):
+realistic 75 %, against 56 ms now. By family at 4K (ms of the frame, share of the matrix peak reached):
 
 | Kernels | ms | Peak reached |
 | --- | --- | --- |
