@@ -2,9 +2,8 @@
 // Linear light in, the network's domain out.
 //
 // The pre-upscale colour buffer an upscaler consumes is scene-referred linear
-// light: tone mapping happens after the upscale, so values run past 1.0 and the
-// distribution is nothing like the finished sRGB frames the network was trained
-// on. Fed raw, two things happen, both seen in Dying Light The Beast: the
+// light: tone mapping happens after the upscale, so values run past 1.0. Fed
+// raw, two things happen, both seen in Dying Light The Beast: the
 // picture goes dark (linear 0.05 is sRGB 0.24), and every light source saturates
 // the pre block's features for its whole window, which comes out as a solid
 // coloured block. This pass makes the proxy the network sees and keeps the

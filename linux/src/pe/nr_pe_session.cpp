@@ -1,4 +1,7 @@
 #include "nr_pe_session.hpp"
+#if NR_INT4
+#include "nr_pe_config.hpp"   // Int4Switch
+#endif
 #include "nr_pe_log.hpp"
 #include "nr_log.hpp"
 #include <windows.h>
@@ -88,10 +91,24 @@ struct Session::Impl {
         // per pass, so a network built for four cannot serve a request for six.
         uint32_t passes{4};
         bool prep{};   // RuntimeConfig::preprocess
+#if NR_INT4
+        int int4{};    // RuntimeConfig::int4_mixed asked for (0 default, 1 int4 mixed)
+#endif
         uint64_t used{};   // LRU stamp
     };
     std::vector<Built> cache;
     uint64_t use_stamp{};
+    // Evicted networks wait here before they are destroyed. run_after and run_present record the network into
+    // the game's own command list (vkd3d-proton's command buffer), which the game submits and the GPU runs frames
+    // later: a network that served the previous frame can still be read by the GPU when its replacement is
+    // adopted (the [Int4Mixed] switch, a resolution change). Destroying it then frees memory under in-flight work
+    // and hangs the GPU. Freed after kRetireCalls more evaluations and kRetireTime, far past any frame in flight.
+    struct Retired { std::unique_ptr<Runtime> runtime; uint64_t call; std::chrono::steady_clock::time_point at; };
+    std::vector<Retired> retired;
+    uint64_t calls{};   // ensure_runtime calls (one per evaluation)
+    static constexpr uint64_t kRetireCalls = 16;
+    static constexpr std::chrono::seconds kRetireTime{1};
+    void free_retired();
     // The entry in `cache` the run paths are using. Raw, because the cache owns
     // them; null until the first build lands.
     Runtime* runtime{};
@@ -172,6 +189,12 @@ struct Session::Impl {
     std::thread build_thread;
     std::mutex build_lock;
     bool building{}, build_done{}, build_linear{}, build_prep{};
+    std::chrono::steady_clock::time_point build_started{};
+#if NR_INT4
+    // [Int4Mixed]: the network the switch asks for, the one being built, and the one running (Built::int4).
+    Int4Switch int4_switch;
+    int int4_want{}, build_int4{}, running_int4{-1};
+#endif
     uint32_t build_passes{kMaxPasses};
     uint32_t build_w{}, build_h{};
     VkFormat build_format{VK_FORMAT_UNDEFINED};
@@ -208,7 +231,7 @@ struct Session::Impl {
     uint32_t max_passes_want{kMaxPasses};
     bool ensure_own_command_buffer();
     bool ensure_d3d12_device(ID3D12Device* device);
-    bool fits_in_memory(uint32_t w, uint32_t h);
+    bool fits_in_memory(uint32_t w, uint32_t h, bool quiet = false);   // quiet: no log, no status
     // Make `entry` the one the run paths use. Returns false when there is no
     // such entry.
     bool select_runtime(uint32_t w, uint32_t h, VkFormat format, bool want_linear);
@@ -216,8 +239,9 @@ struct Session::Impl {
         for (const auto& e : cache) if (e.width == w && e.height == h) return true;
         return false;
     }
-    // Free least-recently-used entries until the card can hold another network
-    // at this extent. False means it cannot hold one even with the cache empty.
+    // True when the card can hold another network at this extent. Otherwise the
+    // least recently used entry is evicted (one per call) and false is returned:
+    // the frame passes through and the build is asked for again later.
     bool make_room(uint32_t w, uint32_t h);
     void drop(size_t index, const char* why = "to make room");
     // Feature ids, handed out by Session::create_feature. Monotonic, never
@@ -426,7 +450,7 @@ static uint64_t arena_bytes_per_pixel() {
     return e && *e && std::atoi(e) == 0 ? 520 : 200;
 }
 
-bool Session::Impl::fits_in_memory(uint32_t w, uint32_t h) {
+bool Session::Impl::fits_in_memory(uint32_t w, uint32_t h, bool quiet) {
     // The padded working extent, which is what the arena is sized from.
     const uint64_t pixels = uint64_t((w + 63) / 64 * 64) * ((h + 63) / 64 * 64);
     const uint64_t need = pixels * arena_bytes_per_pixel() + (300ull << 20);   // arena, plus weights and scratch
@@ -451,6 +475,7 @@ bool Session::Impl::fits_in_memory(uint32_t w, uint32_t h) {
     }
     const double need_mb = double(need) / (1 << 20);
     const double free_mb = double(available) / (1 << 20);
+    if (quiet) return !available || need <= available;
     if (available && need > available) {
         char message[256];
         std::snprintf(message, sizeof message,
@@ -471,6 +496,9 @@ bool Session::Impl::select_runtime(uint32_t w, uint32_t h, VkFormat format, bool
         if (e.width != w || e.height != h || e.format != format || e.linear != want_linear ||
             e.scale != model_scale || e.passes != max_passes_want || e.prep != prep_want)
             continue;
+#if NR_INT4
+        if (e.int4 != int4_want) continue;   // [Int4Mixed]: the network the switch asks for
+#endif
         e.used = ++use_stamp;
         if (runtime != e.runtime.get()) {
             log("[nr] runtime cache hit: %ux%u (model %ux%u, scale %.2f%s), %u built, "
@@ -481,6 +509,9 @@ bool Session::Impl::select_runtime(uint32_t w, uint32_t h, VkFormat format, bool
         runtime = e.runtime.get();
         width = e.width; height = e.height; this->format = e.format;
         linear = e.linear; built_scale = e.scale;
+#if NR_INT4
+        running_int4 = e.int4;
+#endif
         return true;
     }
     return false;
@@ -492,22 +523,33 @@ void Session::Impl::drop(size_t index, const char* why) {
     if (runtime == e.runtime.get()) { runtime = nullptr; width = height = 0; }
     // Nothing of ours may still be reading it. On the paths that submit for
     // themselves this waits on our own fence; on the paths that record into the
-    // game's command list there is nothing of ours to wait for, and eviction
-    // only happens on a frame where the caller has already been told to pass
-    // through - which is exactly when it is safe.
+    // game's command list the game's frames in flight may still hold it, so it
+    // is not destroyed here but retired (see Retired).
     wait_for_own_cmd();
+    retired.push_back({std::move(e.runtime), calls, std::chrono::steady_clock::now()});
     cache.erase(cache.begin() + long(index));
 }
 
-bool Session::Impl::make_room(uint32_t w, uint32_t h) {
-    while (true) {
-        if (fits_in_memory(w, h)) return true;
-        if (cache.empty()) return false;
-        size_t oldest = 0;
-        for (size_t i = 1; i < cache.size(); ++i)
-            if (cache[i].used < cache[oldest].used) oldest = i;
-        drop(oldest);
+void Session::Impl::free_retired() {
+    const auto now = std::chrono::steady_clock::now();
+    for (size_t i = retired.size(); i-- > 0;) {
+        if (calls - retired[i].call < kRetireCalls || now - retired[i].at < kRetireTime) continue;
+        retired.erase(retired.begin() + long(i));
+        log("[nr] evicted network freed");
     }
+}
+
+bool Session::Impl::make_room(uint32_t w, uint32_t h) {
+    if (fits_in_memory(w, h)) return true;
+    if (cache.empty()) return false;
+    size_t oldest = 0;
+    for (size_t i = 1; i < cache.size(); ++i)
+        if (cache[i].used < cache[oldest].used) oldest = i;
+    // One at a time: an evicted network keeps its memory until it is freed (see Retired), and the build is asked
+    // for again once it has been.
+    drop(oldest);
+    status = "freeing the least recently used network to make room";
+    return false;
 }
 
 bool Session::Impl::ensure_runtime(const Controls& controls, uint32_t w, uint32_t h, VkFormat format,
@@ -528,10 +570,15 @@ bool Session::Impl::ensure_runtime(const Controls& controls, uint32_t w, uint32_
 
 bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32_t h, VkFormat format,
                                     bool want_linear) {
+    ++calls;
+    if (!retired.empty()) free_retired();
     if (controls.preprocess.active() && !prep_want) {
         prep_want = true;
         log("[nr] preprocess asked for: networks are rebuilt able to run it (once)");
     }
+#if NR_INT4
+    int4_want = int4_switch.frame(root + "\\dlssnr-amd.ini");
+#endif
     // Adopt a finished background build first.
     {
         std::lock_guard<std::mutex> guard(build_lock);
@@ -543,6 +590,11 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
                 entry.width = build_w; entry.height = build_h; entry.format = build_format;
                 entry.linear = build_linear; entry.scale = build_scale;
                 entry.passes = build_passes; entry.prep = build_prep;
+#if NR_INT4
+                // what was built, not what was asked: an int4 build without what it needs is the default network
+                entry.int4 = built->int4_mixed() ? 1 : 0;
+                if (build_int4 && !entry.int4) { int4_switch.unavailable(); int4_want = 0; }   // not asked again this run
+#endif
                 entry.used = ++use_stamp;
                 entry.runtime = std::move(built);
                 log("[nr] network built at %ux%u (model %ux%u, scale %.2f) on queue family %u in "
@@ -558,11 +610,21 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
                     if (entry.prep && !cache[i].prep && cache[i].width == entry.width &&
                         cache[i].height == entry.height)
                         drop(i, "built without the preprocess");
+#if NR_INT4
+                // [Int4Mixed] switch: unless KeepBoth, only one kind of network stays resident. The one the switch left
+                // keeps no memory once its replacement is in (switching back builds it again, the running one serving).
+                if (!int4_switch.keep_both())
+                    for (size_t i = cache.size(); i-- > 0;)
+                        if (cache[i].int4 != entry.int4) drop(i, entry.int4 ? "(default; int4 mixed is in)" : "(int4 mixed; default is in)");
+#endif
                 cache.push_back(std::move(entry));
                 auto& adopted = cache.back();
                 runtime = adopted.runtime.get();
                 width = adopted.width; height = adopted.height; this->format = adopted.format;
                 linear = adopted.linear; built_scale = adopted.scale;
+#if NR_INT4
+                running_int4 = adopted.int4;
+#endif
                 oom_failures = 0;
                 retry_at = {};
             } else {
@@ -586,7 +648,16 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
         }
     }
     if (select_runtime(w, h, format, want_linear)) return true;
+#if NR_INT4
+    // [Int4Mixed] switch: the running network keeps serving its frames while the other one builds, so the
+    // comparison has no gap but the build itself (the first int4 build also compiles its pipelines).
+    const bool int4_only = runtime && running_int4 >= 0 && running_int4 != int4_want && width == w && height == h &&
+                           this->format == format && linear == want_linear && built_scale == model_scale;
+#endif
     if (building) {
+#if NR_INT4
+        if (int4_only) return true;
+#endif
         status = "building the network in the background; frames pass through until it is ready";
         return false;
     }
@@ -608,6 +679,16 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
     // a smaller extent may well fit later, and a game changing resolution is
     // exactly when that happens. Cached networks at other extents are given up
     // one at a time, oldest first, until this one fits.
+    // An evicted network still holds its memory until it is freed. If the next one does not fit beside it, wait
+    // for that rather than push out another: the switch keeps the running network serving, anything else passes
+    // through.
+    if (!retired.empty() && !fits_in_memory(w, h, true)) {
+#if NR_INT4
+        if (int4_only) return true;
+#endif
+        status = "freeing the previous network before building another";
+        return false;
+    }
     if (!make_room(w, h)) return false;
     RuntimeConfig config;
     config.root = root; config.width = w; config.height = h; config.colour_format = format;
@@ -616,6 +697,9 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
     config.max_passes = native_compose ? 1u : max_passes_want;
     config.native_compose = native_compose;
     config.preprocess = prep_want;
+#if NR_INT4
+    config.int4_mixed = int4_want;
+#endif
     // The soft knee to undo: the linear path's own encode, or OptiScaler's
     // linear-HDR encode, which a float proxy on the OptiScaler route came
     // through (OptiScaler encodes a float colour flagged IsHDR or AutoExposure
@@ -638,8 +722,16 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
     // the build is adopted above.
     const QueueAccess access_copy = access;
     building = true; build_w = w; build_h = h; build_format = format; build_linear = want_linear;
+    build_started = std::chrono::steady_clock::now();
+    nr::g_build_stage = 1; nr::g_build_pipes_done = 0; nr::g_build_pipes_total = 0;
     build_scale = model_scale; build_passes = max_passes_want; build_prep = prep_want;
+#if NR_INT4
+    build_int4 = int4_want;
+#endif
     status = "building the network in the background; frames pass through until it is ready";
+#if NR_INT4
+    log("[nr] network asked for: %s", int4_want ? "int4 mixed" : "default");
+#endif
     log("[nr] building the network at %ux%u (model scale %.2f) in the background%s", w, h, model_scale,
         want_linear ? " (linear-light colour: encoding with a white point, see dlssnr-amd.ini white_point)" : "");
     build_thread = std::thread([this, host, config, temporal, access_copy] {
@@ -658,15 +750,31 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
             HostDevice locked = host;
             locked.queue_lock = access_copy.lock_quiet;
             locked.queue_unlock = access_copy.unlock_quiet;
+#if NR_INT4
+            try {   // an int4 mixed build that fails (its weights file damaged, from other data...) gives the default one
+#endif
             made = std::make_unique<Runtime>(locked, config, ControlMaskConfig{}, temporal);
-        } catch (const std::bad_alloc&) {
+#if NR_INT4
+            } catch (const std::bad_alloc&) {
+                throw;   // host memory: the whole build is retried later, int4 mixed still requested
+            } catch (const std::exception& e) {
+                if (config.int4_mixed != 1) throw;
+                log("[nr] int4 mixed network failed: %s; building the default network", e.what());
+                RuntimeConfig fallback = config;
+                fallback.int4_mixed = 0;
+                made = std::make_unique<Runtime>(locked, fallback, ControlMaskConfig{}, temporal);
+            }
+#endif
+        } catch (const std::bad_alloc& e) {
             // Caught apart from everything else because it is the one failure
-            // that is about the *host* and is worth retrying. `what()` here is
-            // the useless string "std::bad_alloc"; what a reader needs is how
-            // much address space was left, and the build's own log lines above
-            // say what it had just asked for.
+            // that is about the *host* and is worth retrying: operator new, or
+            // Vulkan's own host-memory / mapping failures (nrvk::HostMemoryError).
+            // For a plain bad_alloc `what()` is the useless "std::bad_alloc";
+            // what a reader needs is how much address space was left, and the
+            // build's own log lines above say what it had just asked for.
             oom = true;
-            error = "neural rendering unavailable: out of host memory. " + address_space_report();
+            error = std::string("neural rendering unavailable: out of host memory (") + e.what() + "). " +
+                    address_space_report();
         } catch (const std::exception& e) {
             error = std::string("neural rendering unavailable: ") + e.what();
         }
@@ -675,6 +783,9 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
         built = std::move(made); build_error = error; build_seconds = seconds; build_done = true;
         build_oom = oom;
     });
+#if NR_INT4
+    if (int4_only && runtime != nullptr) return true;   // an [Int4Mixed] switch: the running one serves until the new one is in
+#endif
     return false;
 }
 
@@ -890,6 +1001,8 @@ Session::Session(std::string root) : impl_(std::make_unique<Impl>()) {
     // went to a stdout a game does not have. Send them to the same file
     // everything else here writes to.
     nr::set_log_sink([](const char* line) { log("%s", line); });
+    // 32-bit: the build logs the free address space at each phase.
+    if (sizeof(void*) == 4) nr::g_memory_note = [] { return address_space_report(); };
     log("[nr] session root %s", impl_->root.c_str());
     // NR_INPUT_CHECK=1 (NR_INPUT_CHECK_DEFAULT for a build that has it on without asking):
     // score what the game hands the network and what it gets back; pictures in
@@ -948,6 +1061,7 @@ Session::~Session() {
     impl_->built.reset();
     impl_->runtime = nullptr;
     impl_->cache.clear();
+    impl_->retired.clear();
     impl_->release_output();
     impl_->release_invalidator();
     impl_->release_vk_output();
@@ -976,6 +1090,38 @@ bool Session::failed() const { return impl_->failed; }
 // rebuild the old one is still the one paying for the picture on screen.
 float Session::gpu_ms() const {
     return impl_->runtime ? impl_->runtime->average_gpu_ms() : 0.0f;
+}
+
+float Session::network_ms() const {
+    return impl_->runtime ? impl_->runtime->average_network_ms() : 0.0f;
+}
+
+Session::State Session::state() const {
+    State s;
+    const auto& m = *impl_;
+    s.running = m.runtime != nullptr;
+    if (m.runtime) { s.model_w = m.runtime->model_width(); s.model_h = m.runtime->model_height(); }
+#if NR_INT4
+    s.running_int4 = m.runtime ? m.running_int4 : -1;
+    s.want_int4 = m.int4_want;
+    s.int4_available = !m.int4_switch.is_off();
+    s.building_int4 = m.building ? m.build_int4 : -1;
+#endif
+    s.building = m.building;
+    if (m.building) {
+        s.building_seconds = std::chrono::duration<float>(std::chrono::steady_clock::now() - m.build_started).count();
+        s.stage = nr::g_build_stage;
+        s.pipes_done = nr::g_build_pipes_done; s.pipes_total = nr::g_build_pipes_total;
+    }
+    return s;
+}
+
+void Session::set_int4(bool on) {
+#if NR_INT4
+    impl_->int4_switch.set(on);
+#else
+    (void)on;
+#endif
 }
 
 uint64_t Session::create_feature() {
@@ -1303,6 +1449,9 @@ bool Session::run_d3d11(const D3D11Frame& frame, const Controls& controls) {
     // Transition from the layout DXVK believes the image is in, and put it back:
     // the game's next use of its own texture must see what it left there.
     colour.before = colour.after = target.layout;
+    // What DXVK says the image may be used for: with SAMPLED and STORAGE the runtime reads and
+    // writes it in place at Model resolution below 100% instead of copying it out and back.
+    colour.usage = target.usage;
 
     EngineFrame engine{};
     engine.colour = colour;
@@ -1482,8 +1631,9 @@ VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
     s.handles = handles;
 
     // A Vulkan game gives us no D3D12 resource to hand back, so the output is a
-    // plain VkImage of our own rather than one borrowed from a D3D12 allocation.
-    if (!s.vk_output_valid(frame.width, frame.height, frame.colour_format)) {
+    // plain VkImage of our own rather than one borrowed from a D3D12 allocation -
+    // unless the caller takes the answer in its own image (VulkanFrame::in_place).
+    if (!frame.in_place && !s.vk_output_valid(frame.width, frame.height, frame.colour_format)) {
         if (!s.ensure_vk_output(frame.width, frame.height, frame.colour_format))
             return VK_NULL_HANDLE;
     }
@@ -1493,17 +1643,18 @@ VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
         return VK_NULL_HANDLE;
 
     ColourFrame colour{};
-    colour.image = s.vk_output;
+    colour.image = frame.in_place ? frame.colour : s.vk_output;
     colour.format = frame.colour_format;
     colour.width = frame.width; colour.height = frame.height;
-    colour.before = colour.after = VK_IMAGE_LAYOUT_GENERAL;
+    colour.before = colour.after = frame.in_place ? frame.colour_layout : VK_IMAGE_LAYOUT_GENERAL;
+    if (frame.in_place) colour.usage = frame.colour_usage;
 
     EngineFrame engine{};
     engine.colour = colour;
     // The caller's colour read in place and its output written directly (the engine path with
     // the model applied): the copy into vk_output, the copy into the runtime's input and the
     // write-back all go. Anything else keeps the copies below.
-    const bool direct = frame.output && frame.motion && s.runtime && s.runtime->takes_target(controls) &&
+    const bool direct = !frame.in_place && frame.output && frame.motion && s.runtime && s.runtime->takes_target(controls) &&
                         (frame.colour_usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
                         !(std::getenv("NR_VK_COPY") && std::atoi(std::getenv("NR_VK_COPY")));
     if (direct) {
@@ -1548,6 +1699,18 @@ VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
             return VK_NULL_HANDLE;
         }
         return frame.output;
+    }
+    if (frame.in_place) {
+        try {
+            if (frame.motion) s.runtime->record_engine(cmd, engine, controls);
+            else s.runtime->record(cmd, colour, controls);
+        } catch (const std::exception& e) {
+            s.status = std::string("neural rendering failed: ") + e.what();
+            s.failed = true;
+            log("[nr] %s", s.status.c_str());
+            return VK_NULL_HANDLE;
+        }
+        return frame.colour;
     }
     try {
         VkImageCopy copy{};

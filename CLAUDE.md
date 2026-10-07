@@ -23,6 +23,8 @@ Notes for contributors and coding assistants. README.md covers what the project 
   where the original uses FP8, FP16/FP32 elsewhere. No new lower-precision boundary, no truncated
   inputs or lookup tables. Changing the order of a reduction changes the picture too - it is not a free
   reordering.
+  The optional int4 mixed network (`NR_INT4=1`, `linux/shaders/rdna4/pipelines-int4.json`) is the one
+  exception: it trades precision for speed by design and is installed only when asked for.
 - **Weight packing.** A new kernel that reads weights must be added to the host's weight packing
   (`nr_graph.cpp`); otherwise it runs on unpacked data and its results are meaningless.
 - **Reproducible shaders.** `fetch_deps.sh` pins glslang 16.5.0; with it `build_network.py` produces the

@@ -11,13 +11,21 @@
 // them back without staging; the adapter that owns the game's VkDevice will
 // allocate the same arenas out of device-local memory.
 #pragma once
+#if NR_INT4
+#include "nr_build_cfg.hpp"
+#include "nr_log.hpp"
+#endif
 #include <vulkan/vulkan.h>
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#if NR_INT4
+#include <iterator>
+#endif
 #include <functional>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <algorithm>
@@ -25,9 +33,21 @@
 
 namespace nrvk {
 
+// The host ran out of memory or address space (VK_ERROR_OUT_OF_HOST_MEMORY,
+// VK_ERROR_MEMORY_MAP_FAILED). A std::bad_alloc, so callers that retry a build
+// after a host-memory failure (a 32-bit game while it is loading) treat it as
+// one; everything else that catches std::exception still does.
+struct HostMemoryError : std::bad_alloc {
+    std::string text;
+    explicit HostMemoryError(std::string t) : text(std::move(t)) {}
+    const char* what() const noexcept override { return text.c_str(); }
+};
+
 inline void check(VkResult r, const char* what) {
-    if (r != VK_SUCCESS)
-        throw std::runtime_error(std::string(what) + ": VkResult=" + std::to_string(r));
+    if (r == VK_SUCCESS) return;
+    std::string text = std::string(what) + ": VkResult=" + std::to_string(r);
+    if (r == VK_ERROR_OUT_OF_HOST_MEMORY || r == VK_ERROR_MEMORY_MAP_FAILED) throw HostMemoryError(std::move(text));
+    throw std::runtime_error(text);
 }
 #define NRVK_CHECK(expr) ::nrvk::check((expr), #expr)
 
@@ -182,7 +202,55 @@ struct Context {
                               VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME};
         VkDeviceCreateInfo di{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
         di.pNext = &coop; di.queueCreateInfoCount = 1; di.pQueueCreateInfos = &qi;
-        di.enabledExtensionCount = have_wml ? 3 : 2; di.ppEnabledExtensionNames = exts;
+        std::vector<const char*> ext_list(exts, exts + (have_wml ? 3 : 2));
+        // Our pipelines ask for no robust buffer / image access (Kernel::create); the feature that allows it.
+        VkPhysicalDevicePipelineRobustnessFeaturesEXT prf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT};
+        {
+            VkPhysicalDeviceFeatures2 q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            q.pNext = &prf;
+            vkGetPhysicalDeviceFeatures2(physical, &q);
+            uint32_t ne = 0;
+            vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, nullptr);
+            std::vector<VkExtensionProperties> have(ne);
+            vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, have.data());
+            bool listed = false;
+            for (const auto& e : have) listed |= !std::strcmp(e.extensionName, VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
+            if (prf.pipelineRobustness && listed) {
+                prf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT};
+                prf.pipelineRobustness = VK_TRUE;
+                VkBaseOutStructure* tail = reinterpret_cast<VkBaseOutStructure*>(&coop);
+                while (tail->pNext) tail = tail->pNext;
+                tail->pNext = reinterpret_cast<VkBaseOutStructure*>(&prf);
+                ext_list.push_back(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
+                pipeline_robustness = true;
+            }
+        }
+        di.enabledExtensionCount = uint32_t(ext_list.size()); di.ppEnabledExtensionNames = ext_list.data();
+#if NR_INT4
+        // int4 mixed: pipeline binaries for the int4 pipelines (Kernel::create rewrites their WMMA opcode in a
+        // captured binary), enabled when the driver has them.
+        std::vector<const char*> exts_i4(di.ppEnabledExtensionNames, di.ppEnabledExtensionNames + di.enabledExtensionCount);
+        VkPhysicalDevicePipelineBinaryFeaturesKHR pbf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR};
+        VkPhysicalDeviceMaintenance5FeaturesKHR m5{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
+        {
+            VkPhysicalDeviceFeatures2 q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            q.pNext = &pbf; pbf.pNext = &m5;
+            vkGetPhysicalDeviceFeatures2(physical, &q);
+            pbf.pNext = nullptr; m5.pNext = nullptr;
+        }
+        if (pbf.pipelineBinaries && m5.maintenance5) {
+            pbf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR}; pbf.pipelineBinaries = VK_TRUE;
+            m5 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR}; m5.maintenance5 = VK_TRUE;
+            pbf.pNext = &m5;
+            VkBaseOutStructure* tail = reinterpret_cast<VkBaseOutStructure*>(&coop);
+            while (tail->pNext) tail = tail->pNext;
+            tail->pNext = reinterpret_cast<VkBaseOutStructure*>(&pbf);
+            exts_i4.push_back(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
+            exts_i4.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+            pipeline_binary = true;
+        }
+        di.enabledExtensionCount = uint32_t(exts_i4.size()); di.ppEnabledExtensionNames = exts_i4.data();
+#endif
         NRVK_CHECK(vkCreateDevice(physical, &di, nullptr, &device));
         vkGetDeviceQueue(device, family, 0, &queue);
         vkGetPhysicalDeviceMemoryProperties(physical, &mem);
@@ -221,9 +289,13 @@ struct Context {
         // memory blocks (NR_UPS_ALIAS), which needs this extension.
         VkPhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR wml{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_FEATURES_KHR};
+        VkPhysicalDevicePipelineRobustnessFeaturesEXT prf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT};
         VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-        f2.pNext = &c; c.pNext = &f8; f8.pNext = &v11; v11.pNext = &v12; v12.pNext = &v13; v13.pNext = &wml;
+        f2.pNext = &c; c.pNext = &f8; f8.pNext = &v11; v11.pNext = &v12; v12.pNext = &v13; v13.pNext = &wml; wml.pNext = &prf;
         vkGetPhysicalDeviceFeatures2(physical, &f2);
+        // DXVK and vkd3d-proton create their devices with robustBufferAccess2 and without this feature; RADV
+        // compiles a pipeline by its own VkPipelineRobustnessCreateInfo whether or not the device enabled it.
+        pipeline_robustness = prf.pipelineRobustness;
         if (!c.cooperativeMatrix)             return no("cooperativeMatrix");
         if (!f8.shaderFloat8)                 return no("shaderFloat8");
         if (!f8.shaderFloat8CooperativeMatrix) return no("shaderFloat8CooperativeMatrix");
@@ -251,11 +323,24 @@ struct Context {
             !(sg.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT))
             return no("32-lane compute subgroups");
         vkGetPhysicalDeviceMemoryProperties(physical, &mem);
+#if NR_INT4
+        // int4 pipelines need VK_KHR_pipeline_binary enabled on the host's device;
+        // a command of an extension the device did not enable resolves to null.
+        pipeline_binary = vkGetDeviceProcAddr(dev, "vkCreatePipelineBinariesKHR") != nullptr;
+#endif
         adopted = true;
         return true;
     }
     // `destroy` must not tear down a device it did not create.
     bool adopted = false;
+    // The driver has VK_EXT_pipeline_robustness: Kernel::create compiles every pipeline without robust buffer and
+    // image access. Every access of ours is in bounds, so the output is the same; on a device with
+    // robustBufferAccess2 (DXVK, vkd3d-proton) the robust pipelines are slower.
+    bool pipeline_robustness = false;
+#if NR_INT4
+    // VK_KHR_pipeline_binary is enabled on this device (int4 pipelines need it).
+    bool pipeline_binary = false;
+#endif
 
     // ---- the pipeline cache, on disk ---------------------------------------
     //
@@ -409,40 +494,61 @@ struct Context {
         return b;
     }
 
-    // One-shot staged transfer. Setup path only - no attempt at overlap, and
-    // the staging buffer lives exactly as long as the copy.
+    // Staged transfers. Setup path only - no attempt at overlap.
+    //
+    // **The staging buffer is at most kStageBytes, and big copies go through
+    // it in pieces.** A mapping as large as the copy (the weights, a 4K input
+    // image) needs that much contiguous address space, which a 32-bit game
+    // often does not have (vkMapMemory: VK_ERROR_MEMORY_MAP_FAILED).
+    static constexpr VkDeviceSize kStageBytes = VkDeviceSize(16) << 20;
+
     void transfer(Buffer& gpu, VkDeviceSize offset, void* host, VkDeviceSize bytes, bool to_gpu) {
         if (!bytes) return;
-        Buffer stage = buffer(bytes, true);
-        if (to_gpu) std::memcpy(stage.mapped, host, bytes);
-        VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-        cpi.queueFamilyIndex = family;
-        VkCommandPool pool;
-        NRVK_CHECK(vkCreateCommandPool(device, &cpi, nullptr, &pool));
-        VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        cai.commandPool = pool; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = 1;
-        VkCommandBuffer cmd;
-        NRVK_CHECK(vkAllocateCommandBuffers(device, &cai, &cmd));
-        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        NRVK_CHECK(vkBeginCommandBuffer(cmd, &bi));
-        VkBufferCopy region{};
-        region.srcOffset = to_gpu ? 0 : offset;
-        region.dstOffset = to_gpu ? offset : 0;
-        region.size = bytes;
-        vkCmdCopyBuffer(cmd, to_gpu ? stage.handle : gpu.handle,
-                        to_gpu ? gpu.handle : stage.handle, 1, &region);
-        NRVK_CHECK(vkEndCommandBuffer(cmd));
-        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
-        VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-        VkFence fence;
-        NRVK_CHECK(vkCreateFence(device, &fi, nullptr, &fence));
-        submit(si, fence);
-        NRVK_CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, 30000000000ull));
-        if (!to_gpu) std::memcpy(host, stage.mapped, bytes);
-        vkDestroyFence(device, fence, nullptr);
-        vkDestroyCommandPool(device, pool, nullptr);
+        const VkDeviceSize chunk = std::min(bytes, kStageBytes);
+        Buffer stage = buffer(chunk, true);
+        try {
+            for (VkDeviceSize done = 0; done < bytes; done += chunk) {
+                const VkDeviceSize n = std::min(chunk, bytes - done);
+                uint8_t* h = static_cast<uint8_t*>(host) + done;
+                if (to_gpu) std::memcpy(stage.mapped, h, size_t(n));
+                one_shot([&](VkCommandBuffer cmd) {
+                    VkBufferCopy region{};
+                    region.srcOffset = to_gpu ? 0 : offset + done;
+                    region.dstOffset = to_gpu ? offset + done : 0;
+                    region.size = n;
+                    vkCmdCopyBuffer(cmd, to_gpu ? stage.handle : gpu.handle,
+                                    to_gpu ? gpu.handle : stage.handle, 1, &region);
+                });
+                if (!to_gpu) std::memcpy(h, stage.mapped, size_t(n));
+            }
+        } catch (...) {
+            destroy(stage);
+            throw;
+        }
+        destroy(stage);
+    }
+    // A buffer upload whose bytes are produced a staging piece at a time:
+    // `fill(offset, n, dst)` writes bytes offset..offset+n of the range into dst.
+    // The source never has to be one block (the graph's weight arena is chunked).
+    void upload_with(Buffer& gpu, VkDeviceSize offset, VkDeviceSize bytes,
+                     const std::function<void(VkDeviceSize, VkDeviceSize, uint8_t*)>& fill) {
+        if (!bytes) return;
+        const VkDeviceSize chunk = std::min(bytes, kStageBytes);
+        Buffer stage = buffer(chunk, true);
+        try {
+            for (VkDeviceSize done = 0; done < bytes; done += chunk) {
+                const VkDeviceSize n = std::min(chunk, bytes - done);
+                fill(done, n, static_cast<uint8_t*>(stage.mapped));
+                one_shot([&](VkCommandBuffer cmd) {
+                    VkBufferCopy region{};
+                    region.srcOffset = 0; region.dstOffset = offset + done; region.size = n;
+                    vkCmdCopyBuffer(cmd, stage.handle, gpu.handle, 1, &region);
+                });
+            }
+        } catch (...) {
+            destroy(stage);
+            throw;
+        }
         destroy(stage);
     }
     void upload(Buffer& b, VkDeviceSize off, const void* data, VkDeviceSize bytes) {
@@ -588,27 +694,52 @@ struct Context {
         im.layout = to;
     }
 
-    void image_transfer(Image& im, void* host, VkDeviceSize bytes, bool to_gpu) {
-        Buffer stage = buffer(bytes, true);
-        if (to_gpu) std::memcpy(stage.mapped, host, bytes);
+    // The image's rows, `rows` at a time through one staging buffer of at
+    // most kStageBytes (see `transfer`). `io(y0, n, stage)` writes rows
+    // y0..y0+n into the staging memory on the way to the GPU, and reads them
+    // from it on the way back. Tightly packed rows, bytes / h each.
+    void image_rows(Image& im, VkDeviceSize bytes, bool to_gpu,
+                    const std::function<void(uint32_t, uint32_t, uint8_t*)>& io) {
+        if (!bytes || !im.h) return;
+        const VkDeviceSize row = bytes / im.h;
+        const uint32_t step = uint32_t(std::max<VkDeviceSize>(1, std::min<VkDeviceSize>(im.h, kStageBytes / row)));
+        Buffer stage = buffer(row * step, true);
         const VkImageLayout keep = im.layout;
-        transition(im, to_gpu ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
-                              : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        one_shot([&](VkCommandBuffer cmd) {
-            VkBufferImageCopy r{};
-            r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            r.imageExtent = {im.w, im.h, 1};
-            if (to_gpu)
-                vkCmdCopyBufferToImage(cmd, stage.handle, im.handle,
-                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
-            else
-                vkCmdCopyImageToBuffer(cmd, im.handle,
-                                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                       stage.handle, 1, &r);
-        });
-        transition(im, keep);
-        if (!to_gpu) std::memcpy(host, stage.mapped, bytes);
+        try {
+            transition(im, to_gpu ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+                                  : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            for (uint32_t y0 = 0; y0 < im.h; y0 += step) {
+                const uint32_t n = std::min(step, im.h - y0);
+                if (to_gpu) io(y0, n, static_cast<uint8_t*>(stage.mapped));
+                one_shot([&](VkCommandBuffer cmd) {
+                    VkBufferImageCopy r{};
+                    r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                    r.imageOffset = {0, int32_t(y0), 0};
+                    r.imageExtent = {im.w, n, 1};
+                    if (to_gpu)
+                        vkCmdCopyBufferToImage(cmd, stage.handle, im.handle,
+                                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+                    else
+                        vkCmdCopyImageToBuffer(cmd, im.handle,
+                                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                               stage.handle, 1, &r);
+                });
+                if (!to_gpu) io(y0, n, static_cast<uint8_t*>(stage.mapped));
+            }
+            transition(im, keep);
+        } catch (...) {
+            destroy(stage);
+            throw;
+        }
         destroy(stage);
+    }
+    void image_transfer(Image& im, void* host, VkDeviceSize bytes, bool to_gpu) {
+        const VkDeviceSize row = im.h ? bytes / im.h : 0;
+        uint8_t* h = static_cast<uint8_t*>(host);
+        image_rows(im, bytes, to_gpu, [&](uint32_t y0, uint32_t n, uint8_t* stage) {
+            if (to_gpu) std::memcpy(stage, h + y0 * row, size_t(n * row));
+            else std::memcpy(h + y0 * row, stage, size_t(n * row));
+        });
     }
     void upload(Image& im, const void* data, VkDeviceSize bytes) {
         image_transfer(im, const_cast<void*>(data), bytes, true);
@@ -750,7 +881,138 @@ struct Kernel {
         cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         cpi.stage.module = module; cpi.stage.pName = "main";
         cpi.layout = layout;
+        VkPipelineRobustnessCreateInfoEXT robustness{VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO_EXT};
+        robustness.storageBuffers = robustness.uniformBuffers = robustness.vertexInputs =
+            VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT;
+        robustness.images = VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
+        if (ctx.pipeline_robustness) cpi.pNext = &robustness;
+#if NR_INT4
+        // `<spv>.iu4` marks an int4 pipeline (int8 cooperative matrices whose bytes
+        // hold int4 pairs). Its binary is captured, every v_wmma_i32_16x16x16_iu8 (dword hi16 0xcc44)
+        // becomes v_wmma_i32_16x16x32_iu4 (0xcc4a; the second dword is identical), and the copy is
+        // imported under a fresh key. Only this pipeline changes; the file holds the expected count.
+        std::ifstream iu4(spirv_path + ".iu4");
+        if (iu4) {
+            int want = -1; iu4 >> want;
+            if (!ctx.pipeline_binary) throw std::runtime_error("int4 pipeline needs VK_KHR_pipeline_binary: " + spirv_path);
+            create_iu4(cpi, want, spirv_path, ctx.physical, code);
+            return;
+        }
+#endif
         NRVK_CHECK(vkCreateComputePipelines(device, ctx.pipeline_cache, 1, &cpi, nullptr, &pipeline));
+#if NR_INT4
+    }
+
+    int iu4_rewrites = 0;
+    void create_iu4(VkComputePipelineCreateInfo cpi, int want, const std::string& path, VkPhysicalDevice physical,
+                    const std::vector<uint32_t>& code) {
+#define NRVK_PB(n) auto n = reinterpret_cast<PFN_##n>(vkGetDeviceProcAddr(device, #n))
+        NRVK_PB(vkCreatePipelineBinariesKHR); NRVK_PB(vkGetPipelineBinaryDataKHR);
+        NRVK_PB(vkDestroyPipelineBinaryKHR); NRVK_PB(vkReleaseCapturedPipelineDataKHR);
+#undef NRVK_PB
+        // The rewritten binaries are kept in $NR_I4_CACHE (the runtime points it into dlssnr-amd/), keyed by the
+        // SPIR-V and the driver (pipelineCacheUUID, driverVersion): the next start imports them instead of
+        // compiling, capturing and rewriting again. A file that no longer imports is rebuilt.
+        std::string cfile;
+        if (const char* cd = nr::build_cfg("NR_I4_CACHE")) {
+            VkPhysicalDeviceProperties pp{}; vkGetPhysicalDeviceProperties(physical, &pp);
+            uint64_t h = 1469598103934665603ull;
+            auto mix = [&](const void* p, size_t n) { auto b = static_cast<const uint8_t*>(p); for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; } };
+            mix(code.data(), code.size() * 4); mix(pp.pipelineCacheUUID, VK_UUID_SIZE); mix(&pp.driverVersion, 4); mix(&pp.deviceID, 4);
+            if (cpi.pNext) mix("no robustness", 13);   // compiled with Kernel::create's VkPipelineRobustnessCreateInfo
+            char hx[24]; std::snprintf(hx, sizeof hx, "%016llx", (unsigned long long)h);
+            const size_t sl = path.find_last_of("/\\");
+            cfile = std::string(cd) + "/" + (sl == std::string::npos ? path : path.substr(sl + 1)) + "." + hx + ".bin";
+            std::ifstream f(cfile, std::ios::binary);
+            if (f) try {
+                std::vector<uint8_t> blob((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                size_t o = 0; auto rd = [&](void* d, size_t n) { if (o + n > blob.size()) throw std::runtime_error("short"); std::memcpy(d, blob.data() + o, n); o += n; };
+                uint32_t magic = 0, cnt = 0, nrw = 0; rd(&magic, 4); rd(&cnt, 4); rd(&nrw, 4);
+                if (magic != 0x43344955u || cnt == 0 || cnt > 16) throw std::runtime_error("bad");
+                std::vector<VkPipelineBinaryKeyKHR> keys(cnt); std::vector<std::vector<uint8_t>> data(cnt); std::vector<VkPipelineBinaryDataKHR> pd(cnt);
+                for (uint32_t i = 0; i < cnt; ++i) {
+                    keys[i] = {VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR}; rd(&keys[i].keySize, 4);
+                    if (keys[i].keySize > VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR) throw std::runtime_error("key");
+                    rd(keys[i].key, keys[i].keySize); uint64_t sz = 0; rd(&sz, 8); data[i].resize(size_t(sz)); rd(data[i].data(), size_t(sz));
+                    pd[i] = {size_t(sz), data[i].data()};
+                }
+                VkPipelineBinaryKeysAndDataKHR kd{cnt, keys.data(), pd.data()};
+                VkPipelineBinaryCreateInfoKHR bci{VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR}; bci.pKeysAndDataInfo = &kd;
+                std::vector<VkPipelineBinaryKHR> bins(cnt);
+                VkPipelineBinaryHandlesInfoKHR hi{VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR}; hi.pipelineBinaryCount = cnt; hi.pPipelineBinaries = bins.data();
+                if (vkCreatePipelineBinariesKHR(device, &bci, nullptr, &hi) == VK_SUCCESS) {
+                    VkPipelineBinaryInfoKHR bi{VK_STRUCTURE_TYPE_PIPELINE_BINARY_INFO_KHR}; bi.binaryCount = cnt; bi.pPipelineBinaries = bins.data();
+                    bi.pNext = cpi.pNext;
+                    VkComputePipelineCreateInfo c2 = cpi; c2.pNext = &bi;
+                    const VkResult r = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &c2, nullptr, &pipeline);
+                    for (auto b : bins) if (b) vkDestroyPipelineBinaryKHR(device, b, nullptr);
+                    if (r == VK_SUCCESS) { iu4_rewrites = int(nrw); return; }
+                    pipeline = VK_NULL_HANDLE;
+                }
+            } catch (...) {}
+        }
+        VkPipelineCreateFlags2CreateInfoKHR fl{VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR};
+        fl.flags = VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR;
+        fl.pNext = cpi.pNext;
+        cpi.pNext = &fl;
+        VkPipeline cap{};
+        NRVK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpi, nullptr, &cap));
+        VkPipelineBinaryCreateInfoKHR bci{VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR}; bci.pipeline = cap;
+        VkPipelineBinaryHandlesInfoKHR hi{VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR};
+        NRVK_CHECK(vkCreatePipelineBinariesKHR(device, &bci, nullptr, &hi));
+        std::vector<VkPipelineBinaryKHR> bins(hi.pipelineBinaryCount); hi.pPipelineBinaries = bins.data();
+        NRVK_CHECK(vkCreatePipelineBinariesKHR(device, &bci, nullptr, &hi));
+        VkReleaseCapturedPipelineDataInfoKHR rel{VK_STRUCTURE_TYPE_RELEASE_CAPTURED_PIPELINE_DATA_INFO_KHR}; rel.pipeline = cap;
+        vkReleaseCapturedPipelineDataKHR(device, &rel, nullptr);
+        vkDestroyPipeline(device, cap, nullptr);
+        std::vector<std::vector<uint8_t>> data(bins.size());
+        std::vector<VkPipelineBinaryKeyKHR> keys(bins.size());
+        std::vector<VkPipelineBinaryDataKHR> pdata(bins.size());
+        int n = 0;
+        for (size_t i = 0; i < bins.size(); ++i) {
+            VkPipelineBinaryDataInfoKHR gi{VK_STRUCTURE_TYPE_PIPELINE_BINARY_DATA_INFO_KHR}; gi.pipelineBinary = bins[i];
+            keys[i] = {VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR}; size_t sz = 0;
+            NRVK_CHECK(vkGetPipelineBinaryDataKHR(device, &gi, &keys[i], &sz, nullptr));
+            data[i].resize(sz);
+            NRVK_CHECK(vkGetPipelineBinaryDataKHR(device, &gi, &keys[i], &sz, data[i].data()));
+            for (size_t o = 0; o + 8 <= sz; o += 4) {
+                uint32_t d; std::memcpy(&d, &data[i][o], 4);
+                if ((d >> 16) == 0xcc44u) { d = (d & 0xffffu) | (0xcc4au << 16); std::memcpy(&data[i][o], &d, 4); ++n; o += 4; }
+            }
+            for (uint32_t k = 0; k < keys[i].keySize; ++k) keys[i].key[k] ^= 0x5a;   // never aliases the original
+            pdata[i] = {sz, data[i].data()};
+            vkDestroyPipelineBinaryKHR(device, bins[i], nullptr);
+        }
+        iu4_rewrites = n;
+        if (n == 0 || (want > 0 && n != want))
+            throw std::runtime_error("int4 rewrite count " + std::to_string(n) + " (want " + std::to_string(want) + "): " + path);
+        VkPipelineBinaryKeysAndDataKHR kd{uint32_t(bins.size()), keys.data(), pdata.data()};
+        VkPipelineBinaryCreateInfoKHR bci2{VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR}; bci2.pKeysAndDataInfo = &kd;
+        VkPipelineBinaryHandlesInfoKHR hi2{VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR};
+        hi2.pipelineBinaryCount = uint32_t(bins.size()); hi2.pPipelineBinaries = bins.data();
+        NRVK_CHECK(vkCreatePipelineBinariesKHR(device, &bci2, nullptr, &hi2));
+        VkPipelineBinaryInfoKHR bi{VK_STRUCTURE_TYPE_PIPELINE_BINARY_INFO_KHR};
+        bi.binaryCount = uint32_t(bins.size()); bi.pPipelineBinaries = bins.data();
+        bi.pNext = fl.pNext;
+        cpi.pNext = &bi;
+        NRVK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpi, nullptr, &pipeline));
+        for (auto b : bins) vkDestroyPipelineBinaryKHR(device, b, nullptr);
+        nr::logf("[nr] int4 pipeline %s: %d WMMA rewrites", path.c_str(), n);
+        if (!cfile.empty()) {
+            const std::string tmpf = cfile + ".tmp";
+            if (FILE* f = std::fopen(tmpf.c_str(), "wb")) {
+                const uint32_t hdr[3] = {0x43344955u, uint32_t(data.size()), uint32_t(n)};
+                bool ok = std::fwrite(hdr, 4, 3, f) == 3;
+                for (size_t i = 0; i < data.size() && ok; ++i) {
+                    const uint64_t sz = data[i].size();
+                    ok = std::fwrite(&keys[i].keySize, 4, 1, f) == 1 && std::fwrite(keys[i].key, 1, keys[i].keySize, f) == keys[i].keySize &&
+                         std::fwrite(&sz, 8, 1, f) == 1 && std::fwrite(data[i].data(), 1, data[i].size(), f) == data[i].size();
+                }
+                ok = std::fclose(f) == 0 && ok;
+                if (ok) { std::remove(cfile.c_str()); std::rename(tmpf.c_str(), cfile.c_str()); } else std::remove(tmpf.c_str());
+            }
+        }
+#endif
     }
 
     void destroy() {

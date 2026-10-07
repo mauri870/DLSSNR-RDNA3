@@ -17,6 +17,9 @@
 //
 // Two things this is not, yet: every family - `--report` says which - and the
 // OptiScaler entry point. The arenas are already the shapes that adapter wants.
+#if NR_INT4
+#include "nr_build_cfg.hpp"
+#endif
 #include "nr_shader_manifest.hpp"
 #include "nr_activation_lut.hpp"
 #include "nr_log.hpp"
@@ -33,6 +36,9 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#if NR_INT4
+#include <memory>
+#endif
 #include <set>
 #include <sstream>
 #include <string>
@@ -183,7 +189,29 @@ static bool tchain_active() {
 // attention -> projection -> the next expand (QKV -> attention needs every
 // token and keeps its barrier). The arena layout probe asks before any offset
 // exists, so this looks only at the kernels; the build checks the data offsets.
+#if NR_INT4
+// int4 mixed: per Swin block whether its MLP weights took the hard-swish fold, and the e_off values that are int4
+// records (never packed as matrices).
+static std::map<int, bool> g_hs_folded;
+static std::set<uint32_t> g_swi4_eoff;
+// The int4 pipelines are their base kernels for every table keyed on kernel names.
+static std::string i4base(const std::string& k) {
+    static const std::map<std::string, std::string> m = {
+        {"gemmvact4", "gemmvact"}, {"gemmvact4c", "gemmvact"}, {"gemmproj4", "gemmproj"}, {"gemmprojw4", "gemmprojw"},
+        {"gemmproj4s", "gemmproj"}, {"gemmprojw4s", "gemmprojw"}, {"gemmprojs", "gemmproj"}, {"gemmprojws", "gemmprojw"},
+        {"gemmvqkvnorms4", "gemmvqkvnorms"}, {"gemmvqkvnorm4", "gemmvqkvnorm"},
+        {"gemmprojcs", "gemmprojc"}, {"attn4", "attn"}};
+    const auto it = m.find(k);
+    return it == m.end() ? k : it->second;
+}
+#define NR_KBASE(k) i4base(k)
+#else
+#define NR_KBASE(k) (k)
+#endif
 static bool tchain_pair(const std::string& p, const std::string& q) {
+#if NR_INT4
+    if (i4base(p) != p || i4base(q) != q) return tchain_pair(i4base(p), i4base(q));
+#endif
     auto g = [](const std::string& k) { return k == "gemmprojc"; };
     auto f = [](const std::string& k) { return k == "ffwd3" || k == "ffwd3w" || k == "ffwd3q"; };
     auto vp = [](const std::string& k) { return k == "gemmproj" || k == "gemmprojw" || k == "gemmprojt" || k == "gemmprojh"; };
@@ -208,6 +236,14 @@ static bool tchain_pair(const std::string& p, const std::string& q) {
 // after their push block as this file declares it (gemm1x1 pipelines therefore
 // all build NR_GEMM_REMAP_PC=1, so their block ends with `remap` like PushGemm).
 static bool tchain_kern(const std::string& k00) {
+#if NR_INT4
+    {   // the int4 pipelines and the hard-swish route's "<kern>p" (NR_HS_ROUTE) chain like their base kernels
+        std::string k = i4base(k00);
+        if (k.size() > 3 && k.back() == 'p' && (k.compare(k.size() - 3, 3, "nhp") == 0 || k.compare(k.size() - 3, 3, "32p") == 0))
+            k.pop_back();
+        if (k != k00) return tchain_kern(k);
+    }
+#endif
     // "rv" = the same kernel walking its windows backwards (NR_REV_Y).
     const std::string k0 = k00.size() > 2 && k00.compare(k00.size() - 2, 2, "rv") == 0 ? k00.substr(0, k00.size() - 2) : k00;
     const std::string k = k0.size() > 2 && k0.compare(k0.size() - 2, 2, "nh") == 0 ? k0.substr(0, k0.size() - 2) : k0;
@@ -348,6 +384,207 @@ std::vector<uint8_t> slurp(const std::string& p) {
     if (!f) return {};
     return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)),
                                 std::istreambuf_iterator<char>());
+#if NR_INT4
+}
+
+// ---- int4_mixed: weight-free correction tables -------------------------------------------------------------------
+// The int4 weights are GPTQ solutions of the user's own (DLL) weights, so they are never shipped. What is shipped per
+// matrix (<prefix>.fix.bin + <prefix>.mu.bin) carries no weight value: per row the clip step index, per weight the GPTQ
+// correction (-1/0/+1, rarely more) against plain rounding, and per input channel two calibration means. From the
+// weights at hand the reference is rebuilt here: Wr = (Wsel . H_B) * st (block Hadamard of size B, st = the input
+// quantiser's step), s_n = max|Wr_n| * clip[ci_n] / 7, q = clamp(rint(Wr / s), -8, 7) + correction, and the folded
+// constant c_n = Wsel_n . muX - s_n * q_n . nu (nu = mean quantised input + zero point - 8); the rebuilt q is the
+// solved one bit for bit.
+static std::map<std::pair<int, int>, std::vector<uint8_t>> g_i4_wsave;   // ViT e4m3 weights [N][K] by (block, layer)
+static float i4_e4m3(uint8_t c) {   // the solver's table: both NaN codes read as 0
+    if ((c & 0x7f) == 0x7f) return 0.0f;
+    const int e = (c >> 3) & 15, m = c & 7;
+    const float v = e == 0 ? float(m) * std::ldexp(1.0f, -9) : (1.0f + float(m) / 8.0f) * std::ldexp(1.0f, e - 7);
+    return (c & 0x80) ? -v : v;
+}
+struct I4Mat { std::vector<uint8_t> q; std::vector<uint8_t> sc; };   // q: int8 [N][K4]; sc: f32 [2][N] (s, c)
+// dlssnr-int4.bin: "NRI4WGT1", u32 entry count, u64 FNV-1a of everything after this header; per entry u32 name length,
+// name, u32 N, u32 K4, u64 key, q [N*K4/2] (two -8..7 values a byte, low nibble first), sc [2N] f32. Written by the install-time generator (--int4-weights-out).
+struct I4Entry { std::string name; uint32_t N, K4; uint64_t key; std::vector<uint8_t> q, sc;
+                 uint64_t at = 0; };   // the store: where the entry's q (packed) and sc start in the file; q, sc empty
+struct I4Store { std::string path; std::map<std::string, I4Entry> entries; };
+static std::vector<I4Entry>* g_i4_out = nullptr;   // the generator's collection (one build at a time: g_build_lock)
+static uint64_t i4_fnv(uint64_t h, const void* p, size_t n) {
+    auto b = static_cast<const uint8_t*>(p);
+    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+    return h;
+}
+static uint64_t i4_key(const std::vector<uint8_t>& wsel, const std::vector<uint8_t>& aqb, size_t N, size_t K4, int B) {
+    const uint64_t dims[4] = {1u /* decoder version */, uint64_t(N), uint64_t(K4), uint64_t(B)};
+    uint64_t h = i4_fnv(1469598103934665603ull, dims, sizeof dims);
+    h = i4_fnv(h, wsel.data(), wsel.size());
+    return i4_fnv(h, aqb.data(), aqb.size());
+}
+static const char kI4Magic[8] = {'N', 'R', 'I', '4', 'W', 'G', 'T', '1'};
+static void i4_store_write(const std::string& path, const std::vector<I4Entry>& es) {
+    std::vector<uint8_t> body;
+    auto put = [&](const void* p, size_t n) { auto b = static_cast<const uint8_t*>(p); body.insert(body.end(), b, b + n); };
+    for (const I4Entry& e : es) {
+        const uint32_t nl = uint32_t(e.name.size());
+        put(&nl, 4); put(e.name.data(), nl); put(&e.N, 4); put(&e.K4, 4); put(&e.key, 8);
+        if (e.q.size() % 2) throw std::runtime_error("int4 weights: odd row length " + e.name);
+        std::vector<uint8_t> nib(e.q.size() / 2);
+        for (size_t i = 0; i < nib.size(); ++i) nib[i] = uint8_t((e.q[2 * i] & 15) | ((e.q[2 * i + 1] & 15) << 4));
+        put(nib.data(), nib.size()); put(e.sc.data(), e.sc.size());
+    }
+    const uint32_t cnt = uint32_t(es.size());
+    const uint64_t ck = i4_fnv(1469598103934665603ull, body.data(), body.size());
+    const std::string tmp = path + ".tmp";
+    FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (!f) throw std::runtime_error("int4 weights: cannot write " + tmp);
+    bool ok = std::fwrite(kI4Magic, 1, 8, f) == 8 && std::fwrite(&cnt, 4, 1, f) == 1 && std::fwrite(&ck, 8, 1, f) == 1 &&
+              std::fwrite(body.data(), 1, body.size(), f) == body.size();
+    ok = std::fclose(f) == 0 && ok;
+    std::error_code ec;
+    if (ok) std::filesystem::rename(tmp, path, ec);
+    if (!ok || ec) { std::filesystem::remove(tmp, ec); throw std::runtime_error("int4 weights: cannot write " + path); }
+}
+// The file named by NR_I4_WEIGHTS, read and checked once per build (i4_store_reset at the build's start).
+static std::unique_ptr<I4Store> g_i4_store;
+static bool g_i4_store_read = false;
+static void i4_store_reset() { g_i4_store.reset(); g_i4_store_read = false; }
+static const I4Store* i4_store() {
+    if (g_i4_store_read) return g_i4_store.get();
+    g_i4_store_read = true;
+    const char* path = nr::build_cfg("NR_I4_WEIGHTS");
+    if (!path) return nullptr;
+    // Checked in one pass with a small buffer, and only each entry's place in the file kept: i4_obtain reads a
+    // matrix when the build reaches it, so the file is never in host memory as a whole.
+    std::ifstream f(path, std::ios::binary);
+    char magic[8] = {};
+    uint32_t cnt = 0; uint64_t ck = 0;
+    if (!f.read(magic, 8) || std::memcmp(magic, kI4Magic, 8) || !f.read(reinterpret_cast<char*>(&cnt), 4) ||
+        !f.read(reinterpret_cast<char*>(&ck), 8))
+        throw std::runtime_error(std::string("int4 weights: ") + path + " is missing or not an int4 weights file");
+    auto st = std::make_unique<I4Store>();
+    st->path = path;
+    uint64_t h = 1469598103934665603ull, pos = 20;
+    bool damaged = false;
+    std::vector<char> buf(size_t(1) << 20);
+    auto rd = [&](void* d, size_t n) {
+        if (!f.read(static_cast<char*>(d), std::streamsize(n))) { damaged = true; throw std::runtime_error("short"); }
+        h = i4_fnv(h, d, n); pos += n;
+    };
+    auto skip = [&](size_t n) {   // checksummed, not kept
+        while (n) { const size_t k = std::min(n, buf.size()); rd(buf.data(), k); n -= k; }
+    };
+    try {
+        for (uint32_t i = 0; i < cnt; ++i) {
+            I4Entry e; uint32_t nl = 0; rd(&nl, 4);
+            if (nl > 256) { damaged = true; throw std::runtime_error("bad entry"); }
+            e.name.resize(nl); rd(e.name.data(), nl); rd(&e.N, 4); rd(&e.K4, 4); rd(&e.key, 8);
+            if (e.K4 % 2 || uint64_t(e.N) * e.K4 > (uint64_t(1) << 28)) { damaged = true; throw std::runtime_error("bad entry"); }
+            e.at = pos;
+            skip(size_t(e.N) * e.K4 / 2 + size_t(e.N) * 8);
+            st->entries[e.name] = std::move(e);
+        }
+        if (f.peek() != std::char_traits<char>::eof()) damaged = true;
+    } catch (const std::bad_alloc&) {
+        throw;
+    } catch (const std::exception&) {
+        damaged = true;
+    }
+    if (damaged || h != ck)
+        throw std::runtime_error(std::string("int4 weights: ") + path + " is damaged");
+    g_i4_store = std::move(st);
+    return g_i4_store.get();
+}
+// Whether a matrix has int4 weights: its recovery tables, or (installed) an entry in dlssnr-int4.bin.
+static bool i4_have(const std::string& prefix) {
+    if (std::filesystem::exists(prefix + ".fix.bin")) return true;
+    const I4Store* st = i4_store();
+    return st && st->entries.count(std::filesystem::path(prefix).filename().string());
+}
+static I4Mat i4_obtain(const std::string& prefix, const std::vector<uint8_t>& wsel, size_t N, size_t K4, int B,
+                       const std::vector<uint8_t>& aqb) {
+    I4Mat r;
+    if (wsel.size() != N * K4 || aqb.size() != K4 * 8 || (B > 1 && K4 % size_t(B))) throw std::runtime_error("int4 table: shapes " + prefix);
+    // Installed int4_mixed: the weights come from dlssnr-amd/dlssnr-int4.bin, which the installer made with this
+    // same decoder (NR_I4_WEIGHTS; the recovery tables are not installed). An entry holds the weights and the key of
+    // what they were made from - this model's weights and these input quantisers - so a different model never
+    // matches and the build stops (exact runs).
+    if (const I4Store* st = i4_store()) {
+        const auto it = st->entries.find(std::filesystem::path(prefix).filename().string());
+        if (it == st->entries.end() || it->second.N != N || it->second.K4 != K4 || it->second.key != i4_key(wsel, aqb, N, K4, B))
+            throw std::runtime_error("int4 weights: " + std::filesystem::path(prefix).filename().string() + " is not in dlssnr-int4.bin or was made from another model");
+        std::vector<uint8_t> nib(size_t(N) * K4 / 2);
+        r.sc.resize(size_t(N) * 8);
+        std::ifstream f(st->path, std::ios::binary);
+        if (!f.seekg(std::streamoff(it->second.at)) || !f.read(reinterpret_cast<char*>(nib.data()), std::streamsize(nib.size())) ||
+            !f.read(reinterpret_cast<char*>(r.sc.data()), std::streamsize(r.sc.size())))
+            throw std::runtime_error("int4 weights: " + st->path + " could not be read again");
+        r.q.resize(nib.size() * 2);
+        for (size_t j = 0; j < nib.size(); ++j) {
+            r.q[2 * j] = uint8_t(int8_t(uint8_t(nib[j] << 4)) >> 4);
+            r.q[2 * j + 1] = uint8_t(int8_t(nib[j]) >> 4);
+        }
+        return r;
+    }
+    std::vector<float> aq(K4 * 2); std::memcpy(aq.data(), aqb.data(), aqb.size());
+    static const double clips[9] = {1.0, .95, .9, .85, .8, .75, .7, .65, .6};
+    std::vector<double> wr(N * K4), am(N);
+    for (size_t n = 0; n < N; ++n) {
+        double* row = &wr[n * K4];
+        for (size_t k = 0; k < K4; ++k) row[k] = double(i4_e4m3(wsel[n * K4 + k]));
+        if (B > 1)
+            for (size_t b0 = 0; b0 < K4; b0 += size_t(B)) {
+                for (int h = 1; h < B; h *= 2)
+                    for (int i = 0; i < B; i += 2 * h)
+                        for (int j = i; j < i + h; ++j) { const double a = row[b0 + j], c = row[b0 + j + h]; row[b0 + j] = a + c; row[b0 + j + h] = a - c; }
+                const double nb = 1.0 / std::sqrt(double(B));
+                for (int j = 0; j < B; ++j) row[b0 + j] *= nb;
+            }
+        double m = 1e-30;
+        for (size_t k = 0; k < K4; ++k) { row[k] *= double(float(1.0f / aq[2 * k])); m = std::max(m, std::fabs(row[k])); }
+        am[n] = m;
+    }
+    auto qref = [&](size_t n, float s, size_t k) { return int(std::max(-8.0, std::min(7.0, std::nearbyint(wr[n * K4 + k] / double(s))))); };
+    const std::vector<uint8_t> fx = slurp(prefix + ".fix.bin"), mu = slurp(prefix + ".mu.bin");
+    uint32_t hdr[6]; if (fx.size() < 24) throw std::runtime_error("int4 table: " + prefix + ".fix.bin");
+    std::memcpy(hdr, fx.data(), 24);
+    const size_t ncode = (N * K4 + 3) / 4;
+    if (hdr[0] != 0x58463449u || hdr[1] != N || hdr[2] != K4 || hdr[3] != uint32_t(B) || fx.size() != 24 + N + ncode + size_t(hdr[4]) * 8 ||
+        (mu.size() != K4 * 8 && mu.size() != K4 * 8 + N * 4))
+        throw std::runtime_error("int4 table: " + prefix + " does not match this model");
+    // optional third section: a per-output shift added to the constant (the hard-swish mean compensation of an
+    // int4 expansion: the activation that follows sees h + dh, whose hard-swish mean is the original activation's)
+    std::vector<float> dh(mu.size() > K4 * 8 ? N : 0);
+    if (!dh.empty()) std::memcpy(dh.data(), mu.data() + K4 * 8, N * 4);
+    const uint8_t* ci = fx.data() + 24; const uint8_t* code = ci + N;
+    std::vector<float> muv(K4 * 2); std::memcpy(muv.data(), mu.data(), K4 * 8);
+    std::vector<int8_t> q(N * K4); std::vector<float> sc(N * 2);
+    for (size_t n = 0; n < N; ++n) {
+        if (ci[n] > 8) throw std::runtime_error("int4 table: " + prefix + " clip index");
+        const float s = float(am[n] * clips[ci[n]] / 7.0);
+        double wx = 0.0, qn = 0.0;
+        for (size_t k = 0; k < K4; ++k) {
+            const size_t i = n * K4 + k; const int cd = (code[i / 4] >> (2 * (i % 4))) & 3;
+            const int v = qref(n, s, k) + (cd == 1 ? 1 : cd == 2 ? -1 : 0);
+            q[i] = int8_t(v);
+            wx += double(i4_e4m3(wsel[i])) * double(muv[k]); qn += double(v) * double(muv[K4 + k]);
+        }
+        sc[n] = s; sc[N + n] = float(wx - double(s) * qn + (dh.empty() ? 0.0 : double(dh[n])));
+    }
+    for (uint32_t e = 0; e < hdr[4]; ++e) {
+        uint32_t ie[2]; std::memcpy(ie, fx.data() + 24 + N + ncode + size_t(e) * 8, 8);
+        const size_t n = ie[0] / K4; const float s = sc[n];
+        q[ie[0]] = int8_t(qref(n, s, ie[0] % K4) + int32_t(ie[1]));
+        // the escape changed q_n: refresh the constant
+        double wx = 0.0, qn = 0.0;
+        for (size_t k = 0; k < K4; ++k) { wx += double(i4_e4m3(wsel[n * K4 + k])) * double(muv[k]); qn += double(q[n * K4 + k]) * double(muv[K4 + k]); }
+        sc[N + n] = float(wx - double(s) * qn + (dh.empty() ? 0.0 : double(dh[n])));
+    }
+    r.q.resize(q.size()); std::memcpy(r.q.data(), q.data(), q.size());
+    r.sc.resize(sc.size() * 4); std::memcpy(r.sc.data(), sc.data(), r.sc.size());
+    if (g_i4_out) g_i4_out->push_back({std::filesystem::path(prefix).filename().string(), uint32_t(N), uint32_t(K4),
+                                        i4_key(wsel, aqb, N, K4, B), r.q, r.sc});
+    return r;
+#endif
 }
 size_t align(size_t x, size_t a) { return (x + a - 1) / a * a; }
 // **The tile row stride truncates: it is the number of *whole* 4-pixel tiles in
@@ -993,6 +1230,11 @@ struct Disp {
     // producer tile of this dispatch's local tile 0, and whether the barrier
     // after this dispatch stays.
     int tc_prod = -1; uint32_t tc_off = 0; int split = 0;
+#if NR_INT4
+    // NR_I4_DIR: a GEMM reading another dispatch's int4 side copy reads its slot from this
+    // e4m3 base on (the tile-counter link compares it with the producer's o_off).
+    uint32_t i4_xbase = 0xFFFFFFFFu;
+#endif
 };
 
 // The activation arena's slot table, and which lowered steps ask for each slot.
@@ -1033,6 +1275,56 @@ struct ValueOffsets {
 // See `nrvk::Context::adopt`. With a fresh `ctx` this is exactly what `main`
 // did; with an adopted one the same 171 dispatches record into the host's own
 // command buffer.
+// The weight arena on the host, in pieces: 4 MB chunks, so no allocation is larger than that (a 32-bit game's
+// address space is small and fragmented). A chunk nothing was written to holds zeros without memory (the noise
+// field's region), and the arena-layout probe only counts - it needs the offsets, not the bytes.
+class WeightBlob {
+public:
+    static constexpr size_t kChunk = size_t(4) << 20;
+    explicit WeightBlob(bool count_only) : count_only_(count_only) {}
+    size_t size() const { return size_; }
+    // Grow to `n` (zeros). Never shrinks.
+    void grow(size_t n) { if (n > size_) size_ = n; }
+    // Append `n` bytes at `align`; returns their offset.
+    size_t append(const void* p, size_t n, size_t align) {
+        const size_t off = (size_ + align - 1) / align * align;
+        size_ = off;
+        write(off, p, n);
+        return off;
+    }
+    size_t append_zeros(size_t n, size_t align) {
+        const size_t off = (size_ + align - 1) / align * align;
+        size_ = off + n;
+        return off;
+    }
+    void write(size_t off, const void* src, size_t n) {
+        if (off + n > size_) size_ = off + n;
+        if (count_only_) return;
+        auto b = static_cast<const uint8_t*>(src);
+        while (n) {
+            const size_t c = off / kChunk, o = off % kChunk, k = std::min(n, kChunk - o);
+            if (c >= chunks_.size()) chunks_.resize(c + 1);
+            if (!chunks_[c]) chunks_[c].reset(new uint8_t[kChunk]());
+            std::memcpy(chunks_[c].get() + o, b, k);
+            off += k; b += k; n -= k;
+        }
+    }
+    void read(size_t off, void* dst, size_t n) const {
+        auto d = static_cast<uint8_t*>(dst);
+        while (n) {
+            const size_t c = off / kChunk, o = off % kChunk, k = std::min(n, kChunk - o);
+            if (c < chunks_.size() && chunks_[c]) std::memcpy(d, chunks_[c].get() + o, k);
+            else std::memset(d, 0, k);
+            off += k; d += k; n -= k;
+        }
+    }
+    void clear() { chunks_.clear(); chunks_.shrink_to_fit(); size_ = 0; }
+private:
+    bool count_only_;
+    size_t size_ = 0;
+    std::vector<std::unique_ptr<uint8_t[]>> chunks_;
+};
+
 struct NrSession {
     nrvk::Context ctx;
     nrvk::Buffer act{}, wgt{};
@@ -1219,6 +1511,25 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     }
     g_host_shapes = host_boundary;
     g_post_out_h = 0; g_nohi.clear(); g_nohi_heads.clear(); g_audit_bias.clear();   // per graph build
+#if NR_INT4
+    // the int4 state too - one process may build the exact and the int4_mixed network in turn ([Int4Mixed] Hotkey)
+    // The installed int4 weights file is read once per build (the arena probe build inside it uses the same copy) and
+    // let go when the build ends, as are the ViT weight copies: nothing int4 stays in host memory after a build.
+    g_hs_folded.clear(); g_swi4_eoff.clear();
+    if (!arena_probe) { g_i4_wsave.clear(); i4_store_reset(); }
+    struct I4OutScope {
+        std::string path; std::vector<I4Entry> list; bool out = false, top = false;
+        ~I4OutScope() {
+            if (out) g_i4_out = nullptr;
+            if (top) { g_i4_wsave.clear(); i4_store_reset(); }
+        }
+    } i4_out_scope;
+    i4_out_scope.top = !arena_probe;
+    if (const char* o = arg(argc, argv, "--int4-weights-out", nullptr)) if (!arena_probe) {
+        if (flag(argc, argv, "--reuse") && !flag(argc, argv, "--no-reuse")) throw std::runtime_error("--int4-weights-out wants --no-reuse");
+        i4_out_scope.path = o; i4_out_scope.out = true; g_i4_out = &i4_out_scope.list;
+    }
+#endif
     plan = prepared_plan ? *prepared_plan : load_plan(plan_path);
     std::printf("%zu steps from %s\n", plan.size(), plan_path.c_str());
 
@@ -1390,7 +1701,18 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         // rounds its ViT domain to 32; preserve zero padding in separate slots.
         const size_t stored_tokens = s.type.rfind("CCVit1D",0)==0
             ? align(size_t(s.tokens),32) : size_t(s.tokens);
-        const size_t n = stored_tokens * size_t(sh.fam == F_NONE ? s.co : sh.N);
+        size_t n = stored_tokens * size_t(sh.fam == F_NONE ? s.co : sh.N);
+#if NR_INT4
+        // NR_I4_DIR: the contraction's and the projection's output also carry an int4 copy
+        // (M x N/2 bytes, after the e4m3 tensor) for the next GEMM.
+        if (nr::build_cfg("NR_I4_DIR") && (s.type == "CCVit1DFfnContract" || s.type == "CCVit1DProjection"))
+            n += stored_tokens * size_t(sh.N) / 2;
+        // C=512: the tile grid's tokens (the GEMM's M), e4m3 then the int4 copy.
+        if (nr::build_cfg("NR_I4_DIR") && (s.type == "CCSplitSwin16HFfwdProj" || s.type == "CCSplitSwin16HProj")) {
+            const size_t mt = std::max(stored_tokens, size_t(tiles_of(s.H)) * size_t(tiles_of(s.W)) * 16);
+            n = std::max(n, mt * size_t(sh.N) * 3 / 2);
+        }
+#endif
         vsize[k] = std::max(vsize[k], n);
     }
     // Intra-block edges come from the family's own structure; cross-block edges
@@ -1689,20 +2011,13 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
 
     // ---- weights -----------------------------------------------------------
     //
-    // `wblob` grows by `insert`, so it doubles: while it is being extended past
-    // its capacity, the old block and the new one are both live. That transient
-    // is the largest contiguous request this build makes on the CPU, and it is
-    // invisible from the outside - hence the line before it and the one after,
-    // so a log that stops between them says which of the two it was.
+    // The weight arena on the host (WeightBlob: 4 MB chunks, zeros free; the arena
+    // probe only counts). Logged before and after, so a log that stops between them
+    // says the weights were where the build ran out.
     nr::logf("unpacking weights from %s", unp.c_str());
-    std::vector<uint8_t> wblob;
+    WeightBlob wblob(arena_probe);
     g_noise_jobs.clear();   // this lowering's own; the arena probe ran its own before
-    auto put = [&](const std::vector<uint8_t>& v, size_t a) {
-        wblob.resize(align(wblob.size(), a));
-        const size_t off = wblob.size();
-        wblob.insert(wblob.end(), v.begin(), v.end());
-        return off;
-    };
+    auto put = [&](const std::vector<uint8_t>& v, size_t a) { return wblob.append(v.data(), v.size(), a); };
     uint32_t act_lut_off = 0;
     if (math_profile >= 1) {
         const auto& table = nr::detail::activation_lut_v1;
@@ -1724,6 +2039,10 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     };
 
     timer.mark("plan");
+    if (!arena_probe) {
+        nr::g_build_stage = 2;
+        if (nr::g_memory_note) nr::logf("planned; %s", nr::g_memory_note().c_str());
+    }
     int lowering = 0;
     for (const Step* ps : run) {
         voff.step = lowering++;
@@ -1744,11 +2063,106 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             const int H = 4 * C, Hg = H / heads;
             const int Kc = heads > 1 ? C : H;
             PushFSwin p{};
+#if NR_INT4
+            // int4 mixed: the hard-swish's output scale (fswin_t NR_ACT_HS=2 drops it) folded into the weights that
+            // read the hidden - the middle (heads > 1) or the contraction (one head) - re-rounded to e4m3. NR_HS_FOLD
+            // for the wide layers, NR_HS_FOLD32 for C=32, NR_HS_FOLDPP for the pre and post blocks; NR_HS_FOLD_BLOCKS
+            // (b+b+..), when set, the only blocks that take any fold.
+            const float hs_fold = nr::build_cfg("NR_HS_FOLD") ? float(std::atof(nr::build_cfg("NR_HS_FOLD"))) : 0.0f;
+            const float hs_fold32 = nr::build_cfg("NR_HS_FOLD32") ? float(std::atof(nr::build_cfg("NR_HS_FOLD32"))) : hs_fold;
+            const float hs_foldpp = nr::build_cfg("NR_HS_FOLDPP") ? float(std::atof(nr::build_cfg("NR_HS_FOLDPP"))) : hs_fold32;
+            auto hs_scale = [&](std::vector<uint8_t> v) {
+                float f = (pre || post) ? hs_foldpp : C == 32 ? hs_fold32 : hs_fold;
+                const std::string hs_blocks = [] {
+                    std::string v = nr::build_cfg("NR_HS_FOLD_BLOCKS") ? nr::build_cfg("NR_HS_FOLD_BLOCKS") : "";
+                    for (auto& ch : v) if (ch == '+') ch = ',';
+                    return v.empty() ? v : "," + v + ",";
+                }();
+                if (!hs_blocks.empty() && hs_blocks.find("," + std::to_string(s.block) + ",") == std::string::npos) f = 0.0f;
+                g_hs_folded[s.block] = f != 0.0f;
+                if (f != 0.0f) for (auto& b : v) b = tin::f_to_e4m3(float(tin::e4m3_to_f(b)) * f);
+                return v;
+            };
+#define NR_HS_FOLDED(on, v) ((on) ? hs_scale(v) : (v))
+#else
+#define NR_HS_FOLDED(on, v) (v)
+#endif
             p.e_off = uint32_t(put(tin::tile_blocked(
                 load_e4m3_requantised(std::string(base) + ".mlp_expand.bin", size_t(H) * C).data(),
                 size_t(H), size_t(C)), 256));
+#if NR_INT4
+            // int4 mixed, NR_SWI4_DIR: the multi-head MLP's expansion on int4 (fswin_t NR_SWI4). Files
+            // b<block>l<layer>.x.aq.bin (C (1/step, zero)) and the .ex recovery tables (i4_obtain); with .y.aq.bin and
+            // the .qkv tables also the QKV projection (fswin_t NR_SWQ4). e_off then points at the record
+            // {magic, quantiser vec2 index, W4 bytes, scale index, .., QKV quantiser, QKV W4, QKV scales}.
+            if (const char* sd = nr::build_cfg("NR_SWI4_DIR")) if (heads > 1) {
+                char nb[512]; std::snprintf(nb, sizeof nb, "%s/b%dl%d", sd, s.block, s.layer);
+                if (std::filesystem::exists(std::string(nb) + ".x.aq.bin")) {
+                    const auto aqb = slurp(std::string(nb) + ".x.aq.bin");
+                    const size_t H4 = size_t(4 * C), K4 = size_t(C);
+                    const auto wex = slurp(std::string(base) + ".mlp_expand.bin");
+                    if (wex.size() < H4 * K4) throw std::runtime_error("NR_SWI4_DIR: expand weights");
+                    const std::vector<uint8_t> wsel(wex.begin(), wex.begin() + std::ptrdiff_t(H4 * K4));
+                    const I4Mat imx = i4_obtain(std::string(nb) + ".ex", wsel, H4, K4, 1, aqb);
+                    const auto& q = imx.q; const auto& scb = imx.sc;
+                    if (aqb.size() != K4 * 8 || q.size() != H4 * K4 || scb.size() != H4 * 8 || C % 64)
+                        throw std::runtime_error("NR_SWI4_DIR: file sizes");
+                    // the int4 records: two k steps (32 positions) a record, one 512-byte record per 16 rows and step pair
+                    auto pairrec = [&](const std::vector<uint8_t>& qq, size_t N_, size_t K_) {
+                        const size_t kb_ = K_ / 2, nr_ = (K_ + 63) / 64;
+                        std::vector<uint8_t> oo(N_ / 16 * nr_ * 512, 0);
+                        for (size_t n = 0; n < N_; ++n)
+                            for (size_t j = 0; j < kb_; ++j) {
+                                const size_t st = j / 16, bb = j % 16, l = (n % 16) + 16 * (bb / 8);
+                                oo[((n / 16) * nr_ + st / 2) * 512 + l * 16 + (st % 2) * 8 + bb % 8] =
+                                    uint8_t((qq[n * K_ + 2 * j] & 15) | ((qq[n * K_ + 2 * j + 1] & 15) << 4));
+                            }
+                        return uint32_t(put(oo, 256));
+                    };
+                    // one u32 a row: f16 scale (low half) and f16 constant (high half)
+                    auto f16pairs = [&](const std::vector<uint8_t>& b, size_t rows) {
+                        std::vector<float> sc(rows * 2); std::memcpy(sc.data(), b.data(), rows * 8);
+                        std::vector<uint8_t> scp(rows * 4);
+                        for (size_t n = 0; n < rows; ++n) {
+                            const uint32_t v = uint32_t(tin::f_to_f16(sc[n])) | (uint32_t(tin::f_to_f16(sc[rows + n])) << 16);
+                            std::memcpy(&scp[n * 4], &v, 4);
+                        }
+                        return uint32_t(put(scp, 16) / 4);
+                    };
+                    auto quantiser = [&](const std::vector<uint8_t>& b) {   // one u32 a channel: f16 1/step, f16 zero
+                        std::vector<float> a(b.size() / 4); std::memcpy(a.data(), b.data(), b.size());
+                        std::vector<uint8_t> o4(a.size() * 2);
+                        for (size_t c = 0; c < a.size() / 2; ++c) {
+                            const uint32_t v = uint32_t(tin::f_to_f16(a[2 * c])) | (uint32_t(tin::f_to_f16(a[2 * c + 1])) << 16);
+                            std::memcpy(&o4[c * 4], &v, 4);
+                        }
+                        return uint32_t(put(o4, 16) / 4);
+                    };
+                    const uint32_t w4 = pairrec(q, H4, K4);
+                    const uint32_t si = f16pairs(scb, H4);
+                    const uint32_t qi = quantiser(aqb);
+                    uint32_t rv[17] = {0x34495753u, qi, w4, si, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+                    if (std::filesystem::exists(std::string(nb) + ".y.aq.bin")) {
+                        rv[10] = quantiser(slurp(std::string(nb) + ".y.aq.bin"));
+                        const auto wq = slurp(std::string(base) + ".qkv.bin");
+                        const size_t N3 = size_t(3 * C);
+                        if (wq.size() < N3 * K4) throw std::runtime_error("NR_SWI4_DIR: qkv weights");
+                        const std::vector<uint8_t> qsel(wq.begin(), wq.begin() + std::ptrdiff_t(N3 * K4));
+                        const auto yaq = slurp(std::string(nb) + ".y.aq.bin");
+                        if (yaq.size() != K4 * 8) throw std::runtime_error("NR_SWI4_DIR: y.aq size");
+                        const I4Mat imq = i4_obtain(std::string(nb) + ".qkv", qsel, N3, K4, 1, yaq);
+                        rv[11] = pairrec(imq.q, N3, K4);
+                        rv[12] = f16pairs(imq.sc, N3);
+                    }
+                    std::vector<uint8_t> rec(256, 0);
+                    std::memcpy(rec.data(), rv, sizeof rv);
+                    p.e_off = uint32_t(put(rec, 256));
+                    g_swi4_eoff.insert(p.e_off);
+                }
+            }
+#endif
             p.ct_off = uint32_t(put(tin::tile_blocked(
-                load_e4m3_requantised(std::string(base) + ".mlp_contract.bin", size_t(C) * Kc).data(),
+                NR_HS_FOLDED(heads == 1, load_e4m3_requantised(std::string(base) + ".mlp_contract.bin", size_t(C) * Kc)).data(),
                 size_t(C), size_t(Kc)), 256));
             p.qkv_off = uint32_t(put(tin::tile_blocked(
                 load_e4m3_requantised(std::string(base) + ".qkv.bin", size_t(3 * C) * C).data(),
@@ -1758,7 +2172,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 size_t(C), size_t(C)), 256));
             p.mid_off = heads > 1
                 ? uint32_t(put(tin::tile_blocked(
-                    load_e4m3_requantised(std::string(base) + ".mlp_mid.bin", size_t(C) * Hg).data(),
+                    NR_HS_FOLDED(true, load_e4m3_requantised(std::string(base) + ".mlp_mid.bin", size_t(C) * Hg)).data(),
                     size_t(C), size_t(Hg)), 256))
                 : 0u;
             {
@@ -2143,7 +2557,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                         // A zeroed region the build fills on the GPU after the upload
                         // (see g_noise_jobs); f16 x4 per pixel of the working grid.
                         const uint32_t nw=d.gx*8u, nh=d.gy*8u;
-                        noise_off=uint32_t(put(std::vector<uint8_t>(size_t(nw)*nh*8u,0),256)/4);
+                        noise_off=uint32_t(wblob.append_zeros(size_t(nw)*nh*8u,256)/4);
                         if(!noise_off)throw std::runtime_error("noise field at offset 0");
                         g_noise_jobs.push_back({noise_off,nw,nh,pi.seed,pi.noise});
                     }
@@ -2975,6 +3389,35 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             p.shift = s.shift_x == 100 ? (s.shifted ? 1 : 0) : s.shift_x;
             p.shift_y = s.shift_y == 100 ? p.shift : s.shift_y;
             d.kern = "attn";
+#if NR_INT4
+            // NR_I4_DIR: the QKV projection on int4 (b<b>.attn.w4.bin [1536][512], .attn.sc.bin [2][1536]);
+            // its input is the FFN projection's int4 side copy. pc.w_off -> {magic, X offset, W4, scale index}.
+            if (const char* idir = nr::build_cfg("NR_I4_DIR")) {
+                char fn[512]; std::snprintf(fn, sizeof fn, "%s/b%d.attn", idir, s.block);
+                if (i4_have(fn)) {
+                    char an[512]; std::snprintf(an, sizeof an, "%s/b%d.attn.aq.bin", idir, s.block);
+                    const I4Mat im = i4_obtain(fn, std::vector<uint8_t>(qkv.begin(), qkv.begin() + 1536 * 512), 1536, 512, 16, slurp(an));
+                    const auto& q = im.q; const auto& scb = im.sc;
+                    if (q.size() != 1536u * 512u || scb.size() != 1536u * 8u) throw std::runtime_error("NR_I4_DIR: attn w4/sc size");
+                    const size_t kb = 256, nrec = kb / 32;
+                    std::vector<uint8_t> o(1536 * kb, 0);
+                    for (size_t n = 0; n < 1536; ++n)
+                        for (size_t j = 0; j < kb; ++j) {
+                            const size_t st = j / 16, bb = j % 16, l = (n % 16) + 16 * (bb / 8);
+                            o[((n / 16) * nrec + st / 2) * 512 + l * 16 + (st % 2) * 8 + bb % 8] =
+                                uint8_t((q[n * 512 + 2 * j] & 15) | ((q[n * 512 + 2 * j + 1] & 15) << 4));
+                        }
+                    std::vector<float> sc(1536 * 2); std::memcpy(sc.data(), scb.data(), scb.size());
+                    const uint32_t w4 = uint32_t(put(o, 256)), si = uint32_t(put_f32(sc) / 4);
+                    const uint32_t mt = p.tiles_x * p.tiles_y * 16u;
+                    std::vector<uint8_t> rec(16);
+                    const uint32_t rv[4] = {0x49345141u, mt * 512u, w4, si};
+                    std::memcpy(rec.data(), rv, 16);
+                    p.w_off = uint32_t(put(rec, 256));
+                    d.kern = "attn4";
+                }
+            }
+#endif
             // gridZ is the head split: NR_HSPLIT=16 head groups, and the kernel
             // strides its head loop by gl_NumWorkGroups.z so any divisor is
             // correct. 16 is 3.33x over one.
@@ -3027,7 +3470,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             // padded window grid - see the `ffwd3` branch above and
             // [[the-bottleneck-writes-half-its-tokens]]. The ViT and the
             // decoder's own GEMMs keep the plan's token count.
-            const size_t N = size_t(sh.N), K = size_t(sh.K);
+            size_t N = size_t(sh.N), K = size_t(sh.K);
             const size_t M = (s.type.rfind("CCSplitSwin16H", 0) == 0 &&
                               !flag(argc, argv, "--ffwd-full"))
                 ? size_t(tiles_of(s.H)) * size_t(tiles_of(s.W)) * 16
@@ -3071,6 +3514,108 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                         for (size_t k=0; k<1024; ++k)
                             w[(which*1024+row)*1024+k] = record[vit_qkv_weight_byte(which,row,k)];
             }
+#if NR_INT4
+            // int4_mixed: the ViT weights as the solver saw them (canonical [N][K] e4m3), for the correction tables.
+            // Kept only for the expansion and the QKV, which read them below and then drop them.
+            if (nr::build_cfg("NR_I4_DIR") && (s.type == "CCVit1DFfnExpand" || s.type == "CCVit1DQKV") &&
+                w.size() >= N * K)
+                g_i4_wsave[{s.block, s.layer}] = std::vector<uint8_t>(w.begin(), w.begin() + std::ptrdiff_t(N * K));
+            // int4 helpers. A [N][K] int8 (-8..7) matrix -> nibble pairs, tile-blocked or in the
+            // NR_I4_PAIR records; a side quantiser (1/step, zero) per
+            // rotated channel -> the kernel's (a / sqrt(B), zero + 1.5*2^23) for an unnormalised H_B.
+            auto i4file = [&](const char* fmt, int b) {
+                const char* idir = nr::build_cfg("NR_I4_DIR"); if (!idir) return std::vector<uint8_t>();
+                char fn[512], nm[64]; std::snprintf(nm, sizeof nm, fmt, b); std::snprintf(fn, sizeof fn, "%s/%s", idir, nm);
+                return std::filesystem::exists(fn) ? slurp(fn) : std::vector<uint8_t>();
+            };
+            auto i4pack = [&](const std::vector<uint8_t>& q, size_t N_, size_t K_) {
+                const size_t kb = K_ / 2;
+                std::vector<uint8_t> nib(N_ * kb);
+                for (size_t n = 0; n < N_; ++n)
+                    for (size_t j = 0; j < kb; ++j)
+                        nib[n * kb + j] = uint8_t((q[n * K_ + 2 * j] & 15) | ((q[n * K_ + 2 * j + 1] & 15) << 4));
+                if (K_ % 128) throw std::runtime_error("NR_I4_PAIR: K must be a multiple of 128");
+                const size_t nrec = kb / 32;
+                std::vector<uint8_t> o(N_ * kb, 0);
+                for (size_t n = 0; n < N_; ++n)
+                    for (size_t j = 0; j < kb; ++j) {
+                        const size_t st = j / 16, bb = j % 16, l = (n % 16) + 16 * (bb / 8);
+                        o[((n / 16) * nrec + st / 2) * 512 + l * 16 + (st % 2) * 8 + bb % 8] = nib[n * kb + j];
+                    }
+                return o;
+            };
+            // the side copies are quantised after the H16 rotation (unnormalised: a takes the 1/4)
+            auto i4side = [&](const std::vector<uint8_t>& aqb) {
+                std::vector<float> a(aqb.size() / 4); std::memcpy(a.data(), aqb.data(), aqb.size());
+                for (size_t c = 0; c < a.size() / 2; ++c) { a[2 * c] *= 0.25f; a[2 * c + 1] += 12582912.0f; }
+                return uint32_t(put_f32(a) / 8);
+            };
+            // NR_I4_DIR: the ViT FFN hidden split into K4 int4 channels and 4096-K4 e4m3
+            // ones. Files b<block>.perm.bin u16[4096] (hidden position -> original channel; int4 ones
+            // first), .aq.bin f32[K4][2] (1/step, zero point), .w4.bin i8[1024][K4] (-8..7, permuted
+            // order), .sc.bin f32[2][1024] (per output: int4 scale, constant). The expansion's rows are
+            // permuted (exact); the contraction keeps the e4m3 columns of the last 4096-K4 positions.
+            int i4_k4 = 0;
+            std::vector<uint8_t> i4_w4;
+            std::vector<float> i4_aq, i4_sc;
+            if (const char* idir = nr::build_cfg("NR_I4_DIR"))
+                if (s.type == "CCVit1DFfnExpand" || s.type == "CCVit1DFfnContract") {
+                    char fn[512];
+                    std::snprintf(fn, sizeof fn, "%s/b%d.perm.bin", idir, s.block);
+                    const std::vector<uint8_t> pb = slurp(fn);
+                    std::snprintf(fn, sizeof fn, "%s/b%d.aq.bin", idir, s.block);
+                    const std::vector<uint8_t> aqb = slurp(fn);
+                    const bool ex = s.type == "CCVit1DFfnExpand";
+                    const size_t H = ex ? N : K;
+                    if (pb.size() == H * 2 && H == 4096 && !aqb.empty() && w.size() >= N * K) {
+                        std::vector<uint16_t> perm(H); std::memcpy(perm.data(), pb.data(), pb.size());
+                        std::vector<int> seen(H, 0);
+                        for (uint16_t v : perm) if (v < H) seen[v]++;
+                        if (std::count(seen.begin(), seen.end(), 1) != int(H)) throw std::runtime_error("NR_I4_DIR: perm is not a permutation");
+                        i4_k4 = int(aqb.size() / 8);
+                        if (i4_k4 <= 0 || i4_k4 % 64 || (int(H) - i4_k4) % 256 || i4_k4 > int(H))
+                            throw std::runtime_error("NR_I4_DIR: K4 must be a multiple of 64 with 4096-K4 a multiple of 256");
+                        if (ex) {
+                            i4_aq.resize(size_t(i4_k4) * 2); std::memcpy(i4_aq.data(), aqb.data(), aqb.size());
+                            std::vector<uint8_t> w2(N * K);
+                            for (size_t j = 0; j < N; ++j) std::memcpy(&w2[j * K], &w[size_t(perm[j]) * K], K);
+                            w.swap(w2);
+                        } else {
+                            const size_t K8 = H - size_t(i4_k4);
+                            std::vector<uint8_t> wsel4(N * size_t(i4_k4));
+                            for (size_t n = 0; n < N; ++n)
+                                for (size_t j = 0; j < size_t(i4_k4); ++j) wsel4[n * size_t(i4_k4) + j] = w[n * K + perm[j]];
+                            std::vector<uint8_t> w8(N * K8);
+                            for (size_t n = 0; n < N; ++n)
+                                for (size_t j = 0; j < K8; ++j) w8[n * K8 + j] = w[n * K + perm[size_t(i4_k4) + j]];
+                            w.swap(w8); K = K8;
+                            int rotb = 64;
+                            std::snprintf(fn, sizeof fn, "%s/rot.txt", idir);
+                            if (std::filesystem::exists(fn)) { const auto rt = slurp(fn); rotb = std::atoi(std::string(rt.begin(), rt.end()).c_str()); }
+                            std::snprintf(fn, sizeof fn, "%s/b%d", idir, s.block);
+                            const I4Mat im = i4_obtain(fn, wsel4, N, size_t(i4_k4), rotb, aqb);
+                            const std::vector<uint8_t>& q = im.q; const std::vector<uint8_t>& scb = im.sc;
+                            if (q.size() != N * size_t(i4_k4) || scb.size() != N * 8) throw std::runtime_error("NR_I4_DIR: w4/sc size");
+                            const size_t kb = size_t(i4_k4) / 2;
+                            std::vector<uint8_t> nib(N * kb);
+                            for (size_t n = 0; n < N; ++n)
+                                for (size_t j = 0; j < kb; ++j)
+                                    nib[n * kb + j] = uint8_t((q[n * i4_k4 + 2 * j] & 15) | ((q[n * i4_k4 + 2 * j + 1] & 15) << 4));
+                            // NR_I4_PAIR: [N/16][K4/64] records of 512 bytes; lane l's 16 bytes at l*16 =
+                            // [step 2s: row l%16, bytes 8(l/16)..+7][step 2s+1: the same] (gemm1x1.comp).
+                            if (i4_k4 % 128) throw std::runtime_error("NR_I4_PAIR: K4 must be a multiple of 128");
+                            const size_t nrec = kb / 32;
+                            i4_w4.assign(N * kb, 0);
+                            for (size_t n = 0; n < N; ++n)
+                                for (size_t j = 0; j < kb; ++j) {
+                                    const size_t st = j / 16, b = j % 16, l = (n % 16) + 16 * (b / 8);
+                                    i4_w4[((n / 16) * nrec + st / 2) * 512 + l * 16 + (st % 2) * 8 + b % 8] = nib[n * kb + j];
+                                }
+                            i4_sc.resize(N * 2); std::memcpy(i4_sc.data(), scb.data(), scb.size());
+                        }
+                    }
+                }
+#endif
             if (w.size() < N * K) {
                 std::fprintf(stderr, "b%dl%d %s: weight is %zu B, need %zu\n",
                              s.block, s.layer, s.type.c_str(), w.size(), N * K);
@@ -3177,6 +3722,74 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 p.W = uint32_t(s.H);
                 p.rows = uint32_t(s.W);
             }
+#if NR_INT4
+            if (i4_k4) {
+                // X4 (M x K4/2 bytes, tile-blocked) at the hidden slot, X8 right after it.
+                const uint32_t Mt = uint32_t((M + 15) / 16 * 16);
+                p.p_off = Mt * uint32_t(i4_k4) / 2u;
+                if (s.type == "CCVit1DFfnExpand") {
+                    if (d.kern != "gemmvact") throw std::runtime_error("NR_I4_DIR: expansion on " + d.kern);
+                    d.kern = "gemmvact4";
+                    p.r_off = uint32_t(i4_k4);
+                    // the NR_I4_EPI=2 producer takes a/8 (unnormalised H64) and z + 1.5*2^23 (the fma rounds to the
+                    // integer in the low mantissa bits)
+                    for (size_t c = 0; c < i4_aq.size() / 2; ++c) { i4_aq[2 * c] *= 0.125f; i4_aq[2 * c + 1] += 12582912.0f; }
+                    p.g_off = uint32_t(put_f32(i4_aq) / 8);
+                } else {
+                    if (d.kern != "gemmproj" && d.kern != "gemmprojw") throw std::runtime_error("NR_I4_DIR: contraction on " + d.kern);
+                    d.kern += "4";
+                    p.crow = uint32_t(i4_k4) / 2u;
+                    p.d_off = uint32_t(put(i4_w4, 256));
+                    p.gd_off = uint32_t(put_f32(i4_sc) / 4);
+                }
+            }
+            // NR_I4_DIR, the int4 stream: the contraction writes an int4 copy of its output for the QKV
+            // (b<b>.qkv.aq.bin), the projection one for the next block's expansion (b<b+1>.ex.aq.bin), both
+            // H16-rotated (gemm1x1 NR_I4_SIDE); the expansion reads it (b<b>.ex.w4.bin / .ex.sc.bin, all int4).
+            {
+                const uint32_t Mt = uint32_t((M + 15) / 16 * 16);
+                if (s.type == "CCVit1DFfnContract" && (d.kern == "gemmproj4" || d.kern == "gemmprojw4")) {
+                    const auto aqb = i4file("b%d.qkv.aq.bin", s.block);
+                    if (!aqb.empty()) { d.kern += "s"; p.raster = i4side(aqb); }
+                }
+                if (s.type == "CCSplitSwin16HFfwdProj" && d.kern == "gemmprojc") {
+                    const auto aqb = i4file("b%d.attn.aq.bin", s.block);
+                    if (!aqb.empty()) { d.kern = "gemmprojcs"; p.raster = i4side(aqb); }
+                }
+                if (s.type == "CCVit1DProjection" && (d.kern == "gemmproj" || d.kern == "gemmprojw")) {
+                    const auto aqb = i4file("b%d.ex.aq.bin", s.block + 1);
+                    if (!aqb.empty()) { d.kern += "s"; p.raster = i4side(aqb); }
+                }
+                if (s.type == "CCVit1DFfnExpand" && d.kern == "gemmvact4") {
+                    std::vector<uint8_t> q, scb;
+                    if (const char* idir = nr::build_cfg("NR_I4_DIR")) {
+                        char pf[512]; std::snprintf(pf, sizeof pf, "%s/b%d.ex", idir, s.block);
+                        const auto sv = g_i4_wsave.find({s.block, s.layer});
+                        const auto pb = i4file("b%d.perm.bin", s.block);
+                        if (i4_have(pf) &&
+                            sv != g_i4_wsave.end() && pb.size() == 4096 * 2 && N == 4096) {
+                            std::vector<uint16_t> pm(4096); std::memcpy(pm.data(), pb.data(), pb.size());
+                            std::vector<uint8_t> ws(4096 * 1024);
+                            for (size_t j = 0; j < 4096; ++j) std::memcpy(&ws[j * 1024], &sv->second[size_t(pm[j]) * 1024], 1024);
+                            g_i4_wsave.erase(sv);
+                            const I4Mat im = i4_obtain(pf, ws, 4096, 1024, 16, i4file("b%d.ex.aq.bin", s.block));
+                            q = im.q; scb = im.sc;
+                        }
+                    }
+                    if (!q.empty()) {
+                        if (q.size() != N * 1024 || scb.size() != N * 8) throw std::runtime_error("NR_I4_DIR: ex w4/sc size");
+                        d.kern = "gemmvact4c";
+                        d.i4_xbase = p.x_off;
+                        p.x_off += Mt * 1024u;
+                        p.crow = 512u;
+                        p.d_off = uint32_t(put(i4pack(q, N, 1024), 256));
+                        std::vector<float> sc(N * 2); std::memcpy(sc.data(), scb.data(), scb.size());
+                        p.gd_off = uint32_t(put_f32(sc) / 4);
+                        p.K = 0;
+                    }
+                }
+            }
+#endif
             d.gx = uint32_t((M + mt - 1) / mt); d.gy = uint32_t(N / nt); d.gz = 1;
 #if NR_GEMM_REMAP_HOST
             // Two token tiles, then every output-channel tile, then the next two
@@ -3214,6 +3827,38 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 if(p.N != 3072 || p.K != 1024) throw std::runtime_error("QKV fusion: unexpected QKV shape");
                 p.o_off=pn.dst; p.r_off=pn.scale_off;
                 d.kern=(p.M<=uint32_t(NR_QKVS_MAX_TOKENS) && !flag(argc,argv,"--no-qkvs")) ? "gemmvqkvnorms" : "gemmvqkvnorm";
+#if NR_INT4
+                // NR_I4_DIR: the QKV reads the contraction's int4 copy (b<b>.qkv.w4.bin / .qkv.sc.bin).
+                if (const char* idir = nr::build_cfg("NR_I4_DIR")) {
+                    char fn[512];
+                    std::snprintf(fn, sizeof fn, "%s/b%d.qkv", idir, s.block);
+                    const auto sv = g_i4_wsave.find({s.block, s.layer});
+                    if (i4_have(fn) &&
+                        sv != g_i4_wsave.end()) {
+                        const std::vector<uint8_t> ws(sv->second.begin(), sv->second.begin() + 3072 * 1024);
+                        g_i4_wsave.erase(sv);
+                        const I4Mat im = i4_obtain(fn, ws, 3072, 1024, 16, slurp(std::string(fn) + ".aq.bin"));
+                        const auto& q = im.q; const auto& scb = im.sc;
+                        if (q.size() != 3072u * 1024u || scb.size() != 3072u * 8u) throw std::runtime_error("NR_I4_DIR: qkv w4/sc size");
+                        const size_t kb = 512, nrec = kb / 32;
+                        std::vector<uint8_t> o(3072 * kb, 0);
+                        for (size_t n = 0; n < 3072; ++n)
+                            for (size_t j = 0; j < kb; ++j) {
+                                const size_t st = j / 16, bb = j % 16, l = (n % 16) + 16 * (bb / 8);
+                                o[((n / 16) * nrec + st / 2) * 512 + l * 16 + (st % 2) * 8 + bb % 8] =
+                                    uint8_t((q[n * 1024 + 2 * j] & 15) | ((q[n * 1024 + 2 * j + 1] & 15) << 4));
+                            }
+                        d.kern += "4";
+                        d.i4_xbase = p.x_off;
+                        p.x_off += uint32_t((p.M + 15u) / 16u * 16u) * 1024u;
+                        p.crow = 512u;
+                        p.d_off = uint32_t(put(o, 256));
+                        std::vector<float> sc(3072 * 2); std::memcpy(sc.data(), scb.data(), scb.size());
+                        p.gd_off = uint32_t(put_f32(sc) / 4);
+                        p.K = 0;
+                    }
+                }
+#endif
                 std::memcpy(d.push.data(),&p,sizeof p);
                 disp.push_back(std::move(d));
                 continue;
@@ -3259,6 +3904,18 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         for (Disp& d : disp) d.lo = d.hi = position.at(d.s);
     }
     timer.mark("weights-unpack");
+    if (!arena_probe && nr::g_memory_note) nr::logf("weights read; %s", nr::g_memory_note().c_str());
+#if NR_INT4
+    // --int4-weights-out <file>: the install-time generator (dlssnr-amd/model-tools/dlssnr-int4-weights). Every int4
+    // matrix of this build has been recovered above, by the same code a build without the file would run; write them
+    // and stop before the device.
+    if (i4_out_scope.out) {
+        if (i4_out_scope.list.empty()) throw std::runtime_error("int4 weights: this build has no int4 matrices");
+        i4_store_write(i4_out_scope.path, i4_out_scope.list);
+        nr::logf("[nr] int4 weights: %zu matrices -> %s", i4_out_scope.list.size(), i4_out_scope.path.c_str());
+        return 2;
+    }
+#endif
     if (!arena_probe)
         nr::logf("weight arena %.1f MB over %zu dispatches", double(wblob.size()) / 1e6, disp.size());
 
@@ -3271,14 +3928,15 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             const size_t bytes=N*K;
             if(N%32 || K%16 || size_t(offset)+bytes>wblob.size())
                 throw std::runtime_error("packed weight matrix bounds");
-            std::vector<uint8_t> packed(bytes);
+            std::vector<uint8_t> packed(bytes), orig(bytes);
+            wblob.read(offset, orig.data(), bytes);
             for(size_t n=0;n<N/16;n+=2) for(size_t k=0;k<K/16;++k)
                 for(size_t lane=0;lane<32;++lane) for(size_t j=0;j<2;++j) for(size_t c=0;c<8;++c) {
                     const size_t src=((n+j)*(K/16)+k)*256+(lane%16)*16+(lane/16)*8+c;
                     const size_t dst=((n/2)*(K/16)+k)*512+lane*16+j*8+c;
-                    packed[dst]=wblob[size_t(offset)+src];
+                    packed[dst]=orig[src];
                 }
-            std::copy(packed.begin(),packed.end(),wblob.begin()+offset); ++packed_count;
+            wblob.write(offset, packed.data(), bytes); ++packed_count;
         };
         // Layout 2 extends layout 1 with the three grouped FFWD matrices.
         const bool pack_ffwd = weight_layout >= 2;
@@ -3302,6 +3960,16 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 if(!packed_attn.count(p.w_off)) { pack_matrix(p.w_off,1536,512); packed_attn.insert(p.w_off); }
                 continue;
             }
+#if NR_INT4
+            // the int4 GEMM pipelines keep their e4m3 weights packed like their base kernel's
+            if(i4base(pd.kern)!=pd.kern && pd.kern.rfind("gemm",0)==0) {
+                PushGemm p{};
+                if(pd.push.size()!=sizeof p) throw std::runtime_error("packed GEMM push mismatch");
+                std::memcpy(&p,pd.push.data(),sizeof p);
+                pack_matrix(p.w_off,p.N,p.K);
+                continue;
+            }
+#endif
             if(pd.kern=="gemmproj" || (pd.kern=="gemmprojh" && !NR_VIT_CT41) || pd.kern=="gemmprojc" || pd.kern=="gemmprojt" || pd.kern=="gemmprojw" || pd.kern=="gemmvact" || pd.kern=="gemmvacts" || pd.kern=="gemmvqkv" || pd.kern=="gemmvqkvs" || pd.kern=="gemmvqkvnorm" || pd.kern=="gemmvqkvnorms") {
                 PushGemm p{};
                 if(pd.push.size()!=sizeof p) throw std::runtime_error("packed GEMM push mismatch");
@@ -3329,6 +3997,9 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             PushFSwin p{};
             if(pd.push.size()<sizeof p) throw std::runtime_error("packed Swin push mismatch");
             std::memcpy(&p,pd.push.data(),sizeof p);
+#if NR_INT4
+            if (!g_swi4_eoff.count(p.e_off))   // int4 mixed: an int4 expansion is a record, not a matrix
+#endif
             pack_matrix(p.e_off,4*C,C);
             pack_matrix(p.mid_off,C,128);
             pack_matrix(p.ct_off,C,C);
@@ -3963,12 +4634,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         std::vector<std::array<uint32_t, 7>> rec(disp.size());   // word 6: NR_TC_MAGIC (nr_chain.glsl)
         for (auto& r : rec) r = {0xFFFFFFFFu, 0u, 0xFFFFFFFFu, 0xFFFFFFFFu, frame_word, 0u, 0x54434852u};
         if (tick < disp.size()) rec[tick][1] = 1u;
-        auto putw = [&](const void* p, size_t n) {
-            wblob.resize(align(wblob.size(), 16));
-            const size_t o = wblob.size();
-            wblob.insert(wblob.end(), (const uint8_t*)p, (const uint8_t*)p + n);
-            return uint32_t(o / 4);
-        };
+        auto putw = [&](const void* p, size_t n) { return uint32_t(wblob.append(p, n, 16) / 4); };
         size_t nch = 0;
         bool big_frame = false;
         for (const Disp& d : disp)
@@ -3978,7 +4644,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             }
         // research: NR_TC_BIG=1 keeps the persistent-run chains at 4K too.
         if (std::getenv("NR_TC_BIG") && std::atoi(std::getenv("NR_TC_BIG"))) big_frame = false;
-        auto wword = [&](uint32_t i) { uint32_t v; std::memcpy(&v, wblob.data() + size_t(i) * 4, 4); return v; };
+        auto wword = [&](uint32_t i) { uint32_t v; wblob.read(size_t(i) * 4, &v, 4); return v; };
         // The activation a dispatch reads from its predecessor / writes for its
         // successor. A persistent run: its last layer's output, its UPS layer's
         // lower-level input (records in the weight blob); the fused upsample: its
@@ -3999,6 +4665,9 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 PushUps u{}; std::memcpy(&u, d.push.data() + sizeof(PushFSwin), sizeof u);
                 f[0] = u.p_off; f[1] = 0xFFFFFFFEu;
             } else std::memcpy(f, d.push.data(), 8);                    // attn, ffwd3, vitattn: x_off, o_off first
+#if NR_INT4
+            if (d.kern.rfind("gemm", 0) == 0 && d.i4_xbase != 0xFFFFFFFFu) f[0] = d.i4_xbase;   // reads another dispatch's int4 copy
+#endif
             return f[out ? 1 : 0];
         };
         // The consumer's gather grid: a UPS-first run or the fused upsample
@@ -4090,7 +4759,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             std::vector<uint32_t> t(T, 0xFFFFFFFFu);
             uint32_t ncnt = T;
             auto ent = [](uint32_t c, uint32_t need) { return c | (need << 20); };
-            if (P.kern == "attn") {                                     // tile -> window
+            if (NR_KBASE(P.kern) == "attn") {                           // tile -> window
                 PushAttn pa{}; std::memcpy(&pa, P.push.data(), sizeof pa);
                 ncnt = P.gx * P.gy;
                 for (uint32_t wy = 0; wy < P.gy; ++wy)
@@ -4101,7 +4770,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                             t.at(uint32_t(ty) * pa.tiles_x + uint32_t(tx)) = ent(wy * P.gx + wx, P.gz);
                         }
             } else if (P.kern.rfind("gemm", 0) == 0) {                  // every M tile, all N tiles
-                const auto mw = gemm_mt_wn(P.kern);
+                const auto mw = gemm_mt_wn(NR_KBASE(P.kern));
                 for (uint32_t k = 0; k < P.gx * (mw.first / 16u); ++k) t.at(k) = ent(k, P.gy * mw.second);
             } else if (P.kern == "vitattn") {                            // a workgroup a query tile and head
                 PushVAttn pv{}; std::memcpy(&pv, P.push.data(), sizeof pv);
@@ -4186,7 +4855,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 if (Q.tc_prod >= 0) {
                     const Disp& P = disp[size_t(Q.tc_prod)];
                     uint32_t ntile = 0, need = 0;
-                    if (P.kern.rfind("gemm", 0) == 0) { const auto mw = gemm_mt_wn(P.kern); ntile = P.gx * (mw.first / 16u); need = P.gy * mw.second; }
+                    if (P.kern.rfind("gemm", 0) == 0) { const auto mw = gemm_mt_wn(NR_KBASE(P.kern)); ntile = P.gx * (mw.first / 16u); need = P.gy * mw.second; }
                     else if (P.kern == "vitattn") { PushVAttn pv{}; std::memcpy(&pv, P.push.data(), sizeof pv); ntile = (pv.tokens + 15u) / 16u; need = P.gy; }
                     else throw std::runtime_error("NR_VIT_SPLIT: unexpected producer " + P.kern);
                     if (!pcnt.count(Q.tc_prod)) {
@@ -4318,52 +4987,63 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                   VK_FORMAT_R32G32B32A32_SFLOAT, false);
     nr::logf("images in %ux%u, out %ux%u (x2)", in_w, in_h, out_w, out_h);
     timer.mark("arena-alloc");
+    nr::g_build_stage = 3;
     // A frame to sample. `--in-image` takes an RGBA32F blob; without one the
     // input is a gradient, which is enough to see the pipeline carry data and
     // is *not* enough to call the result an image - the gate check applies.
     {
-        // **Two host allocations at the frame's own size**, and they are the
-        // largest this build makes on the CPU side: this vector, and inside
-        // `upload` a staging buffer of the same length that is mapped. At 4K
-        // that is 133 MB each. On a 32-bit game they come out of the same 2 GB
-        // the game and DXVK are already living in, so the size is logged before
-        // it is asked for rather than inferred afterwards from a bare
-        // std::bad_alloc.
-        const double mb = double(size_t(std::max(in_w, 1u)) * std::max(in_h, 1u) * 16) / 1e6;
-        nr::logf("input image: %.1f MB host + %.1f MB mapped staging", mb, mb);
-        std::vector<float> px(size_t(std::max(in_w, 1u)) * std::max(in_h, 1u) * 4);
+        // Written a band of rows at a time (nrvk::Context::image_rows): the
+        // frame is never held whole in host or mapped memory. The runtime
+        // overwrites this image every frame.
+        const uint32_t w = std::max(in_w, 1u), h = std::max(in_h, 1u);
         const std::vector<uint8_t> blob = slurp(arg(argc, argv, "--in-image", ""));
-        if (arg(argc, argv, "--in-image") && blob.size() != px.size()*4) {
+        const size_t floats = size_t(w) * h * 4;
+        if (arg(argc, argv, "--in-image") && blob.size() != floats * 4) {
             std::fprintf(stderr, "input image has %zu bytes; plan requires %zu (%ux%u RGBA32F)\n",
-                         blob.size(), px.size()*4, in_w, in_h);
+                         blob.size(), floats * 4, in_w, in_h);
             return 1;
         }
-        if (!blob.empty()) std::memcpy(px.data(), blob.data(), px.size() * 4);
-        else
-            for (uint32_t y = 0; y < in_h; ++y)
-                for (uint32_t x = 0; x < in_w; ++x) {
-                    float* q = &px[(size_t(y) * in_w + x) * 4];
-                    q[0] = float(x) / float(in_w ? in_w : 1);
-                    q[1] = float(y) / float(in_h ? in_h : 1);
-                    q[2] = 0.5f; q[3] = 1.0f;
-                }
-        if (tex_in_format == VK_FORMAT_R32G32B32A32_SFLOAT) ctx.upload(tex_in, px.data(), px.size() * 4);
+        // one row of the RGBA32F picture: the blob, or a gradient (enough to
+        // see the pipeline carry data, *not* enough to call the result an image)
+        auto row_f32 = [&](uint32_t y, float* q) {
+            if (!blob.empty()) { std::memcpy(q, blob.data() + size_t(y) * w * 16, size_t(w) * 16); return; }
+            for (uint32_t x = 0; x < w; ++x, q += 4) {
+                if (y >= in_h || x >= in_w) { q[0] = q[1] = q[2] = q[3] = 0.0f; continue; }
+                q[0] = float(x) / float(in_w ? in_w : 1);
+                q[1] = float(y) / float(in_h ? in_h : 1);
+                q[2] = 0.5f; q[3] = 1.0f;
+            }
+        };
+        if (tex_in_format == VK_FORMAT_R32G32B32A32_SFLOAT)
+            ctx.image_rows(tex_in, VkDeviceSize(floats) * 4, true, [&](uint32_t y0, uint32_t n, uint8_t* stage) {
+                for (uint32_t y = y0; y < y0 + n; ++y)
+                    row_f32(y, reinterpret_cast<float*>(stage + size_t(y - y0) * w * 16));
+            });
         else if (tex_in_format == VK_FORMAT_B8G8R8A8_UNORM || tex_in_format == VK_FORMAT_R8G8B8A8_UNORM) {
             // The same picture as an 8-bit frame, for checking the runtime's
             // 8-bit input path from the command line (--in-image on k/255).
-            std::vector<uint8_t> b8(px.size());
-            for (size_t i = 0; i < px.size(); i += 4)
-                for (int k = 0; k < 4; ++k) {
-                    const int src = tex_in_format == VK_FORMAT_B8G8R8A8_UNORM && k < 3 ? 2 - k : k;
-                    b8[i + k] = uint8_t(std::lround(std::min(std::max(px[i + src], 0.f), 1.f) * 255.f));
+            std::vector<float> line(size_t(w) * 4);
+            ctx.image_rows(tex_in, VkDeviceSize(floats), true, [&](uint32_t y0, uint32_t n, uint8_t* stage) {
+                for (uint32_t y = y0; y < y0 + n; ++y) {
+                    row_f32(y, line.data());
+                    uint8_t* b8 = stage + size_t(y - y0) * w * 4;
+                    for (size_t i = 0; i < line.size(); i += 4)
+                        for (int k = 0; k < 4; ++k) {
+                            const int src = tex_in_format == VK_FORMAT_B8G8R8A8_UNORM && k < 3 ? 2 - k : k;
+                            b8[i + k] = uint8_t(std::lround(std::min(std::max(line[i + src], 0.f), 1.f) * 255.f));
+                        }
                 }
-            ctx.upload(tex_in, b8.data(), b8.size());
+            });
         }
     }
     timer.mark("input-image");
-    nr::logf("uploading weights: %.1f MB through a mapped staging buffer of the same size",
-             double(wblob.size()) / 1e6);
-    ctx.upload(wgt, 0, wblob.data(), wblob.size());
+    nr::logf("uploading weights: %.1f MB through a %.0f MB staging buffer",
+             double(wblob.size()) / 1e6, double(std::min<VkDeviceSize>(wblob.size(), nrvk::Context::kStageBytes)) / 1e6);
+    ctx.upload_with(wgt, 0, wblob.size(), [&](VkDeviceSize off, VkDeviceSize n, uint8_t* dst) {
+        wblob.read(size_t(off), dst, size_t(n));
+    });
+    // The host copy is not needed again; free it before the runtime allocates.
+    wblob.clear();
     timer.mark("weights-upload");
     // The pre-block's noise features (NR_NOISE_FIELD): a fixed function of pixel,
     // seed and gain, filled once here into the zeroed regions the lowering put
@@ -4462,6 +5142,19 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 std::filesystem::exists(spv_dir + "/g_" + d.kern + "nh.spv")) { d.kern += "nh"; ++n; }
         if (n) std::printf("exp upper clamp dead (weights): %d C=32 dispatches\n", n);
     }
+#if NR_INT4
+    // NR_HS_ROUTE=b+b+...: C=32 dispatches of these blocks take the "<kern>p" pipeline (built with the
+    // hard-swish) when it exists, so encoder and decoder layers that share a kernel can differ.
+    if (const char* e = nr::build_cfg("NR_HS_ROUTE")) {
+        std::set<int> blocks;
+        for (const char* q = e; *q; ) { blocks.insert(std::atoi(q)); while (*q && std::isdigit((unsigned char)*q)) ++q; while (*q && !std::isdigit((unsigned char)*q)) ++q; }
+        int n = 0;
+        for (Disp& d : disp)
+            if (d.s && blocks.count(d.s->block) && d.kern.find("32") != std::string::npos &&
+                std::filesystem::exists(spv_dir + "/g_" + d.kern + "p.spv")) { d.kern += "p"; ++n; }
+        std::printf("hard-swish route: %d dispatches\n", n);
+    }
+#endif
     // NR_REV_C32 (research): plain C=32 layers that take their windows from the
     // last to the first (NR_REV_Y pipelines). "1" alternates: a plain layer right
     // after a forward C=32 kernel walks backwards; otherwise a list of block ids.
@@ -4480,13 +5173,50 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         }
         std::printf("C=32 layers walking backwards: %d\n", n);
     }
+#if NR_INT4
+    // guard (after every kernel rename: nh, prune route, rv): a layer whose weights took the hard-swish fold must run on a pipeline built with the
+    // hard-swish (spv marker hs-pipelines.txt), and only such a layer may - otherwise the picture is wrong
+    // (the package bug). Without the marker nothing is checked (networks built before it).
+    {
+        const std::string hm = spv_dir + "/hs-pipelines.txt";
+        if (std::filesystem::exists(hm)) {
+            std::set<std::string> hs;
+            { std::ifstream f(hm); std::string k; while (f >> k) hs.insert(k); }
+            std::string bad;
+            for (const Disp& d : disp) {
+                if (d.kern.rfind("fswin", 0) != 0) continue;
+                const bool khs = hs.count(d.kern) != 0;
+                const int lo = d.lo >= 0 ? d.lo : -1, hi = d.hi >= 0 ? d.hi : -1;
+                std::vector<int> blocks;
+                if (lo >= 0) for (int q = lo; q <= hi; ++q) blocks.push_back(run[size_t(q)]->block);
+                else blocks.push_back(d.s->block);
+                for (int b : blocks) {
+                    const auto it = g_hs_folded.find(b);
+                    const bool folded = it != g_hs_folded.end() && it->second;
+                    if (it != g_hs_folded.end() && folded != khs)
+                        bad += " b" + std::to_string(b) + (folded ? "(folded)" : "(not folded)") + "@" + d.kern;
+                }
+            }
+            if (!bad.empty()) throw std::runtime_error("hard-swish fold / pipeline mismatch:" + bad);
+            nr::logf("hard-swish guard: %zu pipelines, folds consistent", hs.size());
+        }
+    }
+#endif
     // ---- pipelines ---------------------------------------------------------
     // Bindings differ per shader and the buffers do not: every kernel in this
     // project reaches both arenas through push-constant offsets, which is what
     // lets one descriptor set per *shader* serve all of that shader's layers.
+    {
+        std::set<std::string> kinds;
+        for (const Disp& d : disp) if (!kern.count(d.kern)) kinds.insert(d.kern);
+        nr::g_build_pipes_total = uint32_t(kinds.size()); nr::g_build_pipes_done = 0; nr::g_build_stage = 4;
+    }
     for (const Disp& d : disp) {
         if (kern.count(d.kern)) continue;
+        struct Tick { ~Tick() { ++nr::g_build_pipes_done; } } tick;
         const std::string p = spv_dir + "/g_" + d.kern + ".spv";
+#if NR_INT4
+#endif
         if (d.kern.rfind("fswindsp",0)==0)
             kern[d.kern].create(ctx,p,{act.handle,act.handle,wgt.handle,wgt.handle,wgt.handle,act.handle},
                                 sizeof(PushFSwin)+sizeof(PushDsProj) + (NR_TCHAIN_TILES && tchain_kern(d.kern) ? 4 : 0));
@@ -4532,7 +5262,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                                 sizeof(PushVAttn) + (g_chain_kern.count(d.kern) ? 16 : 0) + (NR_TCHAIN_TILES ? 4 : 0));
         else if (d.kern.rfind("upsblend", 0) == 0)
             kern[d.kern].create(ctx, p, {act.handle, wgt.handle}, sizeof(PushUps));
-        else if (d.kern == "attn")
+        else if (NR_KBASE(d.kern) == "attn")
             kern[d.kern].create(ctx, p, {act.handle, act.handle, wgt.handle,
                                          wgt.handle, act.handle}, sizeof(PushAttn) + (g_chain_kern.count(d.kern) ? 16 : 0) + (NR_TCHAIN_TILES ? 4 : 0));
         else if (d.kern == "ffwd3" || d.kern == "ffwd3w" || d.kern == "ffwd3q")
@@ -4550,6 +5280,8 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             throw std::runtime_error("push constants longer than the pipeline's range: " + d.kern);
     const size_t cache_bytes = ctx.save_pipeline_cache();
     timer.mark("pipelines");
+    nr::g_build_stage = 5;
+    if (nr::g_memory_note) nr::logf("pipelines created; %s", nr::g_memory_note().c_str());
     // `--wiring` prints what each dispatch reads and writes. A producer and a
     // consumer that disagree about a slot is invisible to the seeded board,
     // because the seeder writes the gold into the producer's slot and the

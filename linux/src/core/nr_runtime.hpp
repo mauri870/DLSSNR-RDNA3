@@ -53,6 +53,9 @@ struct Preprocess {
 };
 
 // In-process interface shared by game adapters and the native menu.
+// Controls::transfer
+constexpr int kEnlargeMatched = 0, kEnlargeEdgeAware = 1, kEnlargeClassic = 2;
+
 struct Controls {
     bool enabled = true;
     bool apply_model = true;
@@ -64,6 +67,16 @@ struct Controls {
     float detail_strength = 1.0f;
     float colour_strength = 1.0f;
     float max_ratio = 2.0f;
+    // Below 100% Model resolution, how the model's result is enlarged to the frame
+    // (runtime_transfer.comp), kEnlarge*: matched residual (the default), edge-aware
+    // lighting + colour, classic. Per frame; nothing is rebuilt.
+    int transfer = 0;
+    // Classic's scaler: 0 bilinear, 1 Catmull-Rom, 2 Lanczos3, 3 FSR 1 EASU.
+    int classic_scaler = 1;
+    // Edge-aware: the enlargement weighted by the full-resolution proxy (else plain
+    // bilinear), and the weight's range in stops. Not user settings.
+    bool transfer_guided = true;
+    float transfer_sigma = 0.25f;
     // How many times the network runs on the frame, 1..RuntimeConfig::max_passes.
     // Pass k+1 takes pass k's output as its colour, with the same motion and
     // depth, and its own history; the transfer pass runs once at the end
@@ -120,6 +133,11 @@ struct RuntimeConfig {
     // the cost tracks scale^2 while the game's own resolution is untouched.
     // The "Model Resolution" of the NVIDIA-side mods.
     float model_scale = 1.0f;
+#if NR_INT4
+    // The int4 mixed network: -1 = as DLSSNR_INT4 / dlssnr-amd.ini [Int4Mixed] Enabled say (start), 0 = the original
+    // network, 1 = int4 mixed when installed and the device has VK_KHR_pipeline_binary ([Int4Mixed] Hotkey switches).
+    int int4_mixed = -1;
+#endif
     // The most passes Controls::passes may ask for; each one above the first
     // costs a history image at the model extent.
     uint32_t max_passes = 1;
@@ -364,6 +382,10 @@ public:
     // The extent the network actually runs at (RuntimeConfig::model_scale applied).
     uint32_t model_width() const;
     uint32_t model_height() const;
+#if NR_INT4
+    // Whether this runtime runs the int4 mixed network (asked for and everything it needs present).
+    bool int4_mixed() const;
+#endif
     // Change the post block's history strength (TemporalConfig::history_strength)
     // between frames. Takes effect on the next recording; no-op without a
     // temporal path.
@@ -387,6 +409,9 @@ public:
     // The same, smoothed over recent frames - what to put in a UI, because the
     // instantaneous number moves too much to read.
     float average_gpu_ms() const;
+    // The network's share of average_gpu_ms (every pass's dispatches), the same average; the rest is
+    // the work around it (input, composition, copies). Zero until the first result is back.
+    float average_network_ms() const;
     // The preprocess meter as the GPU last left it: {smoothed EV, this frame's
     // target EV}, bias not included. For the log; NaN until it has metered.
     std::pair<float, float> preprocess_meter() const;

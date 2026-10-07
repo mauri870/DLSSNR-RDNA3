@@ -84,10 +84,14 @@ da430e0a9c6eecefa0d1b27d05e16c426fb5d04e808b194d914eaac4b31bc0f8  $rs/ReShade32.
 EOF
 get "$rs/ReShade-LICENSE.md" https://raw.githubusercontent.com/crosire/reshade/v6.8.0/LICENSE.md \
     237ded5b8344f820113efab1e65e91e1f159d9202c5b4856606a0590d3ffdab0
-# OptiScaler-NR 0.8.4 (GPL-3.0), the OptiScaler route's host, shipped as released.
+# OptiScaler-NR (GPL-3.0), the OptiScaler route's host, shipped as released: 0.8.91 in the Linux package, 0.8.4 in
+# the Windows package.
 get artifacts/ref/downloads/OptiScaler-NR-v0.8.4.zip \
     https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases/download/v0.8.4/OptiScaler-NR-v0.8.4.zip \
     8789912859882e66b3f3a1aa768db947da779dfd65225df69ea919052e73a2e4
+get artifacts/ref/downloads/OptiScaler-NR-v0.8.91.zip \
+    https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases/download/v0.8.91/OptiScaler-NR-v0.8.91.zip \
+    19a2852bb3f88e09075e3ccc66e0318c52e83a5901d9020a10384ae49d59ff77
 
 # ---- Windows package only ---------------------------------------------------------------------
 if [[ $windows == 1 ]]; then

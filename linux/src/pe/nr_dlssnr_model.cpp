@@ -141,14 +141,17 @@ nr::Preprocess preprocess_now() {
 // is the only way to read "the model ran" or "it passed the frame through, and why" off a log
 // without a debugger, and a user reporting that a control does nothing is asking exactly that.
 void log_evaluate(Feature* f, const char* api, unsigned int w, unsigned int h, const void* in,
-                  const void* out, bool reset, bool ran, const char* why, float gpu_ms) {
+                  const void* out, bool reset, bool ran, const char* why, float gpu_ms, float network_ms) {
     const uint64_t n = ++f->evaluates;
     if (n > 3 && n % 300 != 0) return;
     // owner is always 1 now: every feature owns its own temporal history.
-    // `gpu_ms` is the pass's own cost from the GPU's timestamps, the same number
-    // OptiScaler's overlay reports beside DLSS-NR; zero means no result yet.
-    char cost[32] = "";
-    if (gpu_ms > 0.0f) std::snprintf(cost, sizeof cost, ", %.2f ms", gpu_ms);
+    // `gpu_ms` is the pass's own cost from the GPU's timestamps, `network_ms` the network's part of
+    // it (the rest is the work around it: input, composition, copies); zero means no result yet.
+    char cost[64] = "";
+    if (gpu_ms > 0.0f && network_ms > 0.0f)
+        std::snprintf(cost, sizeof cost, ", %.2f ms (network %.2f, route %.2f)", gpu_ms, network_ms,
+                      gpu_ms > network_ms ? gpu_ms - network_ms : 0.0f);
+    else if (gpu_ms > 0.0f) std::snprintf(cost, sizeof cost, ", %.2f ms", gpu_ms);
     log("[nr] evaluate #%u (%s, %u) %ux%u in=%p out=%p reset=%d owner=1%s -> %s%s%s",
         static_cast<unsigned>(f->id), api, static_cast<unsigned>(n), w, h, in,
         out, reset ? 1 : 0, cost, ran ? "ran" : "passthrough(", ran ? "" : (why ? why : "unknown"),
@@ -1104,7 +1107,7 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
                       : session.failed() ? "failed"
                       : session.building() ? "building" : "declined";
     log_evaluate(f, "D3D12", width, height, static_cast<const void*>(color),
-                 static_cast<const void*>(output), resources.reset, ran, why, session.gpu_ms());
+                 static_cast<const void*>(output), resources.reset, ran, why, session.gpu_ms(), session.network_ms());
     if (readback && f->debug) readback_log(f, *f->debug);
     // The Vulkan identities behind the D3D12 pointers, for the multipass question: does pass k's
     // colour really alias the buffer pass k-1 wrote, or the untouched model input? Same rate limit.
@@ -1327,7 +1330,7 @@ int evaluate_vk(void* cmd_buffer, Feature* f, void* params, const void* color, c
     // A C-style cast through uintptr_t: VkImage is a pointer on x86_64 and a
     // uint64_t on i686, and static_cast is legal for only one of them.
     log_evaluate(f, "Vulkan", frame.width, frame.height, (const void*)(uintptr_t)(frame.colour),
-                 (const void*)(uintptr_t)(out_image), frame.reset, ran, why, session.gpu_ms());
+                 (const void*)(uintptr_t)(out_image), frame.reset, ran, why, session.gpu_ms(), session.network_ms());
     if (!ran && !session.status().empty()) {
         g_last_error = session.status();
         static std::string reported;

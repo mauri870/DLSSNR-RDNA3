@@ -29,10 +29,9 @@
 // (NR_NO_RESIDUAL).
 //
 // Accumulation is FP32 and that is deliberate. NVIDIA accumulates the MMA in
-// f16; RDNA4 has no f16-accumulate FP8 WMMA, so there is no choice to make, and
-// the network was trained in FP32 with fake-quant STE - our reduction is closer
-// to training-time semantics than the shipped one. The FP32 accumulator here
-// matches a *double* host reference exactly at all 524,288 outputs.
+// f16; RDNA4 has no f16-accumulate FP8 WMMA, so there is no choice to make. The
+// FP32 accumulator here matches a *double* host reference exactly at all 524,288
+// outputs.
 //
 // Layouts. Activations are this project's canonical raster NHWC (decision 1),
 // not NVIDIA's 4x4-pixel "tinlayout" - the harness converts at the boundary
@@ -454,6 +453,29 @@ layout(set = 0, binding = 7, std430) NR_COH    buffer ActE4M3x4 { fe4m3vec4 act_
 layout(set = 0, binding = 7, std430) NR_COH readonly buffer ActU32V { uint act_u32v[]; };
 layout(set = 0, binding = 3, std430) readonly buffer WgtU32V { uint wgt_u32v[]; };
 #endif
+// NR_I4 / NR_I4_OUT: the ViT FFN hidden split into pc K4 int4 channels and the rest
+// e4m3 (see the producer epilogue and the consumer's int4 phase). Raw views for the packed nibbles
+// and the float quantiser / dequantiser tables in the weight buffer.
+#ifndef NR_I4_SIDE
+#define NR_I4_SIDE 0
+#endif
+// x * (+-1) + y with the sign taken from the lane half (the last H16 butterfly): the sign by XOR, one rounding in the add
+#define NR_I4_BFLY(x, y) (uintBitsToFloat(floatBitsToUint(x) ^ ((lane & 16u) << 27u)) + (y))
+#if defined(NR_I4) || defined(NR_I4_OUT) || NR_I4_SIDE
+#if NR_XPIPE || NR_A_KPAIR || NR_OUT_KPAIR || NR_OUT_PERM || NR_POOL || defined(NR_CANONICAL_A)
+#error "NR_I4: tile-blocked A, plain pipeline"
+#endif
+#if (defined(NR_I4_OUT) || NR_I4_SIDE) && (!defined(NR_OUT_E4M3) || !defined(NR_OUT_TILED))
+#error "NR_I4_OUT / NR_I4_SIDE: the tiled e4m3 producer"
+#endif
+#extension GL_EXT_control_flow_attributes : require
+layout(set = 0, binding = 7, std430) NR_COH buffer ActU32I4W { uint act_u32i4w[]; };
+layout(set = 0, binding = 1, std430) NR_COH buffer ActU8I4 { uint8_t act_u8i4[]; };
+layout(set = 0, binding = 7, std430) NR_COH readonly buffer ActU32I4 { uint act_u32i4[]; };
+layout(set = 0, binding = 3, std430) readonly buffer WgtU32I4 { uint wgt_u32i4[]; };
+layout(set = 0, binding = 3, std430) readonly buffer WgtF32I4 { float wgt_f32i4[]; };
+layout(set = 0, binding = 3, std430) readonly buffer WgtV2I4 { vec2 wgt_v2i4[]; };
+#endif
 
 #define NR_TC_WBIND 3   // NR_TCHAIN reads its records from the weight buffer
 #include "nr_chain.glsl"
@@ -528,13 +550,10 @@ shared float lds_e[NR_WAVES * 256];
 #else
 #define NR_EPI_DEBUG(i)
 #endif
-// Two epilogues, and the difference is the same argument as FP32 accumulation.
-// NR_EPILOGUE_NVIDIA is the model as measured off the shipping kernel:
-// f16(acc), then f16(g*r), then f16 of the sum. Both inner roundings are
-// artefacts of NVIDIA's f16 accumulator, not of the network. Measured: the f32
-// form agrees with their own output on 98.62% of bytes against their rounding's
-// 98.57%, so the faithful reading of the trained graph is also the one that
-// matches them more often.
+// Two epilogues. NR_EPILOGUE_NVIDIA is the model as measured off the shipping
+// kernel: f16(acc), then f16(g*r), then f16 of the sum. The other carries f32 to
+// the single e4m3 narrowing. Measured: the f32 form agrees with their own output
+// on 98.62% of bytes against their rounding's 98.57%.
 //
 // Spelled out rather than left to the compiler: written as two statements the
 // f16 form contracted into v_fmac_f16 and quietly became the f32 form for the
@@ -841,7 +860,12 @@ void nr_finish_tile(uint tok0, uint ch0, uint wave, uint lane) {   // NOLINT
 // tile-blocked arena - so the residual is one 8-byte load, the output one
 // 8-byte store and the fp8 conversions pair up. Per element the arithmetic is
 // the unswapped epilogue's, on the same (token, channel) element.
+#if NR_I4_SIDE
+// NR_I4_SIDE: the caller passes this fragment's eight side quantisers (loaded once per channel fragment).
+void nr_finish_fragment(NR_FRAG_ACC a, uint tok0, uint ch0, uint lane, vec2 qa[8]) {
+#else
 void nr_finish_fragment(NR_FRAG_ACC a, uint tok0, uint ch0, uint lane) {
+#endif
     if (tok0 >= pc.M) return;
     const uint tk = lane % 16u, c8 = 8u * (lane / 16u);
     const uint tile = ((tok0 / 16u) * (pc.N / 16u) + ch0 / 16u) * 256u;
@@ -852,6 +876,9 @@ void nr_finish_fragment(NR_FRAG_ACC a, uint tok0, uint ch0, uint lane) {
     const fe4m3vec4 r0 = act_e4m3x4[rq], r1 = act_e4m3x4[rq + 1u];
 #endif
     NR_E4M3 qv[8];
+#if NR_I4_SIDE
+    NR_F16 i4v[8];
+#endif
     for (int c = 0; c < 8; ++c) {
         float raw = a[c];
 #ifdef NR_NO_RESIDUAL
@@ -867,8 +894,35 @@ void nr_finish_fragment(NR_FRAG_ACC a, uint tok0, uint ch0, uint lane) {
 #endif
 #endif
         qv[c] = nr_quant_e4m3(v);
+#if NR_I4_SIDE
+        i4v[c] = v;
+#endif
     }
     const fe4m3vec4 q0 = fe4m3vec4(qv[0], qv[1], qv[2], qv[3]), q1 = fe4m3vec4(qv[4], qv[5], qv[6], qv[7]);
+#if NR_I4_SIDE
+    // NR_I4_SIDE: the output also as the next GEMM's int4 A operand, after the M x N e4m3
+    // output in the same slot (o_off + Mt*N): the f16 value of each element, the 16 channels of the fragment
+    // rotated by H16 (unnormalised: c by butterflies in the lane, the lane/16 half by one shuffle), then
+    // q = med3(fma(r, a, z + 1.5*2^23)) with (a, z + magic) at pc.raster (vec2 index), eight nibbles a u32 in
+    // the NR_I4_PAIR record layout (the consumer's K4 = N).
+    {
+        float r_[8];
+        [[unroll]] for (int c = 0; c < 8; ++c) r_[c] = float(i4v[c]);
+        [[unroll]] for (int sb = 1; sb < 8; sb <<= 1) [[unroll]] for (int c = 0; c < 8; ++c)
+            if ((c & sb) == 0) { const float x_ = r_[c], y_ = r_[c + sb]; r_[c] = x_ + y_; r_[c + sb] = x_ - y_; }
+        const float sg = (lane & 16u) != 0u ? -1.0 : 1.0;
+        uint u_ = 0u, mk_ = 0u;
+        [[unroll]] for (int c = 0; c < 8; ++c) {
+            const float rr = NR_I4_BFLY(r_[c], subgroupShuffleXor(r_[c], 16u));
+            u_ += floatBitsToUint(clamp(fma(rr, qa[c].x, qa[c].y), 12582912.0, 12582927.0)) << (4u * uint(c));
+            mk_ += floatBitsToUint(12582912.0) << (4u * uint(c));
+        }
+        u_ = (u_ - mk_) ^ 0x88888888u;
+        const uint k4s = pc.N, c_ = ch0 + c8;
+        act_u32i4w[(pc.o_off + ((pc.M + 15u) / 16u) * 16u * pc.N + ((tok0 / 16u) * (k4s / 64u) + c_ / 64u) * 512u
+                    + (tk + 16u * ((c_ % 32u) / 16u)) * 16u + ((c_ / 32u) & 1u) * 8u + ((c_ % 32u) / 2u) % 8u) / 4u] = u_;
+    }
+#endif
     const uint t = tok0 + tk;
 #if NR_OUT_PERM == 1
     // Raster token -> tile position (see the unswapped NR_OUT_PERM note).
@@ -892,6 +946,65 @@ void nr_finish_fragment(NR_FRAG_ACC a, uint tok0, uint ch0, uint lane) {
 #endif
 #endif
 }
+#if defined(NR_I4_OUT)
+#if !NR_SWAP_AB || NR_NFRAG != 4 || !defined(NR_NO_RESIDUAL)
+#error "NR_I4_OUT: the swapped producer, four output fragments a wave, no residual"
+#endif
+// NR_I4_OUT: the whole wave's epilogue in one pass (main() calls it with acc), so each output
+// position's quantiser is loaded once a wave, not once a token row. Positions < K4: activation in f32, H64
+// unnormalised (the host folds the 1/8 into a), then q = med3(fma(r, a, z + 1.5*2^23), 1.5*2^23, +15): the
+// fma's one rounding at ulp 1 is rint, the low mantissa bits are q; eight q a u32 by shift-add, the constant
+// removed once, ^0x88888888 = q - 8 as signed nibbles. (a, z + 1.5*2^23) f32 pairs at pc.g_off (vec2 index).
+#define NR_I4_MAGIC 12582912.0
+#define NR_I4_V(i, j, c) acc[i][j][c]
+#define NR_I4_ROW_ACT(i) [[unroll]] for (int c = 0; c < 8; ++c) { \
+    acc[i][0][c] = NR_ACT_APPLY(acc[i][0][c]); acc[i][1][c] = NR_ACT_APPLY(acc[i][1][c]); \
+    acc[i][2][c] = NR_ACT_APPLY(acc[i][2][c]); acc[i][3][c] = NR_ACT_APPLY(acc[i][3][c]); }
+#define NR_I4_ROW_ROT(i) { \
+    [[unroll]] for (int j = 0; j < 4; ++j) [[unroll]] for (int sb = 1; sb < 8; sb <<= 1) [[unroll]] for (int c = 0; c < 8; ++c) \
+        if ((c & sb) == 0) { const float x_ = acc[i][j][c], y_ = acc[i][j][c + sb]; acc[i][j][c] = x_ + y_; acc[i][j][c + sb] = x_ - y_; } \
+    [[unroll]] for (int c = 0; c < 8; ++c) { \
+        const float b0 = acc[i][0][c] + acc[i][1][c], b1 = acc[i][0][c] - acc[i][1][c]; \
+        const float b2 = acc[i][2][c] + acc[i][3][c], b3 = acc[i][2][c] - acc[i][3][c]; \
+        acc[i][0][c] = b0 + b2; acc[i][1][c] = b1 + b3; acc[i][2][c] = b0 - b2; acc[i][3][c] = b1 - b3; } \
+    [[unroll]] for (int j = 0; j < 4; ++j) [[unroll]] for (int c = 0; c < 8; ++c) \
+        acc[i][j][c] = NR_I4_BFLY(acc[i][j][c], subgroupShuffleXor(acc[i][j][c], 16u)); }
+#define NR_I4_ROW_Q(i) if (mg0 + mloc + uint(i) * 16u < pc.M) { \
+    uint u_ = 0u; \
+    [[unroll]] for (int c = 0; c < 8; ++c) \
+        u_ += floatBitsToUint(clamp(fma(acc[i][j][c], qa[c].x, qa[c].y), NR_I4_MAGIC, NR_I4_MAGIC + 15.0)) << (4u * uint(c)); \
+    u_ = (u_ - i4mk) ^ 0x88888888u; \
+    const uint tok0_ = mg0 + mloc + uint(i) * 16u; \
+    act_u32i4w[NR_I4_XADDR(tok0_, ch)] = u_; }
+// X4 in records of two k steps (32 positions each): record ((tok/16)*(K4/64) + ch/64)*512,
+// lane l's 16 bytes at l*16 = [step 2s: row l%16, bytes 8(l/16)..+7][step 2s+1: the same], so the consumer
+// loads both steps' fragments with one 16-byte load. A u32 of 8 positions (bytes b..b+3 of its step's row,
+// b = (ch%32)/2) goes to (row + 16*(b/8))*16 + ((ch/32)&1)*8 + b%8.
+#define NR_I4_XADDR(t0, c_) ((pc.o_off + ((t0) / 16u * (k4 / 64u) + (c_) / 64u) * 512u \
+    + ((lane % 16u) + 16u * (((c_) % 32u) / 16u)) * 16u + (((c_) / 32u) & 1u) * 8u + (((c_) % 32u) / 2u) % 8u) / 4u)
+#define NR_I4_ROW_F8(i) if (mg0 + mloc + uint(i) * 16u < pc.M) { \
+    const uint tok0_ = mg0 + mloc + uint(i) * 16u; \
+    [[unroll]] for (int j = 0; j < 4; ++j) { \
+        const uint ch8 = chb + uint(j) * 16u + 8u * (lane / 16u) - k4; \
+        const uint oq = (pc.o_off + pc.p_off + ((tok0_ / 16u) * ((pc.N - k4) / 16u) + ch8 / 16u) * 256u + (lane % 16u) * 16u + ch8 % 16u) / 4u; \
+        NR_E4M3 e_[8]; \
+        [[unroll]] for (int c = 0; c < 8; ++c) e_[c] = nr_quant_e4m3(NR_F16(NR_ACT_APPLY(acc[i][j][c]))); \
+        act_e4m3x4[oq] = fe4m3vec4(e_[0], e_[1], e_[2], e_[3]); act_e4m3x4[oq + 1u] = fe4m3vec4(e_[4], e_[5], e_[6], e_[7]); } }
+#define NR_I4_EPILOGUE { \
+    const uint k4 = pc.r_off, chb = ng0 + nloc; \
+    if (chb < k4) { \
+        const float i4sgn = (lane & 16u) != 0u ? -1.0 : 1.0; \
+        uint i4mk = 0u; \
+        [[unroll]] for (int c = 0; c < 8; ++c) i4mk += floatBitsToUint(NR_I4_MAGIC) << (4u * uint(c)); \
+        NR_FOR_I(NR_MFRAG, NR_I4_ROW_ACT) \
+        NR_FOR_I(NR_MFRAG, NR_I4_ROW_ROT) \
+        [[unroll]] for (int j = 0; j < 4; ++j) { \
+            const uint ch = chb + uint(j) * 16u + 8u * (lane / 16u); \
+            vec2 qa[8]; \
+            [[unroll]] for (int c = 0; c < 8; ++c) qa[c] = wgt_v2i4[pc.g_off + ch + uint(c)]; \
+            NR_FOR_I(NR_MFRAG, NR_I4_ROW_Q) } \
+    } else { NR_FOR_I(NR_MFRAG, NR_I4_ROW_F8) } }
+#endif
 #else
 #ifndef NR_EPI_LANEBYTE
 #define NR_EPI_LANEBYTE 0
@@ -1124,7 +1237,13 @@ void nr_finish_qkv_pair(NR_FRAG_ACC a, NR_FRAG_ACC b, uint tok0, uint ch0, uint 
 // pc.K = 512 B, so a fragment is sixteen 16-byte row segments 512 B apart and a
 // single buffer_load_b64 touches **sixteen 128-byte cache lines to use 16 bytes
 // of each**. Tile-blocked, it touches two lines and uses all of both.
-#ifdef NR_TILED_A
+#if defined(NR_TILED_A) && defined(NR_I4)
+// the e4m3 part of K (X8) sits pc.p_off bytes after the int4 part (X4) at pc.x_off.
+#define NR_ABASE_I(i) abase_g[i] = pc.x_off + pc.p_off + \
+        ((mg0 + mloc + uint((i) * 16)) / 16u) * (pc.K / 16u) * 256u;
+#define NR_ASTRIDE 16u
+#define NR_AKOFF(k) (((k) / 16u) * 256u)
+#elif defined(NR_TILED_A)
 #define NR_ABASE_I(i) abase_g[i] = pc.x_off + \
         ((mg0 + mloc + uint((i) * 16)) / 16u) * (pc.K / 16u) * 256u;
 #define NR_ASTRIDE 16u
@@ -1560,7 +1679,20 @@ shared fe4m3vec4 lds_bv[2 * NR_BLDSV_V4];
         nr_finish_tile(mg0 + mloc + uint(ii) * 16u, ng0 + nloc + uint(j) * 16u, wave, lane); \
     }
 #endif
+#if defined(NR_I4_OUT)
+#define NR_EPI_I(i)
+#elif NR_I4_SIDE && NR_SWAP_AB && NR_USE_FRAGMENT_EPI
+// Channel fragments outer, token fragments inner: each fragment's side quantisers are loaded once.
+#define NR_EPI_I(i)
+#define NR_SIDE_I(i) nr_finish_fragment(acc[i][jj], mg0 + mloc + uint(i) * 16u, ng0 + nloc + uint(jj) * 16u, lane, qa_);
+#define NR_SIDE_J(j) { const int jj = j; vec2 qa_[8]; \
+    const uint chq_ = pc.raster + ng0 + nloc + uint(j) * 16u + 8u * (lane / 16u); \
+    [[unroll]] for (int c = 0; c < 8; ++c) qa_[c] = wgt_v2i4[chq_ + uint(c)]; \
+    NR_FOR_I(NR_MFRAG, NR_SIDE_I) }
+#define NR_SIDE_EPILOGUE NR_FOR_J(NR_NFRAG, NR_SIDE_J)
+#else
 #define NR_EPI_I(i)   { const int ii = i; NR_FOR_J(NR_NFRAG, NR_EPI_J) }
+#endif
 #define NR_SUM_J(j)   s = s + acc[ii][j];
 #define NR_SUM_I(i)   { const int ii = i; NR_FOR_J(NR_NFRAG, NR_SUM_J) }
 
@@ -1617,6 +1749,74 @@ shared fe4m3vec4 lds_bv[2 * NR_BLDSV_V4];
 #define NR_SPILL    NR_FOR_S(NR_SITER_A, NR_SA_S) NR_FOR_S(NR_SITER_B, NR_SB_S)
 #endif
 
+#if defined(NR_I4)
+#define NR_I4ZERO_J(j) ia[ii][j] = NR_IACC_ZERO;
+#define NR_I4ZERO_I(i) { const int ii = i; NR_FOR_J(NR_NFRAG, NR_I4ZERO_J) }
+#define NR_I4FRAG(dst, u) { \
+    const i8vec4 x0_ = unpack8(int((u).x)), x1_ = unpack8(int((u).y)); \
+    for (int v = 0; v < 4; ++v) { dst[v] = x0_[v]; dst[v + 4] = x1_[v]; } }
+#if NR_SWAP_AB
+// Swapped: lane l holds token l%16 and channels 8(l/16) + e of the fragment.
+#define NR_I4FOLD_J(j) { \
+    const uint n_ = ng0 + nloc + uint(j) * 16u + 8u * (lane / 16u); \
+    for (int e = 0; e < 8; ++e) \
+        acc[ii][j][e] = float(ia[ii][j][e]) * wgt_f32i4[pc.gd_off + n_ + uint(e)] + wgt_f32i4[pc.gd_off + pc.N + n_ + uint(e)]; }
+#else
+#define NR_I4FOLD_J(j) { \
+    const uint n_ = ng0 + nloc + uint(j) * 16u + (lane & 15u); \
+    const float s_ = wgt_f32i4[pc.gd_off + n_], c_ = wgt_f32i4[pc.gd_off + pc.N + n_]; \
+    for (int e = 0; e < 8; ++e) acc[ii][j][e] = float(ia[ii][j][e]) * s_ + c_; }
+#endif
+#define NR_I4FOLD_I(i) { const int ii = i; NR_FOR_J(NR_NFRAG, NR_I4FOLD_J) }
+#define NR_I4PABASE_I(i) a4[i] = (pc.x_off + ((mg0 + mloc + uint((i) * 16)) / 16u) * nrec * 512u) / 4u + lane * 4u;
+#define NR_I4PBBASE_J(j) b4[j] = (pc.d_off + ((ng0 + nloc + uint((j) * 16)) / 16u) * nrec * 512u) / 4u + lane * 4u;
+#define NR_I4PLD(dst, arr, b) dst = uvec4(arr[(b) + ko], arr[(b) + ko + 1u], arr[(b) + ko + 2u], arr[(b) + ko + 3u]);
+#define NR_I4PLDA0_I(i) NR_I4PLD(ua0[i], act_u32i4, a4[i])
+#define NR_I4PLDB0_J(j) NR_I4PLD(ub0[j], wgt_u32i4, b4[j])
+#define NR_I4PLDA1_I(i) NR_I4PLD(ua1[i], act_u32i4, a4[i])
+#define NR_I4PLDB1_J(j) NR_I4PLD(ub1[j], wgt_u32i4, b4[j])
+// One k step over every (i, j): the four MMAs of a step are independent, the two steps of a record follow.
+#if NR_SWAP_AB
+// W x X^T: the weight fragment is the A operand, the activation the B one (same element fill).
+#define NR_I4PMMA_J(j, UB, H) { NR_FRAG_I8A b_; NR_I4FRAG(b_, UB[j].H) ia[ii][j] = coopMatMulAdd(b_, a_, ia[ii][j]); }
+#define NR_I4PS_I(i, UA, UB, H, JM) { const int ii = i; NR_FRAG_I8B a_; NR_I4FRAG(a_, UA[i].H) NR_FOR_J(NR_NFRAG, JM) }
+#else
+#define NR_I4PMMA_J(j, UB, H) { NR_FRAG_I8B b_; NR_I4FRAG(b_, UB[j].H) ia[ii][j] = coopMatMulAdd(a_, b_, ia[ii][j]); }
+#define NR_I4PS_I(i, UA, UB, H, JM) { const int ii = i; NR_FRAG_I8A a_; NR_I4FRAG(a_, UA[i].H) NR_FOR_J(NR_NFRAG, JM) }
+#endif
+#define NR_I4PM0XY_J(j) NR_I4PMMA_J(j, ub0, xy)
+#define NR_I4PM0ZW_J(j) NR_I4PMMA_J(j, ub0, zw)
+#define NR_I4PM1XY_J(j) NR_I4PMMA_J(j, ub1, xy)
+#define NR_I4PM1ZW_J(j) NR_I4PMMA_J(j, ub1, zw)
+#define NR_I4PS0XY_I(i) NR_I4PS_I(i, ua0, ub0, xy, NR_I4PM0XY_J)
+#define NR_I4PS0ZW_I(i) NR_I4PS_I(i, ua0, ub0, zw, NR_I4PM0ZW_J)
+#define NR_I4PS1XY_I(i) NR_I4PS_I(i, ua1, ub1, xy, NR_I4PM1XY_J)
+#define NR_I4PS1ZW_I(i) NR_I4PS_I(i, ua1, ub1, zw, NR_I4PM1ZW_J)
+#define NR_I4PLDA2_I(i) NR_I4PLD(ua2[i], act_u32i4, a4[i])
+#define NR_I4PLDB2_J(j) NR_I4PLD(ub2[j], wgt_u32i4, b4[j])
+#define NR_I4PLDA3_I(i) NR_I4PLD(ua3[i], act_u32i4, a4[i])
+#define NR_I4PLDB3_J(j) NR_I4PLD(ub3[j], wgt_u32i4, b4[j])
+#define NR_I4PM2XY_J(j) NR_I4PMMA_J(j, ub2, xy)
+#define NR_I4PM2ZW_J(j) NR_I4PMMA_J(j, ub2, zw)
+#define NR_I4PM3XY_J(j) NR_I4PMMA_J(j, ub3, xy)
+#define NR_I4PM3ZW_J(j) NR_I4PMMA_J(j, ub3, zw)
+#define NR_I4PS2XY_I(i) NR_I4PS_I(i, ua2, ub2, xy, NR_I4PM2XY_J)
+#define NR_I4PS2ZW_I(i) NR_I4PS_I(i, ua2, ub2, zw, NR_I4PM2ZW_J)
+#define NR_I4PS3XY_I(i) NR_I4PS_I(i, ua3, ub3, xy, NR_I4PM3XY_J)
+#define NR_I4PS3ZW_I(i) NR_I4PS_I(i, ua3, ub3, zw, NR_I4PM3ZW_J)
+#define NR_I4PMMA2 NR_FOR_I(NR_MFRAG, NR_I4PS2XY_I) NR_FOR_I(NR_MFRAG, NR_I4PS2ZW_I)
+#define NR_I4PMMA3 NR_FOR_I(NR_MFRAG, NR_I4PS3XY_I) NR_FOR_I(NR_MFRAG, NR_I4PS3ZW_I)
+// NR_I4_PD=4: four record banks in rotation (each reloaded right after its MMAs, three records ahead).
+// NR_I4DEPV: the reload's address depends (by a zero the compiler cannot prove: pc.crow < 2^31) on the bank's
+// last MMA, so ACO can neither hoist the loads above those MMAs nor give them new registers (back-edge copies
+// that wait for every load).
+#define NR_I4DEPV (uint(ia[NR_MFRAG - 1][NR_NFRAG - 1][7]) & (pc.crow >> 31u))
+#define NR_I4PBANK(K, rec) { const uint ko = min(rec, rc1 - 1u) * 128u + NR_I4DEPV; \
+    NR_FOR_I(NR_MFRAG, NR_I4PLDA##K##_I) NR_FOR_J(NR_NFRAG, NR_I4PLDB##K##_J) }
+#define NR_I4PMMA0 NR_FOR_I(NR_MFRAG, NR_I4PS0XY_I) NR_FOR_I(NR_MFRAG, NR_I4PS0ZW_I)
+#define NR_I4PMMA1 NR_FOR_I(NR_MFRAG, NR_I4PS1XY_I) NR_FOR_I(NR_MFRAG, NR_I4PS1ZW_I)
+#endif
+
 void main() {
     NR_PROF_BEGIN()
     nr_chain_wait()
@@ -1665,7 +1865,12 @@ void main() {
     const uint mg0 = gl_WorkGroupID.x * uint(NR_MTILE);
     const uint ng0 = gl_WorkGroupID.y * uint(NR_NTILE);
 #endif
+#ifdef NR_KCONST
+    // K fixed at build for this pipeline (every dispatch alike): the chunk loop unrolls, no back-edge load waits.
+    const uint nchunk = uint(NR_KCONST) / uint(NR_KCHUNK);
+#else
     const uint nchunk = pc.K / uint(NR_KCHUNK);
+#endif
     nr_tchain_wait(mg0 / 16u, NR_MTILE / 16)   // NR_TCHAIN: the M tile's token tiles
     NR_PROF_ITEM_START()   // the wave's work starts here (after the tile-counter wait)
 
@@ -1686,6 +1891,65 @@ void main() {
 #endif
     NR_FRAG_ACC acc[NR_MFRAG][NR_NFRAG];
     NR_FOR_I(NR_MFRAG, NR_ZERO_I)
+#if defined(NR_I4)
+    // the int4 part of K first. X4 at pc.x_off (pc.crow = K4/2 bytes a token row,
+    // tile-blocked) against W4 at pc.d_off (tile-blocked [N/16][K4/32][16 n][16 bytes]); one 16x16
+    // int8 fragment is 16x32 int4 once the host rewrote the WMMA. Raw u32 pairs cross the loop's
+    // back edge (a phi of a byte fragment is copied byte by byte), two banks, two k steps a trip.
+    // Then acc = float(int acc) * s_n + c_n (pc.gd_off: s[N], c[N]; c carries the zero points and
+    // the bias correction), and the unchanged e4m3 loop adds the K8 = pc.K channels of X8.
+    {
+        // records of two k steps, one 16-byte load a fragment a record (lane l at l*16 bytes);
+        // W4 alike ([N/16][K4/64] records, host). Two banks of records, two records a trip.
+        const uint nrec = pc.crow / 32u;                             // records, even
+        uint a4[NR_MFRAG], b4[NR_NFRAG];
+        NR_FOR_I(NR_MFRAG, NR_I4PABASE_I)
+        NR_FOR_J(NR_NFRAG, NR_I4PBBASE_J)
+        NR_FRAG_IACC ia[NR_MFRAG][NR_NFRAG];
+        NR_FOR_I(NR_MFRAG, NR_I4ZERO_I)
+        uvec4 ua0[NR_MFRAG], ub0[NR_NFRAG], ua1[NR_MFRAG], ub1[NR_NFRAG];
+#if defined(NR_I4_NREC)
+        // the record count fixed at build (all ViT layers alike): the loop unrolls fully, so no
+        // loop-carried load registers (ACO waits for every load at a back edge whose phis carry them).
+        const uint rc0 = 0u, rc1 = uint(NR_I4_NREC);
+#else
+        const uint rc0 = 0u, rc1 = nrec;
+#endif
+#ifndef NR_I4_PD
+#define NR_I4_PD 2
+#endif
+#if NR_I4_PD == 4
+        uvec4 ua2[NR_MFRAG], ub2[NR_NFRAG], ua3[NR_MFRAG], ub3[NR_NFRAG];
+        NR_I4PBANK(0, rc0) NR_I4PBANK(1, rc0 + 1u) NR_I4PBANK(2, rc0 + 2u) NR_I4PBANK(3, rc0 + 3u)
+#if defined(NR_I4_NREC)
+        [[unroll]]
+#endif
+        for (uint rc = rc0; rc < rc1; rc += 4u) {   // (rc1 - rc0) % 4 == 0 (host)
+            NR_I4PMMA0
+            NR_I4PBANK(0, rc + 4u)
+            NR_I4PMMA1
+            NR_I4PBANK(1, rc + 5u)
+            NR_I4PMMA2
+            NR_I4PBANK(2, rc + 6u)
+            NR_I4PMMA3
+            NR_I4PBANK(3, rc + 7u)
+        }
+        if (false)
+#endif
+        { const uint ko = rc0 * 128u; NR_FOR_I(NR_MFRAG, NR_I4PLDA0_I) NR_FOR_J(NR_NFRAG, NR_I4PLDB0_J) }
+        if (NR_I4_PD != 4)
+#if defined(NR_I4_NREC)
+        [[unroll]]
+#endif
+        for (uint rc = rc0; rc < rc1; rc += 2u) {
+            { const uint ko = (rc + 1u) * 128u; NR_FOR_I(NR_MFRAG, NR_I4PLDA1_I) NR_FOR_J(NR_NFRAG, NR_I4PLDB1_J) }
+            NR_I4PMMA0
+            { const uint ko = min(rc + 2u, rc1 - 1u) * 128u; NR_FOR_I(NR_MFRAG, NR_I4PLDA0_I) NR_FOR_J(NR_NFRAG, NR_I4PLDB0_J) }
+            NR_I4PMMA1
+        }
+        NR_FOR_I(NR_MFRAG, NR_I4FOLD_I)
+    }
+#endif
 #if NR_SWAP_AB
     // Same element fill (lane%16 = row/column, (lane/16)*8+v = k) for both uses.
     NR_FRAG_B fa[NR_PIPE][NR_MFRAG];
@@ -1794,6 +2058,12 @@ void main() {
     nr_finish_tile(mg0 + mloc, ng0 + nloc, wave, lane);
 #else
     NR_FOR_I(NR_MFRAG, NR_EPI_I)
+#if defined(NR_I4_OUT)
+    NR_I4_EPILOGUE
+#endif
+#ifdef NR_SIDE_EPILOGUE
+    NR_SIDE_EPILOGUE
+#endif
 #endif
     NR_OCC_USE(pc.K == 0u, act_f32[0] = 0.0)
     nr_chain_signal()

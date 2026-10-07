@@ -1,0 +1,15 @@
+{
+    "file_format_version": "1.2.0",
+    "layer": {
+        "name": "VK_LAYER_DLSSNR_int4",
+        "type": "GLOBAL",
+        "library_path": "./libVkLayer_dlssnr_int4.so",
+        "api_version": "1.4.300",
+        "implementation_version": "1",
+        "description": "dlssnr-amd int4_mixed: enables VK_KHR_pipeline_binary on the game device",
+        "functions": {
+            "vkGetInstanceProcAddr": "nr_int4_GetInstanceProcAddr",
+            "vkGetDeviceProcAddr": "nr_int4_GetDeviceProcAddr"
+        }
+    }
+}

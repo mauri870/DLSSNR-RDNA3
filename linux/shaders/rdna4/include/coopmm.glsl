@@ -139,6 +139,18 @@
 // RADV lowers the store, but neither is required by the extension's wording.
 #define NR_FRAG_E4M3 coopmat<NR_E4M3, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
 
+// NR_I4: int8 fragments whose bytes each hold two signed int4 (low nibble = even k).
+// The SPIR-V and the driver see v_wmma_i32_16x16x16_iu8; the host rewrites that opcode to
+// v_wmma_i32_16x16x32_iu4 in the pipeline binary (nrvk.hpp), so one fragment is 16 x 32 int4.
+#if defined(NR_I4) || defined(NR_I4_OUT) || (defined(NR_I4_SIDE) && NR_I4_SIDE)
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#define NR_FRAG_I8A  coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define NR_FRAG_I8B  coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+#define NR_FRAG_IACC coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define NR_IACC_ZERO NR_FRAG_IACC(0)
+#endif
+
 // ---- the fragment layout this target actually uses ----------------------
 //
 // KHR leaves the component-to-coordinate map implementation-defined, and every
@@ -533,8 +545,8 @@ float nr_mp_cubic_silu(float x) {
 // reference model that leans on an intermediate rounding therefore stops being
 // that model without anything in the source changing.
 //
-// This is validation machinery. Our own paths deliberately carry f32 to the
-// single narrowing the trained graph asks for; this exists to reproduce
+// This is validation machinery. Our own paths carry f32 to a single
+// narrowing; this exists to reproduce
 // NVIDIA's f16 accumulator when the question is what *they* computed - the
 // split-K f16 atomics and the attention softmax will both want it.
 //

@@ -44,6 +44,7 @@ minhook=artifacts/ref/DLSS5-Feeder/external/minhook
 # way to tell from a game whether a fix is in the binary that ran.
 stamp=$(bash linux/build/version.sh)
 common=(-std=c++17 -O2 -DNDEBUG -DNR_BUILD_STAMP="\"$stamp\"" -Itoolchain/Vulkan-Headers/include -Ilinux/src -Ilinux/src/core -Ilinux/src/layer -Ilinux/src/pe -I"$out")
+[[ "${NR_INT4:-0}" == 1 ]] && common+=(-DNR_INT4=1)   # the int4 mixed build (installed only with it; build_package.sh)
 
 # The network the package ships (linux/build/arch/rdna4.sh): the host must be built
 # with the same constants as the shaders in dlssnr-amd/shaders.

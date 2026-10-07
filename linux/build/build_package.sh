@@ -12,6 +12,10 @@
 #                       linux/package/model-tools/extract_model.sh); without it
 #                       install.sh needs --dll
 #   NR_VERSION=...      override the version (default: from the git tags, linux/build/version.sh)
+#
+# x86_64 packages also carry int4/, the int4 mixed option install.sh adds when asked for: the programs built again
+# with NR_INT4=1 (this script with NR_INT4=1 NR_PROGRAMS_ONLY=1), the int4 network, its data, the Vulkan layer and the
+# install-time weights generator (build_int4.sh), and its dlssnr-amd.ini.
 set -euo pipefail
 model=${NR_MODEL:+$(realpath -- "$NR_MODEL")}
 cd -- "$(dirname -- "$0")/../.."
@@ -34,6 +38,7 @@ source linux/build/arch/rdna4.sh
 
 # ---- compile ----------------------------------------------------------------
 common=(-std=c++17 -O2 -DNDEBUG -Itoolchain/Vulkan-Headers/include -Ilinux/src -Ilinux/src/core -Ilinux/src/layer -Ilinux/src/pe -I"$out")
+[[ "${NR_INT4:-0}" == 1 ]] && common+=(-DNR_INT4=1)   # the int4 mixed build of the programs (int4/ below)
 "$cxx" "${common[@]}" "${NR_PRODUCT_DEFINES[@]}" -c linux/src/core/nr_runtime.cpp -o "$out/nr_runtime.o"
 "$cxx" "${common[@]}" -c linux/src/core/nr_native_plan.cpp -o "$out/nr_native_plan.o"
 "$cxx" "${common[@]}" -c linux/src/pe/nr_pe_log.cpp -o "$out/log.o"
@@ -109,6 +114,7 @@ lazy=("$out/vulkan_lazy_s.o" "$out/vulkan_lazy_c.o")
 # ---- link ---------------------------------------------------------------------
 "$cxx" -shared -o "$out/dlssnr_amd.addon$bits" "$out/reshade_addon.o" "${runtime_objs[@]}" \
     "${lazy[@]}" "$out"/mh_*.o "${ldflags[@]}"
+[[ -n "${NR_PROGRAMS_ONLY:-}" ]] && exit 0
 
 # ---- package ------------------------------------------------------------------
 pkg="$out/package"
@@ -197,7 +203,7 @@ sed 's/^PreprocessorDefinitions=.*/&,RESHADE_DEPTH_INPUT_IS_REVERSED=0/' "$rs/Re
 # Streamline games (007 First Light) lost the DLSS option; renamed, it is selectable again. OptiScaler finds it through
 # [Libraries] NvngxPath, which takes a file path.
 if [[ "$arch" == x86_64 ]]; then
-    opti_zip=${NR_OPTI_ZIP:-artifacts/ref/downloads/OptiScaler-NR-v0.8.4.zip}
+    opti_zip=${NR_OPTI_ZIP:-artifacts/ref/downloads/OptiScaler-NR-v0.8.91.zip}
     [[ -f "$opti_zip" ]] || { echo "missing $opti_zip" >&2; exit 1; }
     bash linux/build/build_optiscaler_nr.sh artifacts/optiscaler/nr > /dev/null
     mkdir -p -- "$pkg/optiscaler"
@@ -208,6 +214,31 @@ if [[ "$arch" == x86_64 ]]; then
     cp -- linux/package/optiscaler/extract_release.py linux/package/optiscaler/patch_ini.py "$pkg/optiscaler/"
 fi
 
+# dlssnr-amd.ini, put in place at install (the text the programs write themselves, linux/package/make_ini.py)
+python3 linux/package/make_ini.py linux/src/pe/nr_pe_config.cpp "$pkg/ini" > /dev/null
+
+# int4/: the int4 mixed option. The int4 build of the programs that differ, dlssnr-amd/int4 (network,
+# quantisers, recovery tables, settings, layer), the weights generator and the SHA-256 of what it must make from the
+# model (linux/data/int4/<arch>/dlssnr-int4.sha256, checked by install.sh).
+# i686: no OptiScaler route, so only the add-on; the layer comes in both widths (build_int4.sh NR_LAYER32).
+if [[ "$arch" == x86_64 || "$arch" == i686 ]]; then
+    i4="$pkg/int4"
+    NR_INT4=1 NR_PROGRAMS_ONLY=1 bash linux/build/build_package.sh "$out/int4"
+    layer32=0; [[ "$arch" == i686 ]] && layer32=1
+    NR_LAYER32=$layer32 bash linux/build/build_int4.sh "$out/int4/parts" > /dev/null
+    mkdir -p -- "$i4/reshade" "$i4/dlssnr-amd"
+    cp -- "$out/int4/dlssnr_amd.addon$bits" "$i4/reshade/"
+    if [[ "$arch" == x86_64 ]]; then
+        NR_INT4=1 bash linux/build/build_optiscaler_nr.sh artifacts/optiscaler/nr-int4 > /dev/null
+        mkdir -p -- "$i4/optiscaler"
+        cp -- artifacts/optiscaler/nr-int4/nvngx.dll_dlssnr.dll artifacts/optiscaler/nr-int4/nvngx_dlssnr.dll "$i4/optiscaler/"
+        cp -- artifacts/optiscaler/nr-int4/_nvngx.dll "$i4/optiscaler/dlssnr_core.dll"
+    fi
+    cp -r -- "$out/int4/parts/data" "$i4/dlssnr-amd/int4"
+    cp -- "$out/int4/parts/dlssnr-int4-weights" "$i4/"
+    cp -- "linux/data/int4/$NR_GPU_ARCH/dlssnr-int4.sha256" "$i4/dlssnr-int4.bin.sha256"
+    python3 linux/package/make_ini.py linux/src/pe/nr_pe_config.cpp "$i4/ini" --int4 > /dev/null
+fi
 cp -- linux/package/install.sh linux/package/README.txt "$pkg/"
 chmod +x "$pkg/install.sh" "$mt/extract_model.sh"
 

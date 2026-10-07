@@ -34,6 +34,16 @@ When it is done the script prints the line for the Steam launch options, for exa
 
 Use the i686 package for 32-bit games and the x86_64 package for 64-bit games.
 
+int4 mixed (optional, in both packages): part of the network runs in int4 and other lower
+precisions; faster, the picture differs somewhat. The installer asks once (Enter = do not install;
+not asked when not run in a terminal: not installed), or give --int4 or --no-int4. With it, the
+launch options the installer prints have two more entries, VK_ADD_LAYER_PATH and
+VK_INSTANCE_LAYERS; int4 mixed needs them, copy the whole line. It is on by default; Ctrl+F11 in
+game switches between int4 mixed and the default network (a switch builds the other network,
+it takes effect after a few seconds); settings are in [Int4Mixed] in dlssnr-amd.ini.
+With int4 mixed, NR takes much longer to take effect when a game starts. Until then the picture goes
+without NR; this does not mean int4 mixed is not working.
+
 The model
 ---------
 The weights are NVIDIA's and are not distributed with this project. They are extracted from your
@@ -61,8 +71,13 @@ It prints "599 entries, 140.9 MiB" when it succeeds. The file can then be copied
 After installation the game folder has
 --------------------------------------
     dlssnr-amd/                  model and shaders; the run-time pipeline cache goes here too
+    dlssnr-amd.ini               settings, written at install
     dlssnr-amd-install.txt       the installation record, which remove deletes by
 plus the route's own files (OptiScaler's or ReShade's DLLs, ini files, shaders).
+
+Installing again (another route, another package, adding or dropping int4 mixed) first uninstalls by
+the installation record, and dlssnr-amd.ini is replaced by a fresh default file: earlier settings are
+not kept, back the file up if you need them.
 
 Use
 ---
@@ -72,21 +87,31 @@ optiscaler: turn on DLSS, FSR or XeSS in the game; Insert opens the OptiScaler m
             [Spoofing] Dxgi=false in OptiScaler.ini (Dying Light: The Beast has needed it).
 reshade / vulkan / dx9: Home opens ReShade, the settings are on the Add-ons page; the same
             settings are kept in dlssnr-amd.ini in the game folder and changes apply live.
+            Model resolution and Model passes of 5 or more rebuild the network; for the few
+            seconds of a rebuild the picture does not go through NR.
+            Below 100% Model resolution, Enlargement chooses how the model's result is enlarged
+            back to full resolution: Matched residual (default) and Edge-aware lighting + colour
+            enlarge the model's change and apply it to the full-resolution picture; Classic
+            enlarges the model's output picture directly (scalers to choose from, FSR 1 among
+            them).
+            HDR: scRGB (linear) HDR is supported; HDR10 (PQ/HLG) pictures are not handled on these
+            routes, set the game to SDR or scRGB.
 
-Preprocess (optional, off by default): [Preprocess] in dlssnr-amd.ini in the game folder (the
-optiscaler route writes the file on first start; the ReShade routes also show it on the Add-ons
-page). It changes the picture the network is shown (exposure, display curve, contrast,
-saturation), and so how NR edits the picture. Two uses: a personal look in any game (it departs
-from the original look; the result may be better or worse), and games that do not hand their
-exposure to the upscaler, which it fixes (see 007 First Light below). Ctrl+F10 switches it for
-the current run, to compare. The file explains every setting.
+Preprocess (optional, off by default): [Preprocess] in dlssnr-amd.ini in the game folder (written
+at install; the ReShade routes also show it on the Add-ons page). It changes the picture the
+network is shown (exposure, display curve, contrast, saturation), and so how NR edits the picture.
+Two uses: a personal look in any game (it departs from the original look; the result may be better
+or worse), and games that do not hand their exposure to the upscaler, which it fixes (see 007 First
+Light below). Ctrl+F10 switches it for the current run, to compare. The file explains every
+setting.
 
 Logs: dlssnr-amd.log (and OptiScaler.log or ReShade.log), all in the game folder.
 
 Known issues
 ------------
-- 32-bit games at 4K may fail on the first launch (the 32-bit address space runs out while
-  ReShade compiles its shaders for the first time); the second launch works.
+- 32-bit games at 4K: on the first launch the 32-bit address space is tight (ReShade compiles its
+  shaders at the same time). If dlssnr-amd.log shows out of host memory, NR retries every few
+  seconds by itself; if it never succeeds, please send us the log.
 - 007 First Light (optiscaler route): with NR before or after the upscaler the picture turns
   dark, green and grainy. The game leaves exposure to the upscaler and hands over none, so the
   frame NR gets is far too dark. Turn on Preprocess (above); its defaults are meant for this.
@@ -96,3 +121,7 @@ Known issues
 Uninstall
 ---------
     bash install.sh "/path/to/<game folder>" remove
+
+Only the files in the installation record are deleted (dlssnr-amd.ini and the logs included). A file
+of the game folder that the installation overwrote (for example another mod's dxgi.dll) is not
+brought back.

@@ -62,11 +62,12 @@ instructions the network needs.
 ## Performance
 
 GPU time of the network per frame on an RX 9070 XT, **offline benchmark** (network only), measured
-with v0.0.3:
+with v0.0.3 (the int4 mixed row with v0.0.4):
 
 | | 1080p | 1440p | 4K |
 | --- | --- | --- | --- |
 | Linux | 5.60 ms | 9.70 ms | 21.89 ms |
+| Linux, [int4 mixed](#int4-mixed-optional-linux) | 4.99 ms | 8.69 ms | 19.64 ms |
 | Windows | 7.21 ms | 12.59 ms | 27.32 ms |
 
 In game (Linux, RX 9070 XT):
@@ -120,8 +121,8 @@ None of these measurements use frame generation; the OptiScaler route can turn i
 
 `[Preprocess]` in `dlssnr-amd.ini` in the game folder changes the picture the NR network is shown (exposure,
 display curve, contrast, saturation), and so how NR edits the picture. It has two uses: a personal look in any
-game, and fixing games that do not hand their exposure to the upscaler (below). The `optiscaler` route writes
-the file the first time the game starts; the ReShade routes also show the settings on the Add-ons page.
+game, and fixing games that do not hand their exposure to the upscaler (below). The installer writes the
+file; the ReShade routes also show the settings on the Add-ons page.
 
 - **Enabled**: off by default; when off, none of it runs. Turned on, it starts from auto exposure and the
   filmic curve.
@@ -149,6 +150,27 @@ look; it may be better or worse.
 The first time the preprocess is turned on, NR rebuilds; a second or two of frames go without NR.
 The file itself explains every setting.
 
+## int4 mixed (optional, Linux)
+
+A second network, faster than the default one (see Performance): part of its computation runs in int4,
+a lower precision than the original network uses, so its picture differs somewhat from the default
+network's. Both Linux packages have it; it is chosen at install.
+
+- The installer asks once (Enter = no), or pass `--int4` or `--no-int4`.
+- With it, the Steam launch options the installer prints have two more entries, `VK_ADD_LAYER_PATH`
+  and `VK_INSTANCE_LAYERS` (a Vulkan layer in the game folder that int4 mixed needs). Copy the whole
+  line.
+- Once installed it is on. In game, Ctrl+F11 switches between int4 mixed and the default network, to
+  compare them on the same picture; a switch builds the other network in the background, which takes a
+  few seconds (`KeepBoth = 1` keeps both networks in video memory and makes switching instant). The
+  settings are in `[Int4Mixed]` in `dlssnr-amd.ini`.
+- With int4 mixed, NR takes much longer to take effect when a game starts. Until then the picture goes
+  without NR; this does not mean int4 mixed is not working.
+- Its weights are made during installation from your model and the tables in the package, and checked
+  against a known SHA-256. The tables (`linux/data/int4/`) come from this project's own calibration on
+  1,112 game frames and darkened copies of some of them. int4 mixed is the network these tables define;
+  another calibration would give a different network.
+
 ## Why Vulkan
 
 HIP would work too: ROCm supports RDNA4 and its matrix (WMMA) instructions. Vulkan fits this job
@@ -174,8 +196,9 @@ the releases, unpack it and run:
 bash install.sh "/path/to/steamapps/common/<game folder>" --dll /path/to/nvngx_dlssnr_310.8.0.zip
 ```
 
-The folder is the one holding the game's exe. The installer lists the routes, extracts the model
-(below) and prints the Steam launch options to use. `--dll` is needed only for the first install:
+The folder is the one holding the game's exe. The installer lists the routes, asks whether to add
+[int4 mixed](#int4-mixed-optional-linux), extracts the model (below) and prints the Steam launch
+options to use. `--dll` is needed only for the first install:
 the extracted model is kept and reused for every later one. Needs `bash` and `python3`. See
 [linux/package/README.txt](linux/package/README.txt).
 
@@ -252,7 +275,7 @@ Known issues:
 Tested on Ubuntu 24.04. Everything, including the Windows DLLs, is cross-compiled on Linux.
 
 ```sh
-sudo apt install git curl python3 cmake ninja-build mingw-w64
+sudo apt install git curl python3 cmake ninja-build mingw-w64 g++-multilib
 bash fetch_deps.sh                          # pinned third-party pieces -> toolchain/, artifacts/ref/
 bash linux/build/build_vulkan_loader.sh     # the patched Vulkan loader for the vulkan/dx9 routes
 NR_ARCH=x86_64 bash linux/build/build_package.sh

@@ -15,12 +15,13 @@ The fork split, and the two halves reach feature 18 differently. Both are answer
 
 | lineage | how it reaches the model | what it loads |
 | --- | --- | --- |
-| **wilsjo2 ≥ 0.8.1** (`OptiScaler-NR-v0.8.4.zip`, **the bundled one**) | `NVSDK_NGX_D3D12_CreateFeature(cmdList, (NVSDK_NGX_Feature) 18, params, &feature)` on the NGX core, then `D3D12_EvaluateFeature` / `D3D12_ReleaseFeature`. Vulkan: `VULKAN_CreateFeature1` / `VULKAN_EvaluateFeature` / `VULKAN_ReleaseFeature`. | **`_nvngx.dll` only.** Its `INSTALL-DLSSNR.md` says "No NR helper DLL is required; remove the obsolete `nvngx.dll_dlssnr.dll` when upgrading." |
+| **wilsjo2 ≥ 0.8.1** (`OptiScaler-NR-v0.8.91.zip`, **the bundled one**) | `NVSDK_NGX_D3D12_CreateFeature(cmdList, (NVSDK_NGX_Feature) 18, params, &feature)` on the NGX core, then `D3D12_EvaluateFeature` / `D3D12_ReleaseFeature`. Vulkan: `VULKAN_CreateFeature1` / `VULKAN_EvaluateFeature` / `VULKAN_ReleaseFeature`. | **`_nvngx.dll` only.** Its `INSTALL-DLSSNR.md` says "No NR helper DLL is required; remove the obsolete `nvngx.dll_dlssnr.dll` when upgrading." |
 | **Dagherbou** (`OptiScaler-DLSSNR-v0.2.0.zip`) | `dlssnr_call_create` / `_evaluate` / `_release` / `_set_extras` / `_probe_float` / `_set_float_slot` in a forwarder DLL beside itself. | `nvngx.dll_dlssnr.dll`, with `nvngx_dlssnr.dll` as a presence check, plus `_nvngx.dll` for the parameter block. |
 
 Behind both doors is one body of code, `linux/src/pe/nr_dlssnr_model.cpp`: one `nr::pe::Session` per graphics
-API, a feature handle carrying the extent and the six controls, a seed copy of colour into output, and
-`Session::run_after` (D3D12) or `Session::run_vulkan`. `linux/src/pe/nr_ngx_core.cpp` and
+API, a feature handle carrying the extent and the six controls, and `Session::run_after` (D3D12) or
+`Session::run_vulkan` (the network reads the colour and its post block stores into the output; the colour
+is copied into the output first only when the model is not applied or the extents differ). `linux/src/pe/nr_ngx_core.cpp` and
 `linux/src/pe/nr_dlssnr_forwarder.cpp` are the two ABIs over it and nothing else. A process that somehow
 loaded both would still build one network: the core checks for `nvngx.dll_dlssnr.dll` in its module
 list with `GetModuleHandleW` (never `LoadLibrary`) and routes through its exports if it is there.
@@ -30,26 +31,26 @@ list with `GetModuleHandleW` (never `LoadLibrary`) and routes through its export
 | file | what it is | where it comes from |
 | --- | --- | --- |
 | `dxgi.dll` | OptiScaler itself, renamed | the release archive, renamed as its own `setup_linux.sh` would |
-| `OptiScaler.ini` | its configuration | the release archive, four keys rewritten (below) |
+| `OptiScaler.ini` | its configuration | the release archive, three keys rewritten (below) |
 | `OptiScaler/`, `docs/`, `Licenses/` | its FSR/XeSS libraries and papers | the release archive, untouched |
 | **`dlssnr_core.dll`** | **the NGX core, and feature 18** (built as `_nvngx.dll`, shipped renamed; below) | `linux/build/build_optiscaler_nr.sh` |
 | **`nvngx.dll_dlssnr.dll`** | **the forwarder, for the older lineage** | same |
 | **`nvngx_dlssnr.dll`** | **a byte copy of the forwarder** | same |
-| `build/`, `artifacts/` | the network's SPIR-V and its ~290 MB of weights | `linux/build/build_package.sh`'s package |
+| `dlssnr-amd/` | the model, the network's SPIR-V, the pipeline cache (and with int4 mixed its network and Vulkan layer) | `linux/build/build_package.sh`'s package |
+| `dlssnr-amd.ini` | our own settings: `[Preprocess]`, and `[Int4Mixed]` with int4 mixed | written at install |
 
-`install_optiscaler_nr.sh` in this directory does all of it, and so does the package's own
-`install.sh <game-dir> optiscaler`:
-
-```
-linux/package/optiscaler/install_optiscaler_nr.sh <game-dir> <OptiScaler-*.zip> [dxgi.dll]
-```
+The package's `install.sh <game-dir> optiscaler` does all of it. (`install_optiscaler_nr.sh` in this
+directory predates the package layout - it expects `artifacts/optiscaler/nr` and a `build/` +
+`artifacts/` payload - and no longer works; use the package.)
 
 The release that ships:
 
-- <https://github.com/wilsjo2/OptiScaler/releases> — `OptiScaler-NR-v0.8.4.zip`
-- sha256 `8789912859882e66b3f3a1aa768db947da779dfd65225df69ea919052e73a2e4`
-- source tag `v0.8.4`, HEAD `8802b2b`, cloned to
+- <https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases> — `OptiScaler-NR-v0.8.91.zip`
+- sha256 `19a2852bb3f88e09075e3ccc66e0318c52e83a5901d9020a10384ae49d59ff77`
+- source tag `v0.8.91`, commit `f45ccf3`, cloned to
   `artifacts/ref/wilsjo2-OptiScaler-DLSSNR-PreSR-Multipass`
+- the previous one, `OptiScaler-NR-v0.8.4.zip` (sha256 `8789912859882e66b3f3a1aa768db947da779dfd65225df69ea919052e73a2e4`,
+  tag `v0.8.4`), still works with the same core: `NR_OPTI_ZIP=` bundles it instead
 
 It is a binary release: `OptiScaler.dll` (26 MB), `OptiScaler.ini`, the `OptiScaler/` library folder,
 `docs/`, `Licenses/`, `setup_linux.sh` / `setup_windows.bat`, the `!! EXTRACT ALL FILES TO GAME
@@ -114,33 +115,27 @@ and gives up with *"nvngx_dlssnr.dll was not found beside OptiScaler or the game
 NVIDIA it is the 165 MB model out of a driver package. Here it is a byte copy of the forwarder, and on
 the normal path nothing ever loads it.
 
-## The multi-pass rule, and the one thing one Session cannot do
+## The multi-pass rule
 
 wilsjo2's `Passes` slider creates **one NGX feature per pass** — up to 3 by default, 30 with
 `UnlockPasses` — and keeps every handle alive, chaining their outputs through a ping-pong scratch
 texture. Each pass gets its own capability parameter block and its own profile; pass 2 and later
 always get `LocalToneStrength = 0`.
 
-Every create here therefore returns a distinct handle. What one `nr::pe::Session` cannot give them is
-a temporal history each: `nr::Runtime` owns exactly one history image. Left alone, pass 2 would read
-the history pass 1 wrote *in the same game frame* — its own input, one blend earlier — and the
-temporal term would compound with itself.
-
-So **the first handle created on a session keeps the history; every later one is evaluated with reset
-forced on**, never reads the shared history, and runs as a pure spatial enhancement. It still writes,
-and the owner reads that write next frame, so the history holds the last pass's picture rather than
-the first's. That is a limitation of this side, not of the reference, and it is logged once, the first
-time a second handle appears.
+Every create here returns a distinct handle, and every feature has its own temporal history (the
+runtime keeps one per feature id), so pass 2 never reads what pass 1 wrote in the same frame. (Before
+that, the first handle kept the only history and later passes ran with reset forced on.)
 
 ## The ini keys, and the one that is deliberately left alone
 
-Written by the installer into the archive's own `OptiScaler.ini`. Both ship as `<key>=auto` in
-v0.8.4 and are rewritten in place; a key that has been renamed upstream shows up as an error rather
-than as a silently ignored line.
+Written by the installer into the archive's own `OptiScaler.ini`. They ship as `<key>=auto` and are
+rewritten in place; a required key that has been renamed upstream shows up as an error rather than as
+a silently ignored line.
 
 ```ini
 [DlssNr]
 Enabled=true
+WhitePointSource=1
 
 [Libraries]
 NvngxPath=<game-dir>\dlssnr_core.dll
@@ -151,6 +146,12 @@ NvngxPath=<game-dir>\dlssnr_core.dll
 - `[Libraries] NvngxPath` — `Util::LoadProxyLibrary` accepts a directory (it appends `_nvngx.dll`,
   the first of the two names it tries) or a full file path. A file path is written, and it names
   `dlssnr_core.dll`, never `_nvngx.dll` (see "Why three DLLs").
+- `[DlssNr] WhitePointSource=1` — the white point from the game's own exposure (the 1x1 exposure
+  texture and pre-exposure it hands DLSS), as v0.8.4 did by default. v0.8.5 made 0, a fixed paper
+  white, the default; a game that supplies its exposure then gets a different picture (upstream
+  issue #96: "NR does nothing" until "game exposure" is chosen). A frame without a valid exposure
+  texture falls back to the paper white either way. v0.8.4's ini has no such key (1 is its built-in
+  default), so the key is optional: rewritten where present, not an error where absent.
 - `[Spoofing]` stays at the release's `auto` values: `StreamlineSpoofing` is true, `Dxgi` is true on
   an AMD card, and the GPU reported to the game is an NVIDIA RTX 4090 (`SpoofedVendorId` 0x10de,
   `SpoofedDeviceId` 0x2684), which is what makes a game offer DLSS at all. `Dxgi` depends on the game
@@ -165,8 +166,8 @@ NvngxPath=<game-dir>\dlssnr_core.dll
 
 ## Fixes applied to OptiScaler in memory
 
-OptiScaler itself is shipped as released and never rebuilt. The NGX core corrects five defects of
-OptiScaler-NR v0.8.4 in memory when OptiScaler loads it, before the game creates a Vulkan device or
+OptiScaler itself is shipped as released and never rebuilt. The NGX core corrects seven defects of
+OptiScaler-NR v0.8.4 and v0.8.91 in memory when OptiScaler loads it, before the game creates a Vulkan device or
 presents (`linux/src/pe/nr_pe_optifix.cpp`). Each is found by exact byte signatures; another
 OptiScaler build is left untouched and `dlssnr-amd.log` says so. `NR_OPTISCALER_FIX=0` turns all off.
 
@@ -193,11 +194,21 @@ OptiScaler build is left untouched and `dlssnr-amd.log` says so. `NR_OPTISCALER_
 - **A float colour with AutoExposure but no HDR flag (007 First Light, Helldivers 2).** OptiScaler
   treated it as finished SDR and handed NR raw scene-linear values (up to 563 in Helldivers 2). It is
   now encoded as linear HDR, the same as a game that sets the HDR flag.
+- **A released feature's GPU work outliving it (S.T.A.L.K.E.R. 2).** `ReleaseFeature` freed the
+  feature's timestamp heaps while the game's list still had to write them; the release now waits
+  until the GPU has run the feature's last evaluate.
+- **R9G9B9E5 and R32G32B32 typeless colour taken as SDR (Resident Evil Requiem).** They are float
+  formats and now count as linear HDR like the others.
 
-007 First Light is still not right before or after SR: it declares AutoExposure and hands over no
-exposure, so OptiScaler's encode falls back to a fixed white point (paper white 1.0) and the model
-sees a frame about five stops too dark (mean 0.028 against 0.2-0.4 for its finished picture). The
-same happens through the game's DLSS or FSR path. Finished Picture is correct there.
+v0.8.91 has the same seven defects. Fixes 1, 3, 4 and 6 find it by the v0.8.4 signatures; the
+Finished Picture, AutoExposure and float-format fixes have a v0.8.91 signature of their own (its
+Finished Picture condition also skips XeFG's game picture, as its native path does).
+
+007 First Light declares AutoExposure and hands over no exposure, so OptiScaler's encode falls back to
+a fixed white point (paper white 1.0) and the model sees a frame about five stops too dark (mean 0.028
+against 0.2-0.4 for its finished picture), before or after SR. `[Preprocess]` in `dlssnr-amd.ini`
+(auto exposure, filmic curve by default) is the fix for that input; Finished Picture is also correct
+there.
 
 ## What the core does not do
 
@@ -272,9 +283,10 @@ frames pass through as an exact copy of the input either way, which composites t
   device. When it has nothing the Vulkan path declines and says so, rather than calling
   `vkGetDeviceQueue` on a family the game may never have requested.
 
-## Nothing here has run a frame
+## How it is tested
 
-Every GPU-side claim in this document is a reading of source, not a measurement. The DLLs build and
-export what they should — 50 `NVSDK_NGX_*` from `_nvngx.dll`, 28 `dlssnr_*` from the forwarder —
-and the installer's dry run puts the right files in the right places; whether a game comes up, and
-what the picture looks like, is unknown until one is launched.
+In games (Dying Light: The Beast, Kingdom Come: Deliverance II, 007 First Light, Helldivers 2, Resident
+Evil Requiem and others) and offline: the core's OptiScaler fixes are applied to the real OptiScaler
+DLL under Wine and every patched byte is checked, and a stand-in D3D12 DLSS game drives the whole route
+(OptiScaler as `dxgi.dll`, vkd3d-proton, our core) frame by frame, comparing outputs byte for byte
+between releases.

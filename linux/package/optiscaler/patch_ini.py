@@ -46,9 +46,20 @@ def wanted_keys(game: str) -> dict:
     }
 
 
+def optional_keys() -> dict:
+    """Keys rewritten where the release's ini has them, and not missed where it does not."""
+    return {
+        # Where the white point comes from: the game's own exposure, as in v0.8.4, where 1 is the
+        # built-in default and the key is not in the ini. v0.8.5 made 0 (a fixed paper white) the
+        # default, and with it a game that hands DLSS its exposure gets a different picture.
+        ("DlssNr", "WhitePointSource"): "1",
+    }
+
+
 def main(game: str) -> int:
     path = os.path.join(game, "OptiScaler.ini")
-    wanted = wanted_keys(game)
+    required = wanted_keys(game)
+    wanted = {**required, **optional_keys()}
     lines = open(path, encoding="utf-8", errors="replace").read().splitlines()
 
     section = None
@@ -71,9 +82,10 @@ def main(game: str) -> int:
     open(path, "w", encoding="utf-8").write("\n".join(lines) + "\n")
 
     for (s, k), v in sorted(wanted.items()):
-        print(f"  {' ' if (s, k) in seen else '!'} [{s}] {k}={v}")
+        if (s, k) in seen or (s, k) in required:
+            print(f"  {' ' if (s, k) in seen else '!'} [{s}] {k}={v}")
 
-    missing = sorted(k for k in wanted if k not in seen)
+    missing = sorted(k for k in required if k not in seen)
     if missing:
         print(f"  ! not found in {path}; add them by hand: {missing}", file=sys.stderr)
         return 1

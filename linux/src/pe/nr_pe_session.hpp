@@ -188,6 +188,10 @@ class Session {
         // `output_usage` / `colour_usage` as far as the caller's descriptors say.
         VkImage output{}; VkImageLayout output_layout{VK_IMAGE_LAYOUT_GENERAL};
         VkImageUsageFlags output_usage{}, colour_usage{};
+        // The answer back into `colour` itself (copied out and back by the runtime, so `colour`
+        // needs transfer source and destination usage, and is left in colour_layout); run_vulkan
+        // then returns `colour`. Otherwise the answer is in an image of ours.
+        bool in_place{};
     };
     // A Vulkan game's own queue. The two D3D runtimes have an interop object to
     // ask for one; a Vulkan game has nothing of the sort, so the queue is learned
@@ -266,6 +270,25 @@ class Session {
     // around the work, not a clock around the call. Smoothed; zero until the
     // first result is back, and zero on a queue with no timestamp support.
     float gpu_ms() const;
+    // The network's part of gpu_ms (every pass); gpu_ms - network_ms is the route's own work.
+    float network_ms() const;
+
+    // What a host's UI shows: the network running and the one being built.
+    struct State {
+        bool running = false;           // a network is serving frames
+        int running_int4 = -1;          // 1 int4 mixed, 0 the default network, -1 none (or no int4 in this build)
+        uint32_t model_w = 0, model_h = 0;
+        int want_int4 = -1;             // [Int4Mixed]: what the switch asks for; -1 no int4 in this build
+        bool int4_available = false;    // int4 mixed can be switched to in this run
+        bool building = false;
+        int building_int4 = -1;
+        float building_seconds = 0.0f;
+        int stage = 0;                  // nr::g_build_stage while building
+        uint32_t pipes_done = 0, pipes_total = 0;
+    };
+    State state() const;
+    // [Int4Mixed] from the host's UI, as the hotkey does (the caller saves Enabled to the ini).
+    void set_int4(bool on);
 
   private:
     struct Impl;

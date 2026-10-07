@@ -502,6 +502,23 @@ layout(set = 0, binding = 3, std430) readonly buffer WgtF32  { float   wgt_f32[]
 layout(set = 0, binding = 4, std430) NR_COH    buffer ActE4M3x4 { fe4m3vec4 act_e4m3x4[]; };
 // Packed view of the weights for the hoisted-address QKV loads.
 layout(set = 0, binding = 2, std430) readonly buffer WgtE4M3x4 { fe4m3vec4 wgt_e4m3x4[]; };
+#ifndef NR_ATTN_I4
+#define NR_ATTN_I4 0
+#endif
+#if NR_ATTN_I4
+// NR_ATTN_I4: the QKV projection on int4 (the host rewrites the int8 WMMA to iu4, nrvk.hpp).
+// X: the FFN projection's int4 side copy of this layer's input (gemm1x1 NR_I4_SIDE, NR_I4_PAIR records, H16);
+// W: [1536/16][C/64] records of 512 bytes. pc.w_off points at a record {magic, X offset from x_off (bytes),
+// W offset (bytes), scale index}; scale s[1536] then constant c[1536] (f32, binding 3).
+layout(set = 0, binding = 4, std430) NR_COH readonly buffer ActU32A { uint act_u32a[]; };
+layout(set = 0, binding = 2, std430) readonly buffer WgtU32A { uint wgt_u32a[]; };
+#define NR_A4FRAG(dst, u) { const i8vec4 x0_ = unpack8(int((u).x)), x1_ = unpack8(int((u).y)); \
+    for (int v = 0; v < 4; ++v) { dst[v] = x0_[v]; dst[v + 4] = x1_[v]; } }
+NR_FRAG_IACC nr_a4mma(NR_FRAG_IACC c, uvec2 x, uvec2 w, const bool sw) {
+    if (sw) { NR_FRAG_I8A a; NR_A4FRAG(a, w) NR_FRAG_I8B b; NR_A4FRAG(b, x) return coopMatMulAdd(a, b, c); }
+    NR_FRAG_I8A a; NR_A4FRAG(a, x) NR_FRAG_I8B b; NR_A4FRAG(b, w) return coopMatMulAdd(a, b, c);
+}
+#endif
 #ifndef NR_ATTN_KOFF
 #define NR_ATTN_KOFF 0
 #endif
@@ -1025,6 +1042,57 @@ void main() {
 #define NR_QK04 const uint k04 = k0 * 4u;
 #else
 #define NR_QK04
+#endif
+#if NR_ATTN_I4
+#if !(NR_ATTN_QKSWAP && NR_AN == 6 && NR_IMAGE)
+#error "NR_ATTN_I4: the shipping QKSWAP shape"
+#endif
+#undef NR_QKV_LOOP
+#define NR_A4LD(dst, arr, b) dst = uvec4(arr[(b) + ko], arr[(b) + ko + 1u], arr[(b) + ko + 2u], arr[(b) + ko + 3u]);
+#define NR_A4LX0_I(i) NR_QG(i) NR_A4LD(xa0[i], act_u32a, a4_[i])
+#define NR_A4LX1_I(i) NR_QG(i) NR_A4LD(xa1[i], act_u32a, a4_[i])
+#define NR_A4LW0_J(j) NR_A4LD(wb0[j], wgt_u32a, b4_[j])
+#define NR_A4LW1_J(j) NR_A4LD(wb1[j], wgt_u32a, b4_[j])
+#define NR_A4M0XY_J(j) ia[ii][j] = nr_a4mma(ia[ii][j], xa0[ii].xy, wb0[j].xy, (j) < 4);
+#define NR_A4M0ZW_J(j) ia[ii][j] = nr_a4mma(ia[ii][j], xa0[ii].zw, wb0[j].zw, (j) < 4);
+#define NR_A4M1XY_J(j) ia[ii][j] = nr_a4mma(ia[ii][j], xa1[ii].xy, wb1[j].xy, (j) < 4);
+#define NR_A4M1ZW_J(j) ia[ii][j] = nr_a4mma(ia[ii][j], xa1[ii].zw, wb1[j].zw, (j) < 4);
+#define NR_A4M0XY_I(i) NR_QG(i) { const int ii = i; NR_FOR_J(NR_AN, NR_A4M0XY_J) }
+#define NR_A4M0ZW_I(i) NR_QG(i) { const int ii = i; NR_FOR_J(NR_AN, NR_A4M0ZW_J) }
+#define NR_A4M1XY_I(i) NR_QG(i) { const int ii = i; NR_FOR_J(NR_AN, NR_A4M1XY_J) }
+#define NR_A4M1ZW_I(i) NR_QG(i) { const int ii = i; NR_FOR_J(NR_AN, NR_A4M1ZW_J) }
+#define NR_A4Z_J(j) ia[ii][j] = NR_IACC_ZERO;
+#define NR_A4Z_I(i) { const int ii = i; NR_FOR_J(NR_AN, NR_A4Z_J) }
+// Q and K (j < 4) are W . X^T: lane = token, eight consecutive channels; V: lane = channel, eight tokens.
+#define NR_A4F_J(j) if ((j) < 4) { const uint c0_ = i4sc + hrow + uint(j) * 16u + 8u * (lane / 16u); \
+        for (int e = 0; e < 8; ++e) qacc[ii][j][e] = float(ia[ii][j][e]) * wgt_f32[c0_ + uint(e)] + wgt_f32[c0_ + 1536u + uint(e)]; } \
+    else { const uint c0_ = i4sc + hrow + uint(j) * 16u + (lane & 15u); \
+        const float s_ = wgt_f32[c0_], k_ = wgt_f32[c0_ + 1536u]; \
+        for (int e = 0; e < 8; ++e) qacc[ii][j][e] = float(ia[ii][j][e]) * s_ + k_; }
+#define NR_A4F_I(i) { const int ii = i; NR_FOR_J(NR_AN, NR_A4F_J) }
+#define NR_A4XB_I(i) a4_[i] = (pc.x_off + i4xs + nr_tile_base(mtok0 / 16u + uint(i)) / 2u) / 4u + lane * 4u;
+#define NR_A4WB_J(j) b4_[j] = (i4w + (hrow / 16u + uint(j)) * (pc.C / 64u) * 512u) / 4u + lane * 4u;
+// NR_A4_NREC: the record count (C/64) fixed at build: the loop unrolls (no back-edge load waits).
+#ifndef NR_A4_NREC
+#error "NR_ATTN_I4: NR_A4_NREC (C/64)"
+#endif
+#define NR_QKV_LOOP { \
+    const uint i4r = pc.w_off / 4u; \
+    const uint i4xs = wgt_u32a[i4r + 1u], i4w = wgt_u32a[i4r + 2u], i4sc = wgt_u32a[i4r + 3u]; \
+    const uint nrec = uint(NR_A4_NREC); \
+    uint a4_[NR_AM], b4_[NR_AN]; \
+    NR_FOR_I(NR_AM, NR_A4XB_I) NR_FOR_J(NR_AN, NR_A4WB_J) \
+    NR_FRAG_IACC ia[NR_AM][NR_AN]; \
+    NR_FOR_I(NR_AM, NR_A4Z_I) \
+    uvec4 xa0[NR_AM], xa1[NR_AM], wb0[NR_AN], wb1[NR_AN]; \
+    { const uint ko = 0u; NR_FOR_I(NR_AM, NR_A4LX0_I) NR_FOR_J(NR_AN, NR_A4LW0_J) } \
+    [[unroll]] for (uint rc = 0u; rc < nrec; rc += 2u) { \
+        { const uint ko = (rc + 1u) * 128u; NR_FOR_I(NR_AM, NR_A4LX1_I) NR_FOR_J(NR_AN, NR_A4LW1_J) } \
+        NR_FOR_I(NR_AM, NR_A4M0XY_I) NR_FOR_I(NR_AM, NR_A4M0ZW_I) \
+        { const uint ko = min(rc + 2u, nrec - 1u) * 128u; NR_FOR_I(NR_AM, NR_A4LX0_I) NR_FOR_J(NR_AN, NR_A4LW0_J) } \
+        NR_FOR_I(NR_AM, NR_A4M1XY_I) NR_FOR_I(NR_AM, NR_A4M1ZW_I) \
+    } \
+    NR_FOR_I(NR_AM, NR_A4F_I) }
 #endif
 #if NR_ATTN_EDGE && NR_IMAGE && NR_AM == 2
             // A token tile outside the image is zero-filled and the

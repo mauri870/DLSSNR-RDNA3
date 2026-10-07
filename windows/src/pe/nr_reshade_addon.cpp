@@ -249,9 +249,8 @@ void vulkan_selftest(VkDevice device);
 // The header on `D3D11Frame::upscaler_input` says a finished back buffer is
 // display-referred "whatever its format", and for an SDR swapchain that is
 // right. It is wrong for an HDR one: scRGB is linear light with 1.0 at SDR
-// white, HDR10 is PQ over BT.2020, and the model was trained on neither. Feeding
-// one of those in raw is the same fault the upscaler path once had - and
-// there the picture came out dark with coloured blocks.
+// white, HDR10 is PQ over BT.2020. Feeding one of those in raw is the same fault the upscaler path
+// once had - and there the picture came out dark with coloured blocks.
 //
 // ReShade knows: `swapchain::get_color_space()`. The effect runtime is not a
 // swapchain, so it is taken from init_swapchain and kept.
