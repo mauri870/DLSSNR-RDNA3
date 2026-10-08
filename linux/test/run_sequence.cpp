@@ -81,6 +81,17 @@ int main(int argc, char** argv) try {
     controls.reuse_every = reuse_every;
     if (const char* gate = std::getenv("RUN_SEQUENCE_GATE")) controls.reuse_gate = float(atof(gate));
 
+    // RUN_SEQUENCE_ESTIMATOR=1: no motion from the "engine" - the runtime's own estimator finds it from successive
+    // frames (record_temporal), which is what a game with no motion vectors gets on the ReShade route.
+    const bool estimator = std::getenv("RUN_SEQUENCE_ESTIMATOR") != nullptr;
+    auto record = [&](VkCommandBuffer cmd) {
+        if (estimator) {
+            nr::EngineResult r{};
+            r.frame = runtime.record_temporal(cmd, frame.colour, controls, nr::TemporalFrame{frame.reset, frame.feature}).frame;
+            return r;
+        }
+        return runtime.record_engine(cmd, frame, controls);
+    };
     std::printf("%5s %8s %6s %6s %9s\n", "frame", "reused", "gated", "disp", "wall_ms");
     for (int i = 0; i < frames; ++i) {
         const auto rgba = slurp(in_pattern, i);
@@ -99,7 +110,7 @@ int main(int argc, char** argv) try {
         frame.reset = i == 0;
         nr::EngineResult result{};
         const auto begin = std::chrono::steady_clock::now();
-        ctx.one_shot([&](VkCommandBuffer cmd) { result = runtime.record_engine(cmd, frame, controls); });
+        ctx.one_shot([&](VkCommandBuffer cmd) { result = record(cmd); });
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
         std::printf("%5d %8s %6s %6u %9.3f\n", i, result.frame.reused ? "yes" : "no", result.frame.reuse_gated ? "yes" : "no",
                     result.frame.network_dispatches, ms);
@@ -123,7 +134,7 @@ int main(int argc, char** argv) try {
                 frame.reset = false;
                 nr::EngineResult result{};
                 const auto begin = std::chrono::steady_clock::now();
-                ctx.one_shot([&](VkCommandBuffer cmd) { result = runtime.record_engine(cmd, frame, controls); });
+                ctx.one_shot([&](VkCommandBuffer cmd) { result = record(cmd); });
                 const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
                 if (l < loops) continue;
                 total_ms += ms;
