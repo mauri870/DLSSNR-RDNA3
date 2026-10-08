@@ -1,0 +1,34 @@
+#version 460
+// Temporal reuse, the gate's input: the mean length of a motion field, in pixels of the model's extent, into
+// word `word` of a host-visible buffer. One workgroup walks the field. Word 0 is this frame's own motion,
+// which the host reads a frame later without waiting (whether the next frames may skip the network); word 1
+// the motion accumulated since the edit was made, which the warp pass of the same frame reads to fade the
+// edit out when the picture has moved further than the edit can be trusted.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer Stat { float mean_pixels[]; };
+layout(set = 0, binding = 1, rg32f) uniform readonly image2D motion;
+layout(push_constant) uniform Push {
+    uint width, height;       // the field
+    float scale_x, scale_y;   // engine units -> uv
+    float pixels_x, pixels_y; // the model's extent
+    uint word;
+} pc;
+shared float partial[256];
+
+void main() {
+    const uint count = pc.width * pc.height;
+    float sum = 0.0;
+    for (uint i = gl_LocalInvocationID.x; i < count; i += 256u) {
+        const vec2 m = imageLoad(motion, ivec2(i % pc.width, i / pc.width)).xy *
+                       vec2(pc.scale_x, pc.scale_y) * vec2(pc.pixels_x, pc.pixels_y);
+        const float l = length(m);
+        sum += (isnan(l) || isinf(l)) ? 0.0 : l;
+    }
+    partial[gl_LocalInvocationID.x] = sum;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (gl_LocalInvocationID.x < s) partial[gl_LocalInvocationID.x] += partial[gl_LocalInvocationID.x + s];
+        barrier();
+    }
+    if (gl_LocalInvocationID.x == 0u) mean_pixels[pc.word] = partial[0] / float(max(count, 1u));
+}
