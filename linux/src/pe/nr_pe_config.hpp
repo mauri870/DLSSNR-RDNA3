@@ -25,11 +25,17 @@ struct PreprocessConfig {
     Preprocess values{};
     std::string hotkey = "Ctrl+F10";   // empty: none
     bool sound = true;                 // a cue when it switches on or off
+    // [Reuse], the same file: temporal reuse of the network's edit (Controls::reuse_every / reuse_gate).
+    // The OptiScaler route builds its controls from NGX parameters, which have no key for it.
+    int reuse_every = 0;
+    float reuse_gate = 40.0f;
 };
 // One key of the section into `p`; false when it is not one of its keys.
 bool parse_preprocess_key(PreprocessConfig& p, const std::string& key, const std::string& value);
 // The section, with its comments, as the file holds it.
 void write_preprocess(FILE* f, const PreprocessConfig& p);
+// The [Reuse] section the OptiScaler route adds to the file it creates.
+void write_reuse(FILE* f, const PreprocessConfig& p);
 // "exposure auto, ExposureBias +0.00 EV, curve none, contrast 1.00, saturation 1.00", for the log.
 std::string describe(const Preprocess& p);
 

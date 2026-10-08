@@ -167,6 +167,11 @@ bool parse(const std::string& path, Config& c, bool& legacy) {
         const std::string key = lower(trim(text.substr(0, equals)));
         const std::string value = trim(text.substr(equals + 1));
         if (name == "preprocess") { parse_preprocess_key(c.preprocess, key, value); continue; }
+        if (name == "reuse") {      // the OptiScaler route's spelling of ReuseEvery / ReuseGate
+            if (key == "every") c.controls.reuse_every = std::clamp(std::atoi(value.c_str()), 0, 8);
+            else if (key == "gate") c.controls.reuse_gate = number(value, 1, 400);
+            continue;
+        }
         if (value.empty()) continue;
         auto& k = c.controls;
 
@@ -174,6 +179,8 @@ bool parse(const std::string& path, Config& c, bool& legacy) {
         else if (key == "applymodel" || key == "apply") { if (auto b = parse_bool(value)) k.apply_model = *b; }
         else if (key == "passes") passes = std::atoi(value.c_str());
         else if (key == "unlockpasses") { if (auto b = parse_bool(value)) c.unlock_passes = *b; }
+        else if (key == "reuseevery" || key == "reuse_every" || key == "temporal_reuse") k.reuse_every = std::clamp(std::atoi(value.c_str()), 0, 8);
+        else if (key == "reusegate" || key == "reuse_gate") k.reuse_gate = number(value, 1, 400);
         else if (key == "workingscale" || key == "model_scale") c.model_scale = number(value, 0.25f, 1.0f);
         else if (key == "style") { const int v = std::atoi(value.c_str()); if (v >= 0 && v <= 2) k.style = v; }
         else if (key == "intensity") k.intensity = number(value, 0, 2);
@@ -225,8 +232,13 @@ bool parse_preprocess_file(const std::string& path, PreprocessConfig& p) {
             continue;
         }
         const auto equals = text.find('=');
-        if (equals == std::string::npos || name != "preprocess") continue;
-        parse_preprocess_key(p, lower(trim(text.substr(0, equals))), trim(text.substr(equals + 1)));
+        if (equals == std::string::npos) continue;
+        const std::string key = lower(trim(text.substr(0, equals))), value = trim(text.substr(equals + 1));
+        if (name == "preprocess") parse_preprocess_key(p, key, value);
+        else if (name == "reuse") {
+            if (key == "every") p.reuse_every = std::clamp(std::atoi(value.c_str()), 0, 8);
+            else if (key == "gate") p.reuse_gate = number(value, 1, 400);
+        }
     }
     std::fclose(file);
     return true;
@@ -320,6 +332,26 @@ void write_preprocess(FILE* f, const PreprocessConfig& p) {
         kCurves[std::clamp(v.curve, 0, 6)], v.contrast, v.saturation, p.hotkey.c_str(), p.sound ? 1 : 0);
 }
 
+// The OptiScaler route's own section of the file; the ReShade route keeps ReuseEvery / ReuseGate with its other
+// controls and writes them in Config::save, so write_preprocess must not repeat them.
+void write_reuse(FILE* f, const PreprocessConfig& p) {
+    std::fprintf(f,
+        "\n"
+        "[Reuse]\n"
+        "; Temporal reuse of the network's edit (OptiScaler route). The network runs on every Every-th frame and\n"
+        "; the frames between carry its last edit forward by the game's motion vectors, for a fraction of the cost.\n"
+        "; Changing Every from 0 to 2 or more the first time rebuilds the network once, like Preprocess.\n"
+        "\n"
+        "Every = %d\n"
+        "; 0 or 1 = the network on every frame (default); 2 = every second frame (about half the cost);\n"
+        "; 3 = every third frame. Up to 8\n"
+        "\n"
+        "Gate = %.1f\n"
+        "; how far the picture may have moved since the network last ran, in pixels of a 1080p-wide frame,\n"
+        "; for a frame to skip it. Past it the network runs; past twice it the stored edit is dropped.\n",
+        p.reuse_every, p.reuse_gate);
+}
+
 bool PreprocessFile::poll(const std::string& path, PreprocessConfig& out) {
     const uint64_t stamp = stamp_of(path);
     if (!stamp) {
@@ -328,6 +360,7 @@ bool PreprocessFile::poll(const std::string& path, PreprocessConfig& out) {
         // No file: write one with the defaults, off, so there is something to edit.
         if (FILE* f = std::fopen(path.c_str(), "w")) {
             write_preprocess(f, PreprocessConfig{});
+            write_reuse(f, PreprocessConfig{});
             std::fclose(f);
             stamp_ = stamp_of(path);
         }
@@ -452,12 +485,17 @@ void Config::save(const std::string& path) {
         "TransferStrength=%.3f\n"
         "ColourStrength=%.3f\n"
         "MaxRatio=%.3f\n"
+        "; Temporal reuse (OptiScaler route): the network runs on every ReuseEvery-th frame (0 or 1: every frame)\n"
+        "; and the frames between carry its last edit forward by the game's motion vectors. A frame whose motion\n"
+        "; since then exceeds ReuseGate pixels (of a 1080p-wide frame) runs the network instead. 2 halves the cost.\n"
+        "ReuseEvery=%d\n"
+        "ReuseGate=%.1f\n"
         "; From the 2nd pass on, each pass can be set on its own: Pass2Style, Pass2Intensity, Pass2LocalStructure,\n"
         "; Pass2LocalTone, Pass2SkinStructure, Pass2AutoMask, and likewise Pass3...\n"
         "; Keys left out inherit the 1st pass, except LocalTone, which defaults to 0.\n",
         flag(k.enabled), flag(k.apply_model), k.passes, flag(unlock_passes), model_scale, k.style,
         k.intensity, k.local_structure, k.local_tone, k.skin_structure, flag(k.automatic_mask),
-        k.detail_strength, k.colour_strength, k.max_ratio);
+        k.detail_strength, k.colour_strength, k.max_ratio, k.reuse_every, k.reuse_gate);
     for (int n = 2; n <= kMaxPasses; ++n) {
         const PassOverride& o = pass[size_t(n) - 2];
         if (o.style) std::fprintf(f, "Pass%dStyle=%d\n", n, *o.style);

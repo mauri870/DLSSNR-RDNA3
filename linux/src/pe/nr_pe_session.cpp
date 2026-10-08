@@ -88,6 +88,7 @@ struct Session::Impl {
         // per pass, so a network built for four cannot serve a request for six.
         uint32_t passes{4};
         bool prep{};   // RuntimeConfig::preprocess
+        bool reuse{};  // RuntimeConfig::reuse
         uint64_t used{};   // LRU stamp
     };
     std::vector<Built> cache;
@@ -157,7 +158,7 @@ struct Session::Impl {
     bool ensure_runtime_(const Controls& controls, uint32_t w, uint32_t h, VkFormat format, bool linear);
     // The preprocess meter in the log every five seconds while it runs, so NR on/off at one spot
     // can be compared (the feedback loop that made upstream drop frame metering).
-    std::chrono::steady_clock::time_point meter_logged{};
+    std::chrono::steady_clock::time_point meter_logged{}, reuse_logged{};
     static bool is_linear_format(VkFormat f) {
         return f == VK_FORMAT_R16G16B16A16_SFLOAT || f == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ||
                f == VK_FORMAT_R32G32B32A32_SFLOAT ||
@@ -171,7 +172,7 @@ struct Session::Impl {
     // thread adopts whichever on its next call.
     std::thread build_thread;
     std::mutex build_lock;
-    bool building{}, build_done{}, build_linear{}, build_prep{};
+    bool building{}, build_done{}, build_linear{}, build_prep{}, build_reuse{};
     uint32_t build_passes{kMaxPasses};
     uint32_t build_w{}, build_h{};
     VkFormat build_format{VK_FORMAT_UNDEFINED};
@@ -198,6 +199,9 @@ struct Session::Impl {
     // built able to run it, so the hotkey switches at once after the first
     // time. Never cleared; until then nothing about the runtime changes.
     bool prep_want{};
+    // Controls::reuse_every was asked for once: from then on every runtime that can (one pass, which is the
+    // native-compose route) is built able to reuse the network's edit. Never cleared, like prep_want.
+    bool reuse_want{};
     // Every runtime is built able to run this many passes; Controls::passes
     // picks the count per frame.
     // What a network is built for unless the host asks for more. Four is what
@@ -469,7 +473,8 @@ bool Session::Impl::fits_in_memory(uint32_t w, uint32_t h) {
 bool Session::Impl::select_runtime(uint32_t w, uint32_t h, VkFormat format, bool want_linear) {
     for (auto& e : cache) {
         if (e.width != w || e.height != h || e.format != format || e.linear != want_linear ||
-            e.scale != model_scale || e.passes != max_passes_want || e.prep != prep_want)
+            e.scale != model_scale || e.passes != max_passes_want || e.prep != prep_want ||
+            e.reuse != reuse_want)
             continue;
         e.used = ++use_stamp;
         if (runtime != e.runtime.get()) {
@@ -513,6 +518,20 @@ bool Session::Impl::make_room(uint32_t w, uint32_t h) {
 bool Session::Impl::ensure_runtime(const Controls& controls, uint32_t w, uint32_t h, VkFormat format,
                                    bool want_linear) {
     const bool ok = ensure_runtime_(controls, w, h, format, want_linear);
+    if (ok && controls.reuse_every >= 2 && runtime->reuse_allowed()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - reuse_logged > std::chrono::seconds(5)) {
+            reuse_logged = now;
+            const auto n = runtime->reuse_counts();
+            const double frames = double(n.ran + n.skipped);
+            log("[nr] temporal reuse, every %d: %llu frames ran the network, %llu skipped it (%.0f %%), the motion gate "
+                "ran it %llu times; motion since the last line: mean %.1f px, peak %.1f px (Gate %.0f)",
+                controls.reuse_every, (unsigned long long)n.ran, (unsigned long long)n.skipped,
+                frames > 0 ? 100.0 * double(n.skipped) / frames : 0.0, (unsigned long long)n.gated,
+                n.motion_samples ? n.motion_sum / double(n.motion_samples) : 0.0, double(n.motion_peak),
+                double(controls.reuse_gate));
+        }
+    }
     if (ok && controls.preprocess.active() && controls.preprocess.exposure == 1) {
         const auto now = std::chrono::steady_clock::now();
         const auto m = runtime->preprocess_meter();
@@ -532,6 +551,11 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
         prep_want = true;
         log("[nr] preprocess asked for: networks are rebuilt able to run it (once)");
     }
+    if (controls.reuse_every >= 2 && !reuse_want) {
+        reuse_want = true;
+        log("[nr] ReuseEvery %d asked for: networks are rebuilt able to reuse the network's edit (once)%s",
+            controls.reuse_every, native_compose ? "" : "; they run one pass, so Passes above 1 has no effect");
+    }
     // Adopt a finished background build first.
     {
         std::lock_guard<std::mutex> guard(build_lock);
@@ -542,7 +566,7 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
                 Built entry;
                 entry.width = build_w; entry.height = build_h; entry.format = build_format;
                 entry.linear = build_linear; entry.scale = build_scale;
-                entry.passes = build_passes; entry.prep = build_prep;
+                entry.passes = build_passes; entry.prep = build_prep; entry.reuse = build_reuse;
                 entry.used = ++use_stamp;
                 entry.runtime = std::move(built);
                 log("[nr] network built at %ux%u (model %ux%u, scale %.2f) on queue family %u in "
@@ -555,9 +579,9 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
                 // never selected again; its memory goes now. Its last frame
                 // was before this build started, a second or more ago.
                 for (size_t i = cache.size(); i-- > 0;)
-                    if (entry.prep && !cache[i].prep && cache[i].width == entry.width &&
+                    if (((entry.prep && !cache[i].prep) || (entry.reuse && !cache[i].reuse)) && cache[i].width == entry.width &&
                         cache[i].height == entry.height)
-                        drop(i, "built without the preprocess");
+                        drop(i, "built without the preprocess or temporal reuse");
                 cache.push_back(std::move(entry));
                 auto& adopted = cache.back();
                 runtime = adopted.runtime.get();
@@ -613,9 +637,11 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
     config.root = root; config.width = w; config.height = h; config.colour_format = format;
     config.linear_input = want_linear; config.white_point = white_point;
     config.model_scale = model_scale;
-    config.max_passes = native_compose ? 1u : max_passes_want;
+    // Reuse stores one edit, so it needs one pass; Controls::passes above that is capped by the runtime.
+    config.max_passes = native_compose || reuse_want ? 1u : max_passes_want;
     config.native_compose = native_compose;
     config.preprocess = prep_want;
+    config.reuse = reuse_want;
     // The soft knee to undo: the linear path's own encode, or OptiScaler's
     // linear-HDR encode, which a float proxy on the OptiScaler route came
     // through (OptiScaler encodes a float colour flagged IsHDR or AutoExposure
@@ -639,6 +665,7 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
     const QueueAccess access_copy = access;
     building = true; build_w = w; build_h = h; build_format = format; build_linear = want_linear;
     build_scale = model_scale; build_passes = max_passes_want; build_prep = prep_want;
+    build_reuse = config.reuse;
     status = "building the network in the background; frames pass through until it is ready";
     log("[nr] building the network at %ux%u (model scale %.2f) in the background%s", w, h, model_scale,
         want_linear ? " (linear-light colour: encoding with a white point, see dlssnr-amd.ini white_point)" : "");
