@@ -171,7 +171,10 @@ spirv_execution_mode(extensions = ["SPV_KHR_float_controls"], capabilities = [44
 // value from one to the other takes the partner lane's component (lane ^ 16):
 //
 //   NR_OPPUT(dst, c, pair)  the accumulator-order pair (components c, c+1 of this
-//                           lane, c even) into operand components 2c .. 2c+3
+//                           lane, c even) into operand components 2c .. 2c+3, in the
+//                           k-pair-swapped order of NR_OP_KSWAP below
+//   NR_OPPUT_X(dst, c, pair) the same in the plain order (both halves alike)
+//   NR_OPK_R(f, c)          NR_OPK for an operand NR_OPPUT built
 //   NR_OPLIN(dst, j, pair)  a pair of memory-order channels (lane half h holds
 //                           channels 8h + j, 8h + j + 1) into components j, j+1,
 //                           j+8, j+9
@@ -189,7 +192,7 @@ spirv_execution_mode(extensions = ["SPV_KHR_float_controls"], capabilities = [44
 // dword whose halves then go to the operand unchanged (OPLIN) or one half each
 // (OPPUT, a v_pack_b32_f16 with op_sel). The per-half selects it replaces were
 // four v_cndmask_b16 an exchange.
-#define NR_OPPUT(dst, c, qp) { \
+#define NR_OPPUT_X(dst, c, qp) { \
     const uint nr_pv = packFloat2x16(qp); \
     const uint nr_po = subgroupShuffleXor(nr_pv, 16u); \
     const f16vec2 nr_fa = unpackFloat2x16(nr_hi ? nr_po : nr_pv); \
@@ -208,7 +211,7 @@ spirv_execution_mode(extensions = ["SPV_KHR_float_controls"], capabilities = [44
     (dst)[(j) + 8] = nr_fb.x; \
     (dst)[(j) + 9] = nr_fb.y; }
 #else
-#define NR_OPPUT(dst, c, qp) { \
+#define NR_OPPUT_X(dst, c, qp) { \
     const f16vec2 nr_pv = (qp); \
     const f16vec2 nr_po = unpackFloat2x16(subgroupShuffleXor(packFloat2x16(nr_pv), 16u)); \
     (dst)[2 * (c)]     = nr_hi ? nr_po.x : nr_pv.x; \
@@ -222,6 +225,52 @@ spirv_execution_mode(extensions = ["SPV_KHR_float_controls"], capabilities = [44
     (dst)[(j) + 1] = nr_hi ? nr_po.y : nr_pv.y; \
     (dst)[(j) + 8] = nr_hi ? nr_pv.x : nr_po.x; \
     (dst)[(j) + 9] = nr_hi ? nr_pv.y : nr_po.y; }
+#endif
+// ---- the k-pair swap: NR_OP_KSWAP ------------------------------------------
+//
+// Measured with linux/test/wmma_half_probe (gfx1100, RADV): the WMMA computes output row m from
+// lane half m%2 alone, that half's A row m and that half's copy of every B column. So the two
+// halves may hold their operands in different k orders, as long as each half's A rows and B
+// columns agree, and swapping the two elements of every k pair is bit-identical to the plain
+// product (probe over 102400 random e4m3-valued elements: 0 differences).
+//
+// The accumulator gives lane half h the rows of parity h, so a lane building an operand from
+// an accumulator puts (own, partner) into every pair: the lower half holds (2c, 2c+1), the
+// upper half (2c+1, 2c) - every k pair swapped. That is one permute and two packs a pair where
+// matching the plain order took one permute, two selects and two packs. Two register-built
+// operands (K and Q^T, V and P^T) agree with each other by construction. A register-built B
+// operand against a weight tile from memory needs the weight's odd rows (the rows the upper
+// half uses) stored with their k pairs swapped: nr_graph.cpp does that for exactly the tiles
+// these kernels multiply register operands by (`kswap` in shader-constants.txt), and the
+// C=32 kernels stage K and V into LDS with the odd rows swapped the same way (NR_KV_LDS_SWAP).
+// A register-built A operand against a weight tile read as a B operand (NR_V_SWAP's V = X . Wv^T)
+// cannot be swapped on the weight side, so it keeps the exchange: NR_OPPUT_X.
+#ifndef NR_OP_KSWAP
+#define NR_OP_KSWAP 1
+#endif
+#if NR_OP_KSWAP
+#define NR_OPPUT(dst, c, qp) { \
+    const uint nr_pv = packFloat2x16(qp); \
+    const uint nr_po = subgroupShuffleXor(nr_pv, 16u); \
+    const f16vec2 nr_fa = unpackFloat2x16(nr_pv); \
+    const f16vec2 nr_fb = unpackFloat2x16(nr_po); \
+    (dst)[2 * (c)]     = nr_fa.x; \
+    (dst)[2 * (c) + 1] = nr_fb.x; \
+    (dst)[2 * (c) + 2] = nr_fa.y; \
+    (dst)[2 * (c) + 3] = nr_fb.y; }
+// The component of a register-built operand that is accumulator component c of this lane.
+#define NR_OPK_R(f, c) ((f)[2 * (c)])
+#else
+#define NR_OPPUT(dst, c, qp) NR_OPPUT_X(dst, c, qp)
+#define NR_OPK_R(f, c) NR_OPK(f, c)
+#endif
+// The C=32 kernels' K and V staging into LDS with the odd rows pair-swapped (fswin_body.glsl);
+// it has to follow NR_OP_KSWAP and is separate only so the two can be priced apart.
+#ifndef NR_KV_LDS_SWAP
+#define NR_KV_LDS_SWAP NR_OP_KSWAP
+#endif
+#if NR_KV_LDS_SWAP != NR_OP_KSWAP && !defined(NR_KV_LDS_SWAP_DIAG)
+#error "NR_KV_LDS_SWAP must follow NR_OP_KSWAP (wrong picture otherwise)"
 #endif
 #define NR_OPK(f, c)  (nr_hi ? (f)[2 * (c) + 1] : (f)[2 * (c)])
 #define NR_ROW(c)     NR_ACC_ROW(lane, c)
@@ -240,7 +289,11 @@ spirv_execution_mode(extensions = ["SPV_KHR_float_controls"], capabilities = [44
 #define NR_XHPUT(dst, c, qp) { const f16vec2 nr_xq = (qp); (dst)[(c)] = nr_xq.x; (dst)[(c) + 1] = nr_xq.y; }
 #else
 #define NR_XH_N 16
-#define NR_XHK(f, c) NR_OPK(f, c)
+#ifdef NR_FUSED_IMAGE_INPUT
+#define NR_XHK(f, c) NR_OPK_R(f, c)     // xh is NR_OPPUT built (the lift)
+#else
+#define NR_XHK(f, c) NR_OPK(f, c)       // xh is NR_OPLIN built (the blends)
+#endif
 #define NR_XHPUT(dst, c, qp) NR_OPPUT(dst, c, qp)
 #endif
 #if NR_IO_DOT2

@@ -1,0 +1,34 @@
+#version 450
+// Which lane half the wave32 WMMA computes each output row from (wmma_half_probe.cpp).
+// A and B are loaded from memory, so lanes l and l^16 hold the same values; then the
+// components of one lane half are overwritten with a marker and the product against an
+// identity matrix is stored. Workgroup 0: B, upper lanes marked; 1: B, lower lanes marked;
+// 2: A, upper lanes marked; 3: A, lower lanes marked.
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+layout(local_size_x = 32) in;
+layout(set = 0, binding = 0) buffer I { float16_t in_[]; };    // [0, 256): identity; [256, 512): 16 i + j + 1
+layout(set = 0, binding = 1) buffer O { float out_[]; };
+void main() {
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
+    const uint mode = gl_WorkGroupID.x;
+    const bool upper = gl_SubgroupInvocationID >= 16u;
+    const bool mark = (mode & 1u) == 0u ? upper : !upper;
+    if (mode < 2u) {
+        coopMatLoad(a, in_, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(b, in_, 256, 16, gl_CooperativeMatrixLayoutRowMajor);
+        for (uint k = 0u; k < 16u; ++k) if (mark) b[k] = float16_t(1000.0 + float(k));
+    } else {
+        coopMatLoad(a, in_, 256, 16, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(b, in_, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+        for (uint k = 0u; k < 16u; ++k) if (mark) a[k] = float16_t(1000.0 + float(k));
+    }
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    c = coopMatMulAdd(a, b, c);
+    coopMatStore(c, out_, mode * 256u, 16, gl_CooperativeMatrixLayoutRowMajor);
+}
