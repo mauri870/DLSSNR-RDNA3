@@ -109,10 +109,9 @@ nr::pe::Session& vk_session() {
 // [Preprocess] in dlssnr-amd.ini beside this module: the file re-read at most once a second, the
 // hotkey every evaluate. Written with the defaults (off) when absent. OptiScaler knows nothing of it:
 // the change is made on the proxy it hands us and taken back out of the answer before it gets it back.
-nr::Preprocess preprocess_now() {
+const nr::pe::PreprocessConfig& ini_config() {
     static nr::pe::PreprocessFile file;
     static nr::pe::PreprocessConfig config;
-    static nr::pe::PreprocessSwitch toggle;
     static ULONGLONG next = 0;
     const ULONGLONG now = GetTickCount64();
     if (now >= next) {
@@ -120,6 +119,21 @@ nr::Preprocess preprocess_now() {
         const char* folder = nr::pe::module_folder();
         if (*folder) file.poll(std::string(folder) + "\\dlssnr-amd.ini", config);
     }
+    return config;
+}
+
+// [Reuse] in the same file: the network on every Every-th frame, the frames between carrying its edit
+// forward by the game's motion vectors (nr::Controls::reuse_every). Zero or one: the network every frame.
+void reuse_now(nr::Controls& c) {
+    const auto& ini = ini_config();
+    c.reuse_every = ini.reuse_every;
+    c.reuse_gate = ini.reuse_gate;
+}
+
+nr::Preprocess preprocess_now() {
+    static nr::pe::PreprocessConfig config;
+    static nr::pe::PreprocessSwitch toggle;
+    config = ini_config();
     return toggle.frame(config);
 }
 
@@ -1005,6 +1019,7 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
 
     f->controls = controls_from(controls);
     f->controls.preprocess = preprocess_now();
+    reuse_now(f->controls);
 
     nr::pe::Session::EngineResources resources{};
     resources.feature = f->id;
@@ -1305,6 +1320,7 @@ int evaluate_vk(void* cmd_buffer, Feature* f, void* params, const void* color, c
 
     f->controls = controls_from(controls);
     f->controls.preprocess = preprocess_now();
+    reuse_now(f->controls);
     write_evaluate_keys(params, controls, frame.reset, depth_inverted);
 
     auto& session = vk_session();
