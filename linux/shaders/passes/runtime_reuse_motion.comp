@@ -1,0 +1,35 @@
+#version 460
+// Temporal reuse, step 2: on a frame that skips the network, extend the motion from the frame the stored
+// edit belongs to up to this one. `motion` is the engine's backward motion (this frame's pixel -> where it
+// was in the previous frame) in the engine's units, `scale` turns it into uv offsets; `previous` is the
+// same quantity accumulated up to the previous frame, defined at that frame's pixels. Composition is a
+// lookup, not a sum: total(p) = m(p) + previous(p + m(p)).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, rg32f) uniform readonly image2D motion;
+layout(set = 0, binding = 1, rg32f) uniform readonly image2D previous;
+layout(set = 0, binding = 2, rg32f) uniform writeonly image2D next;
+layout(push_constant) uniform Push {
+    uint width, height;      // the field
+    float scale_x, scale_y;  // engine units -> uv
+    uint first;              // 1: the previous frame is the one the edit belongs to, nothing to compose
+} pc;
+
+vec2 fetch_clamped(ivec2 p) {
+    return imageLoad(previous, clamp(p, ivec2(0), ivec2(pc.width, pc.height) - 1)).xy;
+}
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(pc.width) || p.y >= int(pc.height)) return;
+    const vec2 m = imageLoad(motion, p).xy * vec2(pc.scale_x, pc.scale_y);
+    vec2 total = m;
+    if (pc.first == 0u) {
+        const vec2 size = vec2(pc.width, pc.height);
+        const vec2 q = (vec2(p) + 0.5 + m * size) - 0.5;      // texel space of the previous field
+        const vec2 f0 = floor(q), f = q - f0;
+        const ivec2 i = ivec2(f0);
+        total += mix(mix(fetch_clamped(i), fetch_clamped(i + ivec2(1, 0)), f.x),
+                     mix(fetch_clamped(i + ivec2(0, 1)), fetch_clamped(i + ivec2(1, 1)), f.x), f.y);
+    }
+    imageStore(next, p, vec4(total, 0.0, 0.0));
+}

@@ -155,6 +155,17 @@ struct Controls {
     uint64_t feature = 0; // identity for non-temporal seed and Preprocess state
     float history_strength = -1.f; // negative: the session default; otherwise this layer's post blend
     bool model_capture_allowed = true; // an outer multipass host arms only its final pass
+    // Temporal reuse of the network's edit (RuntimeConfig::reuse). 0 or 1: the network runs on every frame.
+    // N >= 2: it runs on every Nth frame, and the frames between carry its last edit forward - the edit
+    // (answer minus what the network was shown) looked up where the accumulated motion says each pixel was
+    // when it was made - onto what the network would have been shown this frame. A frame with `reset`
+    // always runs the network. Needs the temporal path - the engine's motion vectors, or the fallback estimator's
+    // when there are none - and one pass, no preprocess.
+    int reuse_every = 0;
+    // The most the picture may have moved, in pixels of a 1080p-wide frame (scaled with the frame's width),
+    // for the network to be skipped: a frame whose predicted accumulated motion is larger runs the network
+    // instead. The motion is the mean of the previous frame's, times the frames since the network ran.
+    float reuse_gate = 40.0f;
     // Optional readback of the last pass before and after its network, before composition.
     std::function<void(VkCommandBuffer, const ColourFrame&, const ColourFrame&, bool)> model_capture;
 };
@@ -239,6 +250,11 @@ struct RuntimeConfig {
     // beyond this build's need, for other networks to fit.
     std::shared_ptr<ActArenaRef> act_arena;
     double act_slack = 1.0;
+    // Able to run Controls::reuse_every: allocates the stored edit and the motion accumulator and turns the
+    // direct-sampling and direct-store paths off (a frame that skips the network has no post block to store
+    // the answer, so the answer must exist as an image). Needs the temporal path (TemporalConfig::enable).
+    // Off, the runtime is exactly what it was.
+    bool reuse = false;
 };
 
 // SDR encoded RGB, source-sized and upright. Accepts RGBA32F and 8-bit RGBA/BGRA
@@ -318,6 +334,8 @@ struct TemporalFrame {
 struct RecordResult {
     uint32_t network_dispatches{};
     bool applied{};
+    bool reused{};   // the answer came from the stored edit; the network did not run
+    bool reuse_gated{};   // reuse was asked for and the motion was too large: the network ran
     float effective_skin{}, effective_background{};
 
 };

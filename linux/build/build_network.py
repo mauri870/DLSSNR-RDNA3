@@ -29,7 +29,8 @@ from pathlib import Path
 R = Path(__file__).resolve().parents[2]
 # the runtime's own passes around the network (it runs the network only: the composition is RenoDX's stage's and the
 # wilsjo2 flow's): the alpha restore and the depth guide's copy
-RUNTIME = ['runtime_alpha', 'runtime_depth']
+RUNTIME = ['runtime_alpha', 'runtime_depth',
+           'runtime_reuse_store', 'runtime_reuse_motion', 'runtime_reuse_warp', 'runtime_reuse_stat']
 MOTION = ['motion_luma', 'motion_estimate']
 
 

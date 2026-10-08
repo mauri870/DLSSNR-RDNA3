@@ -382,6 +382,23 @@ struct Runtime::Impl {
     // (the native plan's padded one) and Model Resolution.
     std::vector<std::string> share_arguments;
     uint32_t work_w{}, work_h{};
+    // ---- temporal reuse (RuntimeConfig::reuse, Controls::reuse_every) -----------------------------------
+    //
+    // After a network frame: `reuse_edit` = answer - what the network was shown (RGBA16F, model extent).
+    // On a frame that skips the network: the motion since then is accumulated in `reuse_acc` (RG32F at the
+    // motion field's extent, uv units, two images because composition reads the previous one at other
+    // pixels), and the answer is rebuilt from this frame's own `tex_in` and the warped edit. One state
+    // per runtime: it belongs to the first feature that used it, others run the network as usual.
+    bool reuse{};
+    nrvk::Context::Image reuse_edit{}, reuse_acc[2]{};
+    nrvk::Kernel reuse_store, reuse_motion[2], reuse_warp[2], reuse_stat, reuse_stat_acc[2];
+    nrvk::Buffer reuse_stat_buffer{};   // host visible: the previous frames' mean motion, pixels of the model extent
+    uint64_t reuse_gate_trips{}, reuse_skipped{}, reuse_ran{};
+    bool reuse_have{};              // an edit is stored
+    uint32_t reuse_since{};         // frames that skipped the network since it ran
+    uint32_t reuse_acc_cur{};       // which accumulator holds the latest accumulation
+    uint64_t reuse_feature{};       // the feature that owns the stored edit
+    bool reuse_owned{};
     // The post block restores the frame's alpha (and the 8-bit rounding) in its
     // own store, so the alpha pass is skipped: native compose, one pass, no
     // Model Resolution - there the answer is the post block's output as it is.
@@ -1311,6 +1328,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         VkFormatProperties2 f2{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &f3};
         vkGetPhysicalDeviceFormatProperties2(host.physical, unorm, &f2);
         impl_->direct_out = NR_DIRECT_OUT && NR_POST_ALPHA && impl_->direct_in && store_matches_blit &&
+                            !config.reuse &&
                             mask_config.width == 0 &&
                             (f3.optimalTilingFeatures & VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT) &&
                             (f3.optimalTilingFeatures & VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT);
@@ -1644,6 +1662,35 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         NRVK_CHECK(vkAllocateMemory(host.device,&allocation,nullptr,&im.memory));
         NRVK_CHECK(vkBindImageMemory(host.device,im.handle,im.memory,0));
         s.ctx.transition(im,VK_IMAGE_LAYOUT_GENERAL);
+    }
+    if (config.reuse) {
+        if (!impl_->temporal.enabled || mask_config.width)
+            throw std::invalid_argument("temporal reuse needs the temporal path and no control mask");
+        auto& t = impl_->temporal;
+        impl_->reuse = true;
+        impl_->reuse_edit = s.ctx.image(mw, mh, VK_FORMAT_R16G16B16A16_SFLOAT, false);
+        s.ctx.transition(impl_->reuse_edit, VK_IMAGE_LAYOUT_GENERAL);
+        for (auto& a : impl_->reuse_acc) {
+            a = s.ctx.image(t.lw[0], t.lh[0], VK_FORMAT_R32G32_SFLOAT, false);
+            s.ctx.transition(a, VK_IMAGE_LAYOUT_GENERAL);
+        }
+        impl_->reuse_stat_buffer = s.ctx.buffer(16, true);
+        std::memset(impl_->reuse_stat_buffer.mapped, 0, 16);
+        impl_->reuse_stat.create(s.ctx, (adapters / "runtime_reuse_stat.spv").string(), {impl_->reuse_stat_buffer.handle}, 28,
+                                 {&t.flow[0]});
+        for (unsigned k = 0; k < 2; ++k)
+            impl_->reuse_stat_acc[k].create(s.ctx, (adapters / "runtime_reuse_stat.spv").string(),
+                                            {impl_->reuse_stat_buffer.handle}, 28, {&impl_->reuse_acc[k]});
+        impl_->reuse_store.create(s.ctx, (adapters / "runtime_reuse_store.spv").string(), {}, 8,
+                                  {&s.tex_in, &s.surf0, &impl_->reuse_edit});
+        for (unsigned k = 0; k < 2; ++k) {
+            // writes acc[k], composes onto acc[k ^ 1]
+            impl_->reuse_motion[k].create(s.ctx, (adapters / "runtime_reuse_motion.spv").string(), {}, 20,
+                                          {&t.flow[0], &impl_->reuse_acc[k ^ 1], &impl_->reuse_acc[k]});
+            impl_->reuse_warp[k].create(s.ctx, (adapters / "runtime_reuse_warp.spv").string(),
+                                        {impl_->reuse_stat_buffer.handle}, 24,
+                                        {&s.tex_in, &s.surf0, &impl_->reuse_edit, &impl_->reuse_acc[k]});
+        }
     }
     impl_->post_alpha = NR_POST_ALPHA && s.kern.count("fswinimagepost32");
     timer.mark("adapters");
@@ -2211,12 +2258,44 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                 tgt->after == VK_IMAGE_LAYOUT_PREINITIALIZED))
         throw std::invalid_argument("invalid NR target frame");
     const VkImage wb = tgt ? tgt->image : frame.image;
+    // Temporal reuse: does this frame take part, and does it skip the network? Decided once, here, from the
+    // controls and the stored state; everything below only reads `reuse_frame` and `reuse_skip`.
+    bool reuse_frame = impl_->reuse && engine && temporal && c.reuse_every >= 2 && c.apply_model && passes == 1 &&
+                       !mask;
+    if (reuse_frame) {
+        if (!impl_->reuse_owned) { impl_->reuse_owned = true; impl_->reuse_feature = temporal->feature; }
+        else if (impl_->reuse_feature != temporal->feature) reuse_frame = false;
+    }
+    bool reuse_skip = false;
+    if (reuse_frame) {
+        reuse_skip = impl_->reuse_have && !temporal->reset && impl_->reuse_since + 1 < uint32_t(c.reuse_every);
+        if (reuse_skip) {
+            // The motion of the previous frames, as the last finished stat dispatch left it, carried for as
+            // many frames as the edit would have to be.
+            const float moved = *static_cast<const volatile float*>(impl_->reuse_stat_buffer.mapped);
+            const float limit = c.reuse_gate * float(impl_->mw) / 1920.0f;
+            if (!(moved * float(impl_->reuse_since + 1) <= limit)) {   // also true of NaN
+                reuse_skip = false;
+                info.reuse_gated = true;
+                ++impl_->reuse_gate_trips;
+            }
+        }
+        if (!impl_->reuse_have || temporal->reset) impl_->reuse_since = 0;
+    } else if (impl_->reuse && (!temporal || !impl_->reuse_owned || impl_->reuse_feature == temporal->feature)) {
+        // Reuse is not in use by the feature that owns the stored edit (or by a frame that has no feature):
+        // the edit goes stale as soon as a frame is answered another way.
+        impl_->reuse_have = false;
+        impl_->reuse_since = 0;
+    }
+    // The network frame after skipped ones has no usable history: its predecessor in the history image is
+    // the last network frame, several frames of motion back.
+    const bool reuse_after_skip = reuse_frame && !reuse_skip && impl_->reuse_since > 0;
     // The caller's colour (and depth) sampled in place, when this frame allows
     // it: see Impl::DirectSrc. Null means the copies below, as always.
     const Impl::DirectSrc* ds = nullptr;
     // post_alpha: no alpha pass - after the network only the write-back touches the frame.
     const bool colour_direct =
-        NR_DIRECT_SAMPLE && !impl_->direct_src_failed && impl_->post_alpha && engine &&
+        NR_DIRECT_SAMPLE && !impl_->reuse && !impl_->direct_src_failed && impl_->post_alpha && engine &&
         temporal && !mask && passes == 1 &&
         impl_->temporal.pingpong && impl_->transfer != Transfer::Encoded &&
         (frame.usage & VK_IMAGE_USAGE_SAMPLED_BIT) && frame.width == nw && frame.height == nh;
@@ -2234,7 +2313,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     // linearly filterable format, whatever the pass count (every pass reads the
     // frame's vectors), as NVIDIA's DLL reads them.
     const bool motion_direct =
-        NR_DIRECT_MOTION && !impl_->motion_src_failed && engine && temporal && !mask && engine->motion.image &&
+        NR_DIRECT_MOTION && !impl_->reuse && !impl_->motion_src_failed && engine && temporal && !mask && engine->motion.image &&
         (engine->motion.usage & VK_IMAGE_USAGE_SAMPLED_BIT) && impl_->filters_linearly(engine->motion.format);
     // (research NR_DIRECT_STORE=1): the post block stores into the frame itself.
     // With a separate target (storage-capable) the post block stores into it and the
@@ -2250,7 +2329,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     // the plain path (no temporal, no engine frame) samples the caller's colour in place
     // too - the input copy goes. Research switch NR_PLAIN_DIRECT=0 turns it off.
     static const bool plain_env = !(std::getenv("NR_PLAIN_DIRECT") && !std::atoi(std::getenv("NR_PLAIN_DIRECT")));
-    const bool plain_direct = plain_env && !temporal && !engine && !mask && passes == 1 && impl_->plain_pre &&
+    const bool plain_direct = plain_env && !impl_->reuse && !temporal && !engine && !mask && passes == 1 && impl_->plain_pre &&
         impl_->plain_post && !impl_->direct_src_failed && impl_->post_alpha &&
         impl_->transfer != Transfer::Encoded && (frame.usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
         frame.width == nw && frame.height == nh;
@@ -2368,7 +2447,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         // all.
         Impl::InputDomain& previous = fs ? fs->input : impl_->input_single;
         const bool domain_changed = !(input == previous);
-        gate = (fs ? fs->latch : t.latch) && !temporal->reset && !domain_changed;
+        gate = (fs ? fs->latch : t.latch) && !temporal->reset && !domain_changed && !reuse_after_skip;
         previous = input;
         // The pre block's noise seed, the DLL's rule: a counter in the pre node
         // (+0xc8) handed to the kernel and then incremented (0x180060f44), zeroed
@@ -2582,7 +2661,34 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         impl_->bound_feature = temporal->feature;
     }
     // The pass (one: a caller stacks passes as runs of its own).
-    for (uint32_t pass = 0; pass < passes; ++pass) {
+    if (reuse_frame) {
+        struct { uint32_t w, h; float sx, sy, px, py; uint32_t word; } sp{t.lw[0], t.lh[0], engine->motion_scale_x,
+                                                                         engine->motion_scale_y, float(nw), float(nh), 0u};
+        dispatch(cmd, impl_->reuse_stat, 1, 1, 1, &sp, sizeof sp);
+        compute_barrier(cmd);
+        reuse_skip ? ++impl_->reuse_skipped : ++impl_->reuse_ran;
+    }
+    if (reuse_skip) {
+        // No network. The answer is this frame's own input plus the stored edit carried by the motion since.
+        const bool first = impl_->reuse_since == 0;
+        const uint32_t next = first ? 0u : impl_->reuse_acc_cur ^ 1u;
+        struct { uint32_t w, h; float sx, sy; uint32_t first; } mp{t.lw[0], t.lh[0], engine->motion_scale_x,
+                                                                  engine->motion_scale_y, first ? 1u : 0u};
+        dispatch(cmd, impl_->reuse_motion[next], (t.lw[0] + 7) / 8, (t.lh[0] + 7) / 8, 1, &mp, sizeof mp);
+        compute_barrier(cmd);
+        // the accumulated motion's mean length, for the fade
+        struct { uint32_t w, h; float sx, sy, px, py; uint32_t word; } ap{t.lw[0], t.lh[0], 1.0f, 1.0f, float(nw), float(nh), 1u};
+        dispatch(cmd, impl_->reuse_stat_acc[next], 1, 1, 1, &ap, sizeof ap);
+        compute_barrier(cmd);
+        struct { uint32_t w, h, mw, mh, round_u8; float limit; } wp{nw, nh, t.lw[0], t.lh[0], uint32_t(impl_->round_u8),
+                                                                   c.reuse_gate * float(nw) / 1920.0f};
+        dispatch(cmd, impl_->reuse_warp[next], (nw + 7) / 8, (nh + 7) / 8, 1, &wp, sizeof wp);
+        compute_barrier(cmd);
+        impl_->reuse_acc_cur = next;
+        ++impl_->reuse_since;
+        info.reused = true;
+    }
+    for (uint32_t pass = 0; pass < (reuse_skip ? 0u : passes); ++pass) {
         ColourFrame shot_in{}, shot_out{};
         const bool snapshot = c.model_capture && pass + 1 == passes;
         if (snapshot) {
@@ -2656,13 +2762,21 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         if (c.network_timestamp) c.network_timestamp(cmd, false);
         if (snapshot) c.model_capture(cmd, shot_in, shot_out, true);
     }
+    if (reuse_frame && !reuse_skip) {
+        // Keep this network frame's edit for the frames that skip it.
+        struct { uint32_t w, h; } sp{nw, nh};
+        dispatch(cmd, impl_->reuse_store, (nw + 7) / 8, (nh + 7) / 8, 1, &sp, sizeof sp);
+        compute_barrier(cmd);
+        impl_->reuse_have = true;
+        impl_->reuse_since = 0;
+    }
     if (temporal) {
         // The latch is set after every recorded frame and `reset` never clears
         // it: reset suppresses consumption, it does not un-write the buffer.
         if (fs) { fs->latch = true; fs->parity ^= 1u; }
         else { t.latch = true; t.parity ^= 1u; }
         // The post variant wrote this frame's history into the other image.
-        if (t.pingpong) t.hcur ^= 1u;
+        if (t.pingpong && !reuse_skip) t.hcur ^= 1u;
         if (history_consumed) *history_consumed = gate;
     }
     impl_->check_record(cmd);
@@ -2674,7 +2788,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         s.ctx.destroy(impl_->retiring[i].first);
         impl_->retiring.erase(impl_->retiring.begin() + long(i));
     }
-    info.network_dispatches = uint32_t(s.steps.size()) * passes;
+    info.network_dispatches = reuse_skip ? 0u : uint32_t(s.steps.size()) * passes;
     if (c.apply_model) {
         if (mask) {
             struct { uint32_t w,h;float intensity; } push{frame.width,frame.height,c.intensity};
