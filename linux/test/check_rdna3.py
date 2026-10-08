@@ -10,8 +10,9 @@ linux/test/sweep_defines.py times a few pipelines rebuilt with other defines, wi
 
 What it runs, on the first discrete GPU:
   1. the e4m3 quantiser and decoder of linux/shaders/rdna3 against the host's reference over every f16
-     input, and the f32 and packed-f16 rounding forms against the bit-level rounding over every f32 bit
-     pattern and every pair of f16 patterns (4 billion each);
+     input, the f32 and packed-f16 rounding forms against the bit-level rounding over every f32 bit
+     pattern and every pair of f16 patterns (4 billion each), and the lane halves the WMMA reads its
+     operands from (wmma_half_probe), which the operand layout of the kernels depends on;
   2. the three single frames of docs/ngx-verification (1080p, 1440p, 4K) through nr::Runtime, each twice
      (a result that changes from run to run is a race, not a result);
   3. every activation value of the 1080p network, hashed (`nr_graph --value-stats`), which names the first
@@ -108,7 +109,8 @@ def build(model):
     run(cxx + ["linux/src/core/nr_graph.cpp", "-o", str(BUILD / "nr_graph"), "-lvulkan"])
     run(cxx + ["linux/test/e4m3_emul_test.cpp", "-o", str(BUILD / "e4m3_emul_test"), "-lvulkan"])
     run(cxx + ["linux/test/e4m3_round_test.cpp", "-o", str(BUILD / "e4m3_round_test"), "-lvulkan"])
-    for test in ("e4m3_emul_test", "e4m3_round_test"):
+    run(cxx + ["linux/test/wmma_half_probe.cpp", "-o", str(BUILD / "wmma_half_probe"), "-lvulkan"])
+    for test in ("e4m3_emul_test", "e4m3_round_test", "wmma_half_probe"):
         run([str(glslang), "-V", "--target-env", "vulkan1.3", "-Ilinux/shaders/rdna3/include",
              f"linux/test/{test}.comp", "-o", str(BUILD / f"{test}.spv")])
     inst = BUILD / "inst" / "dlssnr-amd"
@@ -121,7 +123,7 @@ def build(model):
 # ---- the checks ----------------------------------------------------------------------------------
 def check_quantiser():
     ok = True
-    for test in ("e4m3_emul_test", "e4m3_round_test"):
+    for test in ("e4m3_emul_test", "e4m3_round_test", "wmma_half_probe"):
         r = subprocess.run([str(BUILD / test), str(BUILD / f"{test}.spv")], capture_output=True, text=True)
         print(r.stdout.strip() + ("" if r.returncode == 0 else "   FAIL"))
         ok = ok and r.returncode == 0

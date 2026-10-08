@@ -972,7 +972,17 @@
     NR_OPA wpe[NR_WPF_SLOTS];
     NR_WPF_PRIME(wpe, NR_WPF_E_TOT, NR_WPF_E_ADDR)
 #endif
-    for (int h = 0; h < NR_HF; ++h) {
+    // NR_EXPAND_HLOOP keeps the loop over the hidden fragments rolled. NIR left it rolled on
+    // its own until NR_OP_KSWAP made the operand builds smaller; unrolled, the C=32 kernels
+    // go from 216 to 240 VGPRs, one wave a SIMD fewer, and the smaller exchange is lost.
+#ifndef NR_EXPAND_HLOOP
+#if NR_STREAM_C32 && NR_OP_KSWAP
+#define NR_EXPAND_HLOOP [[dont_unroll]]
+#else
+#define NR_EXPAND_HLOOP
+#endif
+#endif
+    NR_EXPAND_HLOOP for (int h = 0; h < NR_HF; ++h) {
         NR_ACCF a[NR_MF];
         for (int m = 0; m < NR_MF; ++m) a[m] = NR_ACCZERO;
         for (int k = 0; k < NR_CF; ++k) {
@@ -1087,7 +1097,7 @@
     // that reads it; see `yqr` there.
 #define NR_Y(m, n, c) float(NR_OPK(yqr[m], c))
 #else
-#define NR_Y(m, n, c) float(NR_OPK(NR_YQ(m, n), c))
+#define NR_Y(m, n, c) float(NR_OPK_R(NR_YQ(m, n), c))
 #endif
 #else
     NR_FRAG_ACC16 yh[NR_MF][NR_CF];     // ... and the wide one, for the skip
@@ -1277,7 +1287,7 @@
                 NR_QPAIR_T q=NR_QP_YQ(f16vec2(requantized[c],requantized[c+1]));
                 NR_YQPUT(m, n, c, q)
 #if NR_V_SWAP && !NR_HWAVES
-                NR_OPPUT(yqa[m][NR_YN], c, q)
+                NR_OPPUT_X(yqa[m][NR_YN], c, q)   // an A operand against a weight tile read as B
 #endif
             }
         }
@@ -1875,7 +1885,20 @@
                 // being [dim][token]. V wants [dim][token], which is the
                 // accumulator's own orientation - a plain RowMajor store.
 #if !NR_K_REGS
+#if NR_KV_LDS_SWAP
+                // The same store component by component, with the dims of the odd tokens (the
+                // rows the upper lane half reads as the logits' A operand) pair-swapped, so K
+                // agrees with the k-pair-swapped Q^T of NR_OPPUT. Component c is (dim 2c + h,
+                // token lane % 16); 2c has no bit 0, so the XOR is a per-lane constant on the
+                // lane's base address and the component offset stays an immediate.
+                {
+                    const uint nr_kb = NR_WKB (t0 + (lane & 15u)) * uint(NR_HD) + uint(d) * 16u
+                                       + ((lane >> 4u) ^ (lane & 1u));
+                    for (int c = 0; c < 8; ++c) lds_k[nr_kb + 2u * uint(c)] = kf[c];
+                }
+#else
                 NR_STORE_ACC_COL(kf, lds_k, NR_WKB t0 * uint(NR_HD) + uint(d) * 16u, uint(NR_HD));
+#endif
 #endif
                 NR_PV_STAGE_FRAG vf;
 #if NR_QBATCH_ON
@@ -1907,7 +1930,18 @@
                 NR_STORE_ACC_COL(vf, lds_y, NR_LXB_
                                  uint(m * NR_CF + hh * NR_DF + d) * 256u, 16u);
 #elif NR_V_SWAP && !NR_V_REGS
+#if NR_KV_LDS_SWAP
+                // V^T is the context product's A operand: the odd dims (its upper-half rows)
+                // take their tokens pair-swapped to agree with the k-pair-swapped P^T. The
+                // accumulator is [token][dim] here: component c is (token 2c + h, dim lane % 16).
+                {
+                    const uint nr_vb = NR_WKB NR_V_LDS_OFFSET + (uint(d) * 16u + (lane & 15u)) * uint(NR_WIN) + t0
+                                       + ((lane >> 4u) ^ (lane & 1u));
+                    for (int c = 0; c < 8; ++c) lds_v[nr_vb + 2u * uint(c)] = vf[c];
+                }
+#else
                 NR_STORE_ACC_COL(vf, lds_v, NR_WKB NR_V_LDS_OFFSET + uint(d) * 16u * uint(NR_WIN) + t0, uint(NR_WIN));
+#endif
 #elif !NR_V_SWAP
                 NR_STORE_ACC(vf, lds_v, NR_WKB NR_V_LDS_OFFSET + uint(d) * 16u * uint(NR_WIN) + t0, uint(NR_WIN));
 #endif

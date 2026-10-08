@@ -1905,7 +1905,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     // `linux/build/build_network.py` from the same table that produces the
     // `-D`s, and a directory without it is refused rather than guessed at.
     uint32_t qkv_fused_norm = 0, ups_fused_mode = 0, wide_ups_fused_mode = 0;
-    uint32_t weight_layout = 0;
+    uint32_t weight_layout = 0, kswap = 0;
     math_profile = 0;
     {
         const std::string path = spv_dir + "/shader-constants.txt";
@@ -1992,6 +1992,14 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         if (!built.count("ffwd_fm2_min")) built["ffwd_fm2_min"] = 0;
         if (!built.count("post_alpha")) built["post_alpha"] = 0;
         if (!built.count("tchain")) built["tchain"] = 0;
+        // `kswap` (RDNA3, NR_OP_KSWAP in fswin_t.comp): the fused Swin kernels build operands from
+        // accumulators with every k pair swapped in the upper lane half, and the weight tiles they
+        // multiply those operands by have to be stored the same way; see the repack below.
+        if (!built.count("kswap")) built["kswap"] = 0;
+        if (built.at("kswap") && !NR_ARCH_RDNA3) {
+            std::fprintf(stderr, "kswap shaders need the RDNA3 host\n"); return 1;
+        }
+        kswap = built.at("kswap");
         if (!built.count("ffwd_gmajor")) built["ffwd_gmajor"] = 0;
         if (!built.count("gemm_remap")) built["gemm_remap"] = 0;
         for (const auto& [name, mine] : want) {
@@ -3948,6 +3956,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         // Layout 2 extends layout 1 with the three grouped FFWD matrices.
         const bool pack_ffwd = weight_layout >= 2;
         std::set<uint32_t> packed_attn;   // an attention matrix is packed once even if two dispatches share it
+        std::set<uint32_t> kswapped; size_t kswap_count=0;
         for(const auto& pd:disp) {
             if(pack_ffwd && (pd.kern=="ffwd3" || pd.kern=="ffwd3w" || pd.kern=="ffwd3q")) {
                 PushFfwd3 p{};
@@ -3985,8 +3994,56 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 continue;
             }
             uint32_t C=0;
-            // RDNA3: the fused Swin kernels read plain tile-blocked [row][k] tiles.
-            if(NR_ARCH_RDNA3 && pd.kern.rfind("fswin",0)==0) continue;
+            // RDNA3: the fused Swin kernels read plain tile-blocked [row][k] tiles. With `kswap`
+            // (NR_OP_KSWAP in fswin_t.comp, measured in linux/test/wmma_half_probe) the WMMA computes
+            // the odd rows of a 16x16 tile from the upper lane half, whose register-built operands
+            // hold every k pair swapped, so the odd rows of the weight tiles that multiply such an
+            // operand are stored with their k pairs swapped too. Which tiles those are is a property
+            // of each kernel: a tile against an operand loaded from LDS or the arena stays plain.
+            // The swap is a permutation of the tile's bytes; the products are the same products.
+            if(NR_ARCH_RDNA3 && pd.kern.rfind("fswin",0)==0) {
+                if(!kswap) continue;
+                // diagnostic (wrong picture): NR_KSWAP_DIAG=0 leaves the weights plain, to time the data alone.
+                if(std::getenv("NR_KSWAP_DIAG") && !std::atoi(std::getenv("NR_KSWAP_DIAG"))) continue;
+                PushFSwin p{};
+                if(pd.push.size()<sizeof p) throw std::runtime_error("kswap: Swin push mismatch");
+                std::memcpy(&p,pd.push.data(),sizeof p);
+                auto swap_odd_rows=[&](uint32_t offset,size_t rows,size_t K) {
+                    if(!kswapped.insert(offset).second) return;   // the same tile from two dispatches
+                    const size_t bytes=rows*K;
+                    if(rows%16 || K%16 || size_t(offset)+bytes>wblob.size())
+                        throw std::runtime_error("kswap: weight matrix bounds");
+                    uint8_t* t=wblob.data()+offset;
+                    for(size_t tile=0;tile<bytes/256;++tile)
+                        for(size_t r=1;r<16;r+=2) for(size_t k=0;k<16;k+=2)
+                            std::swap(t[tile*256+r*16+k],t[tile*256+r*16+k+1]);
+                    ++kswap_count;
+                };
+                const std::string& k=pd.kern;
+                if(k.size()>=2 && k.compare(k.size()-2,2,"32")==0) {
+                    // The one-head body: x is a register operand only where the kernel reads an
+                    // f16 image or blend (NR_INPUT_F16); the hidden activations, y against the Q
+                    // and K rows, and the context are register operands in every C=32 kernel. V
+                    // is X . Wv^T with the weight tile as the B operand (NR_V_SWAP): plain.
+                    if(k=="fswinimagepreds32" || k=="fswinimagepost32" || k=="fswinfusedup32")
+                        swap_odd_rows(p.e_off,128,32);
+                    else if(k!="fswin32" && k!="fswinds32" && k!="fswindsp32")
+                        throw std::runtime_error("kswap: unknown C=32 Swin kernel "+k);
+                    swap_odd_rows(p.ct_off,32,128);
+                    swap_odd_rows(p.qkv_off,64,32);
+                    swap_odd_rows(p.op_off,32,32);
+                } else {
+                    // The head-split body (C >= 64): every operand but the middle's comes from LDS.
+                    for(uint32_t c:{64u,128u,256u}) {
+                        const std::string suffix=std::to_string(c);
+                        if(k.size()>=suffix.size() && k.compare(k.size()-suffix.size(),suffix.size(),suffix)==0) C=c;
+                    }
+                    if(!C) throw std::runtime_error("kswap: unknown Swin kernel "+k);
+                    swap_odd_rows(p.mid_off,C,128);
+                    C=0;
+                }
+                continue;
+            }
             if((weight_layout==3 || weight_layout==5) && pd.kern.rfind("fswin",0)==0 &&
                pd.kern.size()>=2 && pd.kern.substr(pd.kern.size()-2)=="32") {
                 PushFSwin p{};
@@ -4016,6 +4073,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             pack_matrix(p.op_off,C,C);
         }
         std::printf("N-pair FP8 weight layout: %zu matrices\n",packed_count);
+        if(kswap) std::printf("k-pair swap (kswap): odd rows of %zu Swin weight matrices\n",kswap_count);
     }
 
     //
