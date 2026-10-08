@@ -1,0 +1,57 @@
+#version 460
+// Temporal reuse, step 3: the answer of a frame that skipped the network. What the network would have been
+// shown this frame (already in `shown`: the same copy, downscale and encoding as a network frame) plus the
+// stored edit, looked up where the accumulated motion says this pixel was when the edit was made. Where
+// that lies outside the frame the edit is zero: the frame itself, which scores better than a wrong edit.
+// The answer is rounded to 8 bits like the post block's when the frame is, and carries the frame's alpha.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) buffer Stat { float mean_pixels[]; };     // word 1: the accumulated motion's mean length
+layout(set = 0, binding = 1) uniform sampler2D shown;
+layout(set = 0, binding = 2, rgba32f) uniform writeonly image2D answer;
+layout(set = 0, binding = 3, rgba16f) uniform readonly image2D edit;
+layout(set = 0, binding = 4, rg32f) uniform readonly image2D motion;   // accumulated, uv units
+layout(push_constant) uniform Push {
+    uint width, height;          // the model's extent: `shown`, `answer`, `edit`
+    uint motion_width, motion_height;
+    uint round_u8;
+    float limit;                 // pixels the picture may have moved for the whole edit to be trusted; 0: no fade
+} pc;
+
+vec3 edit_clamped(ivec2 p) {
+    return imageLoad(edit, clamp(p, ivec2(0), ivec2(pc.width, pc.height) - 1)).rgb;
+}
+
+vec2 motion_clamped(ivec2 p) {
+    return imageLoad(motion, clamp(p, ivec2(0), ivec2(pc.motion_width, pc.motion_height) - 1)).xy;
+}
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(pc.width) || p.y >= int(pc.height)) return;
+    const vec2 size = vec2(pc.width, pc.height);
+    const vec2 uv = (vec2(p) + 0.5) / size;
+
+    // the accumulated motion, bilinear on its (coarser) texel centres
+    const vec2 mq = uv * vec2(pc.motion_width, pc.motion_height) - 0.5;
+    const vec2 mf0 = floor(mq), mf = mq - mf0;
+    const ivec2 mi = ivec2(mf0);
+    const vec2 m = mix(mix(motion_clamped(mi), motion_clamped(mi + ivec2(1, 0)), mf.x),
+                       mix(motion_clamped(mi + ivec2(0, 1)), motion_clamped(mi + ivec2(1, 1)), mf.x), mf.y);
+
+    const vec2 source = uv + m;
+    vec3 e = vec3(0.0);
+    if (all(greaterThanEqual(source, vec2(0.0))) && all(lessThanEqual(source, vec2(1.0)))) {
+        const vec2 q = source * size - 0.5;
+        const vec2 f0 = floor(q), f = q - f0;
+        const ivec2 i = ivec2(f0);
+        e = mix(mix(edit_clamped(i), edit_clamped(i + ivec2(1, 0)), f.x),
+                mix(edit_clamped(i + ivec2(0, 1)), edit_clamped(i + ivec2(1, 1)), f.x), f.y);
+    }
+    // Past the limit the edit fades out, linearly to nothing at twice the limit: a global measure of how far
+    // the warp can be believed, which is what the host's gate predicts and this frame's own motion confirms.
+    if (pc.limit > 0.0) e *= clamp(2.0 - mean_pixels[1] / pc.limit, 0.0, 1.0);
+    const vec4 s = texelFetch(shown, p, 0);
+    vec3 o = s.rgb + e;
+    if (pc.round_u8 != 0u) o = round(clamp(o, 0.0, 1.0) * 255.0) / 255.0;
+    imageStore(answer, p, vec4(o, s.a));
+}

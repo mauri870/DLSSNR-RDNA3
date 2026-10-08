@@ -24,7 +24,8 @@ from pathlib import Path
 
 R = Path(__file__).resolve().parents[2]
 RUNTIME = ['runtime_alpha', 'runtime_encode', 'runtime_transfer', 'runtime_upscale', 'runtime_prep', 'runtime_depth', 'cascade_lograt', 'cascade_blur', 'cascade_feed',
-           'runtime_downscale', 'runtime_taps']
+           'runtime_downscale', 'runtime_taps',
+           'runtime_reuse_store', 'runtime_reuse_motion', 'runtime_reuse_warp', 'runtime_reuse_stat']
 # runtime passes built from another pass's source with defines: name -> (source, defines)
 RUNTIME_VARIANTS = {'runtime_transfer_store': ('runtime_transfer', ['NR_STORE_NATIVE'])}
 MOTION = ['motion_luma', 'motion_estimate']

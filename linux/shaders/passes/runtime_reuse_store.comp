@@ -1,0 +1,15 @@
+#version 460
+// Temporal reuse, step 1: after the network ran, keep its edit - the answer minus what the network was
+// shown, both in the frame's own values at the model's extent - so the frames that skip the network can
+// carry it forward (runtime_reuse_warp.comp).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D shown;                          // what the network saw
+layout(set = 0, binding = 1, rgba32f) uniform readonly image2D answer;         // the network's answer
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D edit;          // answer - shown
+layout(push_constant) uniform Push { uint width, height; } pc;
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(pc.width) || p.y >= int(pc.height)) return;
+    imageStore(edit, p, vec4(imageLoad(answer, p).rgb - texelFetch(shown, p, 0).rgb, 0.0));
+}
