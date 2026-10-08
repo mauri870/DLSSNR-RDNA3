@@ -393,6 +393,7 @@ struct Runtime::Impl {
     nrvk::Kernel reuse_store, reuse_motion[2], reuse_warp[2], reuse_stat, reuse_stat_acc[2];
     nrvk::Buffer reuse_stat_buffer{};   // host visible: the previous frames' mean motion, pixels of the model extent
     uint64_t reuse_gate_trips{}, reuse_skipped{}, reuse_ran{};
+    double reuse_motion_sum{}; uint64_t reuse_motion_samples{}; float reuse_motion_peak{};
     bool reuse_have{};              // an edit is stored
     uint32_t reuse_since{};         // frames that skipped the network since it ran
     uint32_t reuse_acc_cur{};       // which accumulator holds the latest accumulation
@@ -2041,7 +2042,8 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     const VkImage wb = tgt ? tgt->image : frame.image;
     // Temporal reuse: does this frame take part, and does it skip the network? Decided once, here, from the
     // controls and the stored state; everything below only reads `reuse_frame` and `reuse_skip`.
-    bool reuse_frame = impl_->reuse && engine && temporal && c.reuse_every >= 2 && c.apply_model && passes == 1 &&
+    // The motion is the engine's, or the fallback estimator's when the game provides none (record_temporal).
+    bool reuse_frame = impl_->reuse && temporal && c.reuse_every >= 2 && c.apply_model && passes == 1 &&
                        !mask && !(impl_->prep && c.preprocess.active());
     if (reuse_frame) {
         if (!impl_->reuse_owned) { impl_->reuse_owned = true; impl_->reuse_feature = temporal->feature; }
@@ -2050,10 +2052,15 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     bool reuse_skip = false;
     if (reuse_frame) {
         reuse_skip = impl_->reuse_have && !temporal->reset && impl_->reuse_since + 1 < uint32_t(c.reuse_every);
+        // The motion of the previous frames, as the last finished stat dispatch left it, carried for as many
+        // frames as the edit would have to be.
+        const float moved = *static_cast<const volatile float*>(impl_->reuse_stat_buffer.mapped);
+        if (moved == moved && moved >= 0.0f) {
+            const float per1080 = moved * 1920.0f / float(impl_->mw);
+            impl_->reuse_motion_sum += per1080; ++impl_->reuse_motion_samples;
+            impl_->reuse_motion_peak = std::max(impl_->reuse_motion_peak, per1080);
+        }
         if (reuse_skip) {
-            // The motion of the previous frames, as the last finished stat dispatch left it, carried for as
-            // many frames as the edit would have to be.
-            const float moved = *static_cast<const volatile float*>(impl_->reuse_stat_buffer.mapped);
             const float limit = c.reuse_gate * float(impl_->mw) / 1920.0f;
             if (!(moved * float(impl_->reuse_since + 1) <= limit)) {   // also true of NaN
                 reuse_skip = false;
@@ -2334,14 +2341,16 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         }
         fs = &it->second;
     }
-    bool gate = false;
+    bool gate = false, flow_open = false;
     uint32_t pre_seed = 0;
     if (temporal) {
         // The original's gate, all three terms, resolved here and nowhere else:
         // the first-frame latch, DLSSNR.Reset, and a motion source existing at
         // all.
         uint32_t& gen = fs ? fs->prep_gen : impl_->prep_gen_single;
-        gate = (fs ? fs->latch : t.latch) && !temporal->reset && gen == impl_->prep_gen && !reuse_after_skip;
+        const bool history_open = (fs ? fs->latch : t.latch) && !temporal->reset && gen == impl_->prep_gen;
+        gate = history_open && !reuse_after_skip;
+        flow_open = history_open;
         gen = impl_->prep_gen;
         // The pre block's noise seed, the DLL's rule: a counter in the pre node
         // (+0xc8) handed to the kernel and then incremented (0x180060f44), zeroed
@@ -2461,7 +2470,9 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
             dispatch(cmd, t.luma_kernel[p][k], (t.lw[k]+7)/8, (t.lh[k]+7)/8, 1, &lp, sizeof lp);
             compute_barrier(cmd);
         }
-        if (gate && !engine) {
+        // The estimator's flow also runs on the network frame after skipped ones, whose history gate is closed:
+        // the motion of that frame is what the gate reads next.
+        if (flow_open && !engine) {
             for (int k = int(kTemporalLevels) - 1; k >= 0; --k) {
                 const bool first = unsigned(k) == kTemporalLevels - 1, last = k == 0;
                 Temporal::FlowPush fp{t.lw[k], t.lh[k],
@@ -2537,8 +2548,8 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     // the model's write (surf1) copied back after it. With one pass the
     // history round trip is the single copy it always was.
     if (reuse_frame) {
-        struct { uint32_t w, h; float sx, sy, px, py; uint32_t word; } sp{t.lw[0], t.lh[0], engine->motion_scale_x,
-                                                                         engine->motion_scale_y, float(nw), float(nh), 0u};
+        struct { uint32_t w, h; float sx, sy, px, py; uint32_t word; } sp{t.lw[0], t.lh[0], engine ? engine->motion_scale_x : 1.0f,
+                                                                         engine ? engine->motion_scale_y : 1.0f, float(nw), float(nh), 0u};
         dispatch(cmd, impl_->reuse_stat, 1, 1, 1, &sp, sizeof sp);
         compute_barrier(cmd);
         reuse_skip ? ++impl_->reuse_skipped : ++impl_->reuse_ran;
@@ -2547,8 +2558,8 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         // No network. The answer is this frame's own input plus the stored edit carried by the motion since.
         const bool first = impl_->reuse_since == 0;
         const uint32_t next = first ? 0u : impl_->reuse_acc_cur ^ 1u;
-        struct { uint32_t w, h; float sx, sy; uint32_t first; } mp{t.lw[0], t.lh[0], engine->motion_scale_x,
-                                                                  engine->motion_scale_y, first ? 1u : 0u};
+        struct { uint32_t w, h; float sx, sy; uint32_t first; } mp{t.lw[0], t.lh[0], engine ? engine->motion_scale_x : 1.0f,
+                                                                  engine ? engine->motion_scale_y : 1.0f, first ? 1u : 0u};
         dispatch(cmd, impl_->reuse_motion[next], (t.lw[0] + 7) / 8, (t.lh[0] + 7) / 8, 1, &mp, sizeof mp);
         compute_barrier(cmd);
         // the accumulated motion's mean length, for the fade
@@ -2866,6 +2877,13 @@ void set_input_check(bool on, const std::string& folder, int pictures) {
                      folder.empty() ? "(none)" : folder.c_str());
 }
 
+bool Runtime::reuse_allowed() const { return impl_->reuse; }
+Runtime::ReuseCounts Runtime::reuse_counts() {
+    const ReuseCounts n{impl_->reuse_ran, impl_->reuse_skipped, impl_->reuse_gate_trips, impl_->reuse_motion_sum,
+                        impl_->reuse_motion_samples, impl_->reuse_motion_peak};
+    impl_->reuse_motion_sum = 0; impl_->reuse_motion_samples = 0; impl_->reuse_motion_peak = 0;
+    return n;
+}
 float Runtime::last_gpu_ms() const { return impl_->gpu_ms; }
 float Runtime::average_gpu_ms() const { return impl_->gpu_ms_avg; }
 float Runtime::average_network_ms() const { return impl_->split_timing ? impl_->net_ms_avg : 0.0f; }
