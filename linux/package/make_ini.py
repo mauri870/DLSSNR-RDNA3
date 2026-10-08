@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Default dlssnr-amd.ini files for the installer, written with the exact text the code writes (the format strings are
 read out of src/pe/nr_pe_config.cpp, so the two cannot drift): <out>/dlssnr-amd-optiscaler.ini ([Network], [Int4Mixed],
-[Preprocess], [RenoDX] and [Log], what the OptiScaler route reads), <out>/dlssnr-amd-optiscaler-renodx.ini (the same
+[Preprocess], [RenoDX], [Log] and [Reuse], what the OptiScaler route reads), <out>/dlssnr-amd-optiscaler-renodx.ini (the same
 with [RenoDX] Enabled = 1) and <out>/dlssnr-amd-addon.ini (the ReShade add-on's whole file).
 usage: make_ini.py <nr_pe_config.cpp> <out dir> [--int4]   (--int4: with [Int4Mixed], for an install with int4 mixed)"""
 import re, sys
@@ -32,20 +32,21 @@ network = formats(body_of("void write_network("))[0] % ("original" if perf else 
 prep = formats(body_of("void write_preprocess("))[0]
 rdx = formats(body_of("void write_renodx("))[0]
 logsec = formats(body_of("void write_log("))[0] % (1, 1)
+reusesec = formats(body_of("void write_reuse("))[0] % (0, 40.0)   # the OptiScaler route's own section
 save = formats(body_of("void Config::save("))
 assert prep and len(save) == 8, len(save)   # [DlssNr], six Pass<N> lines (none by default), own keys
 
 # defaults (nr_runtime.hpp Controls / Preprocess, nr_pe_config.hpp Config / PreprocessConfig)
 int4mixed = perf % (1, "Ctrl+F11", 0, 1) if perf else ""   # chosen at install: on
 preprocess = prep % (0, "auto", 0.0, "filmic", 1.0, 1.0, "Ctrl+F10", 1)
-dlssnr = save[0] % ("true", "true", 1, "false", 1.0, 0, 1.0, 1.0, 1.0, -1.0, "true", 1.0, 1.0, 2.0, 0, "catmullrom")
+dlssnr = save[0] % ("true", "true", 1, "false", 1.0, 0, 1.0, 1.0, 1.0, -1.0, "true", 1.0, 1.0, 2.0, 0, "catmullrom", 0, 40.0)
 own = save[-1] % (1.0, 1.0, "false")
 # nr_renodx.hpp Settings: RenoDX's defaults
 renodx_values = (1, 'F6', 0, 1.0, 0, 1.0, 1.0, -1.0, 0, 1, 1, 0, 1, 1.0, 1.0, 1.0, 1, 0, 1.0, 1.0, -1.0, 0, 1.0, 1.0, 1.0, 1, 0, 1.0, 1.0, -1.0, 0, 1.0, 1.0, 1.0, 1, 0, 1.0, 1.0, -1.0, 0, 1.0, 1.0, 1.0, 0, 0.0, 0, 1.0, 0, 0, 0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0, 60.0, 0, 0, 0, 2, 1, 0, 0.0, 4.0, 2.5375, 203.0, 1.0, 0, 0, 0.0, 0, 2, 1, 4.0, 0.5, 0.02, 0, 0, 1.0, 1.0, 'F5', 0, 0, 0, 95, 10)
 renodx = rdx % ((0,) + renodx_values)
 renodx_on = rdx % ((1,) + renodx_values)
 
-(out / "dlssnr-amd-optiscaler.ini").write_text(network + int4mixed + preprocess + renodx + logsec, encoding="utf-8")
-(out / "dlssnr-amd-optiscaler-renodx.ini").write_text(network + int4mixed + preprocess + renodx_on + logsec, encoding="utf-8")
+(out / "dlssnr-amd-optiscaler.ini").write_text(network + int4mixed + preprocess + renodx + logsec + reusesec, encoding="utf-8")
+(out / "dlssnr-amd-optiscaler-renodx.ini").write_text(network + int4mixed + preprocess + renodx_on + logsec + reusesec, encoding="utf-8")
 (out / "dlssnr-amd-addon.ini").write_text(dlssnr + own + "\n" + network + int4mixed + preprocess + renodx + logsec, encoding="utf-8")
 print("wrote", out / "dlssnr-amd-optiscaler.ini", out / "dlssnr-amd-optiscaler-renodx.ini", out / "dlssnr-amd-addon.ini")
