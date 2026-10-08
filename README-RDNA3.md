@@ -76,10 +76,18 @@ copied into it. It is checked against a bit-level rounding over every f32 bit pa
 preserved; none reaches a quantiser in the network.
 
 The RDNA4 shaders are not touched: the RDNA3 network is `linux/shaders/rdna3/`, built with
-`linux/build/arch/rdna3.sh`. Two properties of gfx11 had to be measured, and the RDNA4 shaders assumed
-neither: an accumulator component `c` of lane `l` is element `(2c + l/16, l%16)`, and an A or B fragment
+`linux/build/arch/rdna3.sh`. Three properties of gfx11 had to be measured, and the RDNA4 shaders assumed
+none of them: an accumulator component `c` of lane `l` is element `(2c + l/16, l%16)`; an A or B fragment
 holds sixteen components per lane, so an accumulator cannot be copied component by component into the
-next stage's operand. The host keeps an FP16 twin of the activation arena and of the weights next to the
+next stage's operand; and the matrix instruction computes output row `m` from lane half `m%2` alone, that
+half's A row `m` and that half's copy of every B column (`linux/test/wmma_half_probe`, run by
+`check_rdna3.py`). The last one means the two halves may hold their operands in different k orders as
+long as each half's A rows and B columns agree, and swapping the elements of every k pair is bit-identical
+to the plain product (0 differences over 102400 random e4m3-valued elements). The kernels use that: an
+operand built from an accumulator puts (own, partner) into every pair, so the upper half holds every k
+pair swapped, and the host stores the odd rows of the weight tiles such operands meet with their k pairs
+swapped (`kswap` in `shader-constants.txt`; `NR_OP_KSWAP` in `fswin_t.comp`). A build that answers the
+probe differently cannot run these kernels. The host keeps an FP16 twin of the activation arena and of the weights next to the
 byte arenas, indexed like them, and binds it to every binding whose block holds e4m3 data. Raw 32-bit
 views of an arena (tile counters, sync words, scale tables) live at alias binding 16 plus the arena's
 binding and always get the arena itself.
@@ -96,6 +104,7 @@ bit-identical before and after. 4K network time, ms:
 | C=32 kernels on two waves a window instead of one, the MLP streamed through its hidden fragments, the stage-1 k loop kept rolled at C=64 and C=128, the C=256 upsample projection k-outermost | 84 | 62 |
 | ViT contraction GEMM and C=512 attention in 256 VGPRs | 62 | 58 |
 | the e4m3 rounding constant positive for either sign (about 7 % fewer vector instructions in all, 2 % of the frame) | 58 | 56 |
+| register operands built with every k pair swapped (one permute and two packs a pair instead of one permute, two selects and two packs; the weight tiles they meet are stored to match), and the ViT FFN expand on eight waves of 2x4 fragments instead of four of 4x4 (no spill) | 56 | 55.5 |
 
 What mattered, most important first:
 
@@ -161,8 +170,13 @@ Each of these looked promising and did not pay off.
 
 Gains still available at 4K, none of them large:
 
-- Swapping the two elements of a k pair per lane half so a B operand needs one permute and two packs:
-  bit-identical, needs a weight repack in `nr_graph.cpp`, about 1 ms.
+- The k-pair swap above left the C=32 kernels at 240 VGPRs instead of 216 (six waves a SIMD instead of
+  seven; LDS allows eight), which is why they gained 1 to 2 % where a timing-only build gained 3 to 4 %.
+  No define found that brings them back; the demand is 225 to 231 before scheduling.
+- The persistent C=64/128/256 kernels spill 95 to 112 VGPRs each (RADV `shaderstats`; the quantised K
+  and V fragments, 24 f16 fragments of operands are 192 VGPRs on their own). Moving V through LDS cuts
+  the spill by ten and is a wash in time, so the scratch traffic is cheap; the lever would be a smaller
+  operand set, not fewer spills.
 - The attention softmax epilogue still spills (about 0.3 ms), and `vitattn` is vector-bound at about 44 % of
   the matrix peak.
 - Skipping the e4m3 rounding in selected kernels. `NR_QUANT_F16_ONLY=1` (off by default, in
