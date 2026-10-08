@@ -141,10 +141,9 @@ nr::pe::Session& vk_session() {
 // [Preprocess] in dlssnr-amd.ini beside this module: the file re-read at most once a second, the
 // hotkey every evaluate. Written with the defaults (off) when absent. OptiScaler knows nothing of it:
 // the change is made on the proxy it hands us and taken back out of the answer before it gets it back.
-nr::Preprocess preprocess_now() {
+const nr::pe::PreprocessConfig& ini_config() {
     static nr::pe::PreprocessFile file;
     static nr::pe::PreprocessConfig config;
-    static nr::pe::PreprocessSwitch toggle;
     static ULONGLONG next = 0;
     static uint64_t epoch = 0;
     const ULONGLONG now = GetTickCount64();
@@ -154,6 +153,21 @@ nr::Preprocess preprocess_now() {
         const char* folder = nr::pe::module_folder();
         if (*folder) file.poll(std::string(folder) + "\\dlssnr-amd.ini", config);
     }
+    return config;
+}
+
+// [Reuse] in the same file: the network on every Every-th frame, the frames between carrying its edit
+// forward by the game's motion vectors (nr::Controls::reuse_every). Zero or one: the network every frame.
+void reuse_now(nr::Controls& c) {
+    const auto& ini = ini_config();
+    c.reuse_every = ini.reuse_every;
+    c.reuse_gate = ini.reuse_gate;
+}
+
+nr::Preprocess preprocess_now() {
+    static nr::pe::PreprocessConfig config;
+    static nr::pe::PreprocessSwitch toggle;
+    config = ini_config();
     return toggle.frame(config);
 }
 
@@ -1280,6 +1294,7 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
     f->controls = controls_from(controls);
     if (const auto* w2 = nr::pe::renodx_route::call_wilsjo2()) f->controls.history_strength = w2->history;
     f->controls.preprocess = preprocess_now();
+    reuse_now(f->controls);
     // a wilsjo2 layer that runs [Preprocess] itself (nr_asi_wilsjo2*.cpp, from the frame's light): not again here
     f->prep_by_layer = false;
     if (const auto* w2 = nr::pe::renodx_route::call_wilsjo2(); w2 && w2->prep_outside) {
@@ -1687,6 +1702,7 @@ int evaluate_vk(void* cmd_buffer, Feature* f, void* params, const void* color, c
     f->controls = controls_from(controls);
     if (const auto* w2 = nr::pe::renodx_route::call_wilsjo2()) f->controls.history_strength = w2->history;
     f->controls.preprocess = preprocess_now();
+    reuse_now(f->controls);
     // a wilsjo2 layer that runs [Preprocess] itself (nr_asi_wilsjo2*.cpp, from the frame's light): not again here
     f->prep_by_layer = false;
     if (const auto* w2 = nr::pe::renodx_route::call_wilsjo2(); w2 && w2->prep_outside) {
@@ -1851,6 +1867,7 @@ int evaluate_vk_asi(void* cmd_buffer, Feature* f, const VkImageRef& colour, cons
     f->controls = controls_from(controls);
     if (const auto* w2 = nr::pe::renodx_route::call_wilsjo2()) f->controls.history_strength = w2->history;
     f->controls.preprocess = preprocess_now();
+    reuse_now(f->controls);
     // a wilsjo2 layer that runs [Preprocess] itself (nr_asi_wilsjo2*.cpp, from the frame's light): not again here
     f->prep_by_layer = false;
     if (const auto* w2 = nr::pe::renodx_route::call_wilsjo2(); w2 && w2->prep_outside) {

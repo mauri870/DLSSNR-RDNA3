@@ -350,6 +350,11 @@ bool parse(const std::string& path, Config& c, bool& legacy) {
         const std::string value = trim(text.substr(equals + 1));
         if (name == "preprocess") { parse_preprocess_key(c.preprocess, key, value); continue; }
         if (name == "renodx") { parse_renodx_key(c.renodx, key, value); continue; }
+        if (name == "reuse") {
+            if (key == "every") c.controls.reuse_every = std::clamp(std::atoi(value.c_str()), 0, 8);
+            else if (key == "gate") c.controls.reuse_gate = number(value, 1, 400);
+            continue;
+        }
         if (name == "log") {
             if (key == "enabled") { if (auto b = parse_bool(value)) c.log_enabled = *b; }
             else if (key == "clearonstart") { if (auto b = parse_bool(value)) c.log_clear = *b; }
@@ -428,8 +433,13 @@ bool parse_preprocess_file(const std::string& path, PreprocessConfig& p) {
             continue;
         }
         const auto equals = text.find('=');
-        if (equals == std::string::npos || name != "preprocess") continue;
-        parse_preprocess_key(p, lower(trim(text.substr(0, equals))), trim(text.substr(equals + 1)));
+        if (equals == std::string::npos) continue;
+        const std::string key = lower(trim(text.substr(0, equals))), value = trim(text.substr(equals + 1));
+        if (name == "preprocess") parse_preprocess_key(p, key, value);
+        else if (name == "reuse") {
+            if (key == "every") p.reuse_every = std::clamp(std::atoi(value.c_str()), 0, 8);
+            else if (key == "gate") p.reuse_gate = number(value, 1, 400);
+        }
     }
     std::fclose(file);
     return true;
@@ -1640,6 +1650,23 @@ void write_log(FILE* f, bool enabled, bool clear) {
         enabled ? 1 : 0, clear ? 1 : 0);
 }
 
+void write_reuse(FILE* f, int every, float gate) {
+    std::fprintf(f,
+        "\n[Reuse]\n"
+        "; Temporal reuse of the network's edit. The network runs on every Every-th frame and the frames between\n"
+        "; carry its last edit forward by the game's motion vectors (or the estimator's, with none), for a fraction\n"
+        "; of the cost. Changing Every from 0 to 2 or more the first time rebuilds the network once.\n"
+        "\n"
+        "Every = %d\n"
+        "; 0 or 1 = the network on every frame (default); 2 = every second frame (about half the cost);\n"
+        "; 3 = every third frame. Up to 8\n"
+        "\n"
+        "Gate = %.1f\n"
+        "; how far the picture may have moved since the network last ran, in pixels of a 1080p-wide frame,\n"
+        "; for a frame to skip it. Past it the network runs; past twice it the stored edit is dropped.\n",
+        every, gate);
+}
+
 bool PreprocessFile::poll(const std::string& path, PreprocessConfig& out) {
     const uint64_t stamp = stamp_of(path);
     if (!stamp) {
@@ -1652,6 +1679,7 @@ bool PreprocessFile::poll(const std::string& path, PreprocessConfig& out) {
             write_renodx(f, RenoDXConfig{});
             write_wilsjo2(f);
             write_log(f, true, true);
+            write_reuse(f, 0, 40.0f);
             std::fclose(f);
             stamp_ = stamp_of(path);
         }
@@ -2004,6 +2032,7 @@ void Config::save(const std::string& path) {
     write_preprocess(f, preprocess);
     write_renodx(f, renodx);
     write_log(f, log_enabled, log_clear);
+    write_reuse(f, controls.reuse_every, controls.reuse_gate);
     std::fclose(f);
     stamp_ = stamp_of(path);
 }

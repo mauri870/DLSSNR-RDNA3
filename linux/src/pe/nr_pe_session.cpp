@@ -121,6 +121,7 @@ struct Session::Impl {
         // layer's (the ReShade route's layers each have their own).
         std::map<int, std::chrono::steady_clock::time_point> layers;
         int net{};     // the network it runs (nr::NetworkChoice)
+        bool reuse{};  // RuntimeConfig::reuse
         uint64_t used{};   // LRU stamp
         std::chrono::steady_clock::time_point last{};   // when it was last selected
         bool light{};      // built inside a recording (inframe): its images in its network memory's heap
@@ -174,7 +175,7 @@ struct Session::Impl {
     uint64_t inframe_built{}, plans_built{};
     double inframe_ms_max{};
     bool same_config_but_format(const Built& e) const { return same_config(e, e.format); }
-    bool same_config(const Built& e, VkFormat f) const { return e.format == f && e.net == net_want; }
+    bool same_config(const Built& e, VkFormat f) const { return e.format == f && e.net == net_want && e.reuse == reuse_want; }
     // The network a runtime runs (nr::NetworkChoice).
     static int net_of(const Runtime& r) {
 #if NR_INT4
@@ -1031,6 +1032,10 @@ struct Session::Impl {
     // [Network] Model: the network the switch asks for, the one being built, and the one running (Built::net).
     NetworkSwitch net_switch;
     int net_want{}, build_net{}, running_net{-1};
+    // Controls::reuse_every was asked for once: from then on every runtime is built able to reuse the network's edit.
+    // Never cleared, so the cache keeps one kind of runtime.
+    bool reuse_want{}, build_reuse{};
+    std::chrono::steady_clock::time_point reuse_logged{};
     int call_net{-1};   // Session::set_call_network
     // The network this call wants: an NR-chain layer's own (set_call_network) when the run can serve it,
     // else [Network] Model (the switch, which also takes the hotkey: called on every call either way).
@@ -1383,6 +1388,7 @@ bool Session::Impl::select_runtime(uint32_t w, uint32_t h, VkFormat format) {
         if (e.runtime->stale()) continue;   // its images belong to a later runtime (dropped by trim_cache)
         if (e.width != w || e.height != h || e.format != format) continue;
         if (e.net != net_want) continue;   // [Network] Model: the network the switch asks for
+        if (e.reuse != reuse_want) continue;
         e.used = ++use_stamp;
         const auto now = std::chrono::steady_clock::now();
         if (runtime != e.runtime.get()) {
@@ -1767,6 +1773,20 @@ bool Session::Impl::make_room(uint32_t w, uint32_t h) {
 
 bool Session::Impl::ensure_runtime(const Controls& controls, uint32_t w, uint32_t h, VkFormat format) {
     const bool ok = ensure_runtime_(controls, w, h, format);
+    if (ok && runtime && controls.reuse_every >= 2 && runtime->reuse_allowed()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - reuse_logged > std::chrono::seconds(5)) {
+            reuse_logged = now;
+            const auto n = runtime->reuse_counts();
+            const double frames = double(n.ran + n.skipped);
+            log("[nr] temporal reuse, every %d: %llu frames ran the network, %llu skipped it (%.0f %%), the motion gate "
+                "ran it %llu times; motion since the last line: mean %.1f px, peak %.1f px (Gate %.0f)",
+                controls.reuse_every, (unsigned long long)n.ran, (unsigned long long)n.skipped,
+                frames > 0 ? 100.0 * double(n.skipped) / frames : 0.0, (unsigned long long)n.gated,
+                n.motion_samples ? n.motion_sum / double(n.motion_samples) : 0.0, double(n.motion_peak),
+                double(controls.reuse_gate));
+        }
+    }
     ++(ok ? ran : passed);
     last_ok = ok;
     last_w = w; last_h = h; last_format = format;
@@ -1805,6 +1825,10 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
     if (cache.size() > kMaxResident) trim_cache();
     if (!availability_checked) check_availability();
     net_want = wanted_network();
+    if (controls.reuse_every >= 2 && !reuse_want) {
+        reuse_want = true;
+        log("[nr] ReuseEvery %d asked for: networks are rebuilt able to reuse the network's edit (once)", controls.reuse_every);
+    }
     // Adopt a finished background build first.
     {
         nr::pe::watchdog::Phase phase("adopting a finished network build (build lock)");
@@ -1843,6 +1867,7 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
                 // what was built, not what was asked: a network without what it needs is another one (the runtime
                 // says why); the one asked for is not asked again this run
                 entry.net = net_of(*built);
+                entry.reuse = build_reuse;
                 if (entry.net != build_net) {
                     net_switch.unavailable(build_net, built->network_note().empty() ? "could not be built (see dlssnr-amd.log)"
                                                                                     : built->network_note());
@@ -2026,6 +2051,7 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
     nr::g_build_stage = 1; nr::g_build_pipes_done = 0; nr::g_build_pipes_total = 0;
     build_layer = call_layer;
     build_net = net_want;
+    build_reuse = config.reuse;
     status = "building the network in the background; frames pass through until it is ready";
     events::note(events::kNetwork, "network asked for: %s", nr::network_codename(net_want));
     events::note(events::kNetwork, "building the network at %ux%u in the background", w, h);
@@ -2104,6 +2130,7 @@ RuntimeConfig Session::Impl::make_config(uint32_t w, uint32_t h, VkFormat f) con
     RuntimeConfig config;
     config.root = root; config.width = w; config.height = h; config.colour_format = f;
     config.motion_point = motion_point;
+    config.reuse = reuse_want;
     // RuntimeConfig::network: 1 the small model, 2 CC_SMALL_FP8_EXPERIMENTAL, 0 the 310.8 one
     config.network = net_want == nr::kSmallFp8 ? 1 : net_want == nr::kSmallFp8Experimental ? 2 : 0;
 #if NR_INT4
@@ -2203,6 +2230,7 @@ bool Session::Impl::inframe(uint32_t w, uint32_t h, VkFormat f, std::shared_ptr<
     Built entry;
     entry.width = w; entry.height = h; entry.format = f;
     entry.net = net_of(*made);
+    entry.reuse = reuse_want;
     entry.used = ++use_stamp;
     entry.last = std::chrono::steady_clock::now();
     entry.light = true;
