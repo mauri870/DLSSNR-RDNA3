@@ -456,6 +456,14 @@ public:
     // Requires a runtime built with TemporalConfig::enable, whose extent matches
     // the render resolution rather than the display one.
     EngineResult record_engine(VkCommandBuffer, const EngineFrame&, const Controls&);
+    // Temporal reuse (RuntimeConfig::reuse): whether this runtime was built able to, and what it did so far -
+    // frames that ran the network, frames that skipped it, and skips the motion gate declined.
+    // `motion_*` are the frames' mean motion, in pixels of a 1080p-wide frame (the unit of Controls::reuse_gate),
+    // summed over `motion_samples` frames and the largest one, since the last call; read by the log so the gate
+    // can be set from what a game actually does.
+    struct ReuseCounts { uint64_t ran{}, skipped{}, gated{}; double motion_sum{}; uint64_t motion_samples{}; float motion_peak{}; };
+    bool reuse_allowed() const;
+    ReuseCounts reuse_counts();
     // whether record_engine can take EngineFrame::target with these controls
     // (the model applied, one pass). A host asks before it skips its own seed copy.
     bool takes_target(const Controls&) const;
