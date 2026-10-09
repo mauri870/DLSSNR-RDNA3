@@ -15,7 +15,7 @@
 #                       carries -rdna3 in its name
 #   NR_VERSION=...      override the version (default: from the git tags, linux/build/version.sh)
 #
-# x86_64 packages also carry int4/, the int4 mixed option install.sh adds when asked for: the programs built again
+# RDNA4 x86_64 packages also carry int4/, the int4 mixed option install.sh adds when asked for: the programs built again
 # with NR_INT4=1 (this script with NR_INT4=1 NR_PROGRAMS_ONLY=1), the int4 network, its data, the Vulkan layer and the
 # install-time weights generator (build_int4.sh), and its dlssnr-amd.ini.
 set -euo pipefail
@@ -225,7 +225,8 @@ python3 linux/package/make_ini.py linux/src/pe/nr_pe_config.cpp "$pkg/ini" > /de
 # quantisers, recovery tables, settings, layer), the weights generator and the SHA-256 of what it must make from the
 # model (linux/data/int4/<arch>/dlssnr-int4.sha256, checked by install.sh).
 # i686: no OptiScaler route, so only the add-on; the layer comes in both widths (build_int4.sh NR_LAYER32).
-if [[ "$arch" == x86_64 || "$arch" == i686 ]]; then
+# RDNA4 only: it rewrites the RDNA4 programs' machine code, so an RDNA3 package has no int4/.
+if [[ "$gpu" == rdna4 && ( "$arch" == x86_64 || "$arch" == i686 ) ]]; then
     i4="$pkg/int4"
     NR_INT4=1 NR_PROGRAMS_ONLY=1 bash linux/build/build_package.sh "$out/int4"
     layer32=0; [[ "$arch" == i686 ]] && layer32=1
