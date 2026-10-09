@@ -338,17 +338,31 @@ int wmain() {
     // ---- the tests -------------------------------------------------------------------------------------
     const DWORD first_limit = fs::exists(base / "dlssnr-amd" / "pipeline.cache") ? 10 * 60000 : 30 * 60000;
     say("");
-    say("Test 1 of 2: barriers between GPU steps");
-    const ModeResult barriers = run_mode(base, "barriers", true, first_limit);
+    // The first two tests leave out the persistent kernels (NR_NO_PERSIST: every layer is its own dispatch, on
+    // pipelines the driver's compiler takes); the last two use them as shipped. The tile-chain (counters one
+    // dispatch waits on) is off in the first test of each pair, so a counter that never advances cannot hang the GPU.
+    say("Test 1 of 4: layer by layer, barriers between GPU steps");
+    const ModeResult flat_barriers = run_mode(base, "flat_barriers", true, first_limit, {{"NR_NO_PERSIST", "1"}}, "nopersist_barriers");
     say("");
-    say("Test 2 of 2: default mode");
+    say("Test 2 of 4: layer by layer, tile counters");
+    const ModeResult flat_counters = run_mode(base, "flat_counters", false, 10 * 60000, {{"NR_NO_PERSIST", "1"}}, "nopersist_default");
+    say("");
+    say("Test 3 of 4: persistent kernels, barriers between GPU steps");
+    const ModeResult barriers = run_mode(base, "barriers", true, 10 * 60000);
+    say("");
+    say("Test 4 of 4: persistent kernels, tile counters (the default)");
     const ModeResult normal = run_mode(base, "default", false, 10 * 60000);
+    const struct { const char* label; const ModeResult* result; } all_modes[] = {
+        {"Layer by layer, barriers:     ", &flat_barriers}, {"Layer by layer, counters:     ", &flat_counters},
+        {"Persistent, barriers:         ", &barriers},      {"Persistent, counters (default):", &normal}};
 
     // When both runs fail, find out which shaders the driver's compiler cannot take (each is tried in its own process).
     bool probed = false;
-    if (barriers.verdict.rfind("OK", 0) != 0 && normal.verdict.rfind("OK", 0) != 0 && fs::exists(base / "probe.exe")) {
+    bool all_failed = true;
+    for (const auto& m : all_modes) all_failed = all_failed && m.result->verdict.rfind("OK", 0) != 0;
+    if (all_failed && fs::exists(base / "probe.exe")) {
         say("");
-        say("Both tests failed. Now trying each shader on its own to find the cause. This can take up to 45 minutes;");
+        say("All four tests failed. Now trying each shader on its own to find the cause. This can take up to 45 minutes;");
         say("the window may look idle. Please leave it running.");
         DWORD code = 0;
         bool timed_out = false;
@@ -359,9 +373,10 @@ int wmain() {
 
     say("");
     say("==================  SUMMARY  ==================");
-    for (const ModeResult* m : {&barriers, &normal}) {
+    for (const auto& entry : all_modes) {
+        const ModeResult* m = entry.result;
         char line[300];
-        say(std::string(m == &barriers ? "Barriers mode: " : "Default mode:  ") + m->verdict);
+        say(std::string(entry.label) + " " + m->verdict);
         if (m->ms_1080 > 0 || m->ms_720 > 0) {
             std::snprintf(line, sizeof line, "    time per frame: 1080p %.2f ms, 720p %.2f ms", m->ms_1080, m->ms_720);
             say(line);

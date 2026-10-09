@@ -53,8 +53,8 @@ cp -r "<kit folder>" "/mnt/c/Users/<name>/Desktop/"
    `./nr_tester.exe` from the kit folder under `/mnt/c/...`. Leave it alone until it prints
    `The result is in ...\results.txt`.
    - The first run builds shader pipelines and can take several minutes.
-   - If both tests fail, it then tries every shader on its own. That can take up to 45 minutes and the window can look
-     idle. Wait for it to finish.
+   - It runs four tests one after the other. If all four fail, it then tries every shader on its own. That can take up
+     to 45 minutes and the window can look idle. Wait for it to finish.
 4. Read `results.txt` in the kit folder without changing it.
 
 ## What to report
@@ -70,7 +70,7 @@ in a few lines:
 
 ## Reading the answer (for your understanding; report it, do not act on it)
 
-- `OK, identical to the Linux driver's picture` in both modes: the network runs correctly on this driver.
+- `OK, identical to the Linux driver's picture` in any of the four modes: the network runs correctly on this driver.
 - `OK (tiny differences)`: harmless rounding differences.
 - `DIFFERENT PICTURE`, `FAILED` or `TIMED OUT`: the log lines say where it stopped.
 - `Pipeline probe` with `crashed` above 0: the AMD compiler crashes on those shaders; the table says which.

@@ -14,10 +14,11 @@ one `results.txt`.
   cooperative-matrix configurations (`probe.exe --report`).
 - It makes the model from the user's DLL with `windows/package/model-tools` (the file is only read). The model is
   never in the kit.
-- It runs the network on a 1080p frame twice, with barriers between dispatches and with tile counters
-  (`NR_TCHAIN`), each with a time limit, compares the picture with RADV's (the reference is the committed
-  `docs/ngx-verification` output) and times 1080p and 720p.
-- When both runs fail, `probe.exe` creates every pipeline of the network in its own process, plus the tiny shaders
+- It runs the network on a 1080p frame four times, each with a time limit: layer by layer (`NR_NO_PERSIST`, no
+  persistent kernels) and with them, each with barriers between dispatches and with tile counters (`NR_TCHAIN`). It
+  compares the picture with RADV's (the reference is the committed `docs/ngx-verification` output) and times 1080p
+  and 720p.
+- When all four fail, `probe.exe` creates every pipeline of the network in its own process, plus the tiny shaders
   in `micro/` and `micro2/`, and prints a table: OK, or CRASH with the module and offset inside the driver.
 
 ```
@@ -48,8 +49,15 @@ Giving the kit to someone else to run: `INSTRUCTIONS-FOR-AI.md`.
 - `unroll_network.py` makes every index constant with `windows/build/unroll_glsl.py`. All four rolled/unrolled pairs
   tried compile once unrolled, and on RADV the unrolled network gives the bit-identical picture at 2 to 4 % more time.
 
+With the unrolled network, 92 of 101 shaders compile on that driver; the nine persistent kernels (`fswinp*`,
+`fswinpds*`, `fswinpup*`) still fail: seven crash at one new site (`amdvlk64.dll+0x2b0fefb`) and `fswinp64/128` return
+`VK_ERROR_INITIALIZATION_FAILED`. They share the work-claiming code: `atomicExchange`, module-level variables and
+unsigned compares, which no passing shader has. The first two tests leave them out. Five passing shaders declare more
+workgroup memory than the 32 KB the driver advertises (`fswin256`, `fswinds256`, `fswindsp256`, `fswinfusedup256` at
+64 KB, `fswinfusedup128` at 36 KB); whether they run is not known yet.
+
 Not yet known: whether the unrolled network dispatches and gives the right picture on LLPC, how fast it is, and
-whether tile counters make progress there. That is what the kit's first two tests answer.
+whether tile counters make progress there. That is what the kit's tests answer.
 
 ## Files
 

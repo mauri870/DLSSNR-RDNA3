@@ -18,7 +18,7 @@ Steps
      (the programs are not signed). Some antivirus programs may ask the same; this is expected.
   5. Wait until it says it is done. The first run can take several minutes and the screen may flicker or go
      black for a moment. If nothing seems to happen for more than 30 minutes, close the window.
-     If the first two tests fail, the program then tries every shader on its own to find the cause. That can
+     If all four tests fail, the program then tries every shader on its own to find the cause. That can
      take up to 45 minutes and the window may look idle. Please leave it running until it says it is done.
   6. Send back the file results.txt that appears in the same folder. Nothing else is needed.
 
