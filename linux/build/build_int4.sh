@@ -3,16 +3,16 @@
 #   <out>/network/             the int4 network (build_network.py <arch> --int4)
 #   <out>/layer/               the Vulkan layer that gives the game's device VK_KHR_pipeline_binary (src/layer)
 #   <out>/dlssnr-int4-weights  the install-time weights generator (src/tools/nr_int4_weights.cpp), fully static
-#   <out>/data/                the int4 data: the network, linux/data/int4/<arch>/ (quantisers, recovery tables,
+#   <out>/data/                the int4 data: the network, linux/data/int4/<NR_INT4_DATA>/ (quantisers, recovery tables,
 #                              settings.txt), the layer; what install.sh copies into dlssnr-amd/int4/
 #
-#   build_int4.sh <out dir>
+#   [NR_GPU=rdna3|rdna4] build_int4.sh <out dir>      (default rdna4)
 set -euo pipefail
 cd -- "$(dirname -- "$0")/../.."
 out=$(realpath -m -- "${1:?usage: build_int4.sh <out dir>}")
 case "$out" in "$(pwd)"/*) ;; *) echo 'build directory must be in the project' >&2; exit 2;; esac
-source linux/build/arch/rdna4.sh
-src=linux/data/int4/$NR_GPU_ARCH
+source "linux/build/arch/${NR_GPU:-rdna4}.sh"
+src=linux/data/int4/$NR_INT4_DATA
 [[ -f "$src/settings.txt" ]] || { echo "missing $src" >&2; exit 1; }
 rm -rf -- "$out"; mkdir -p -- "$out/layer" "$out/gen"
 

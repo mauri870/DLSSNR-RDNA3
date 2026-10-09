@@ -5,6 +5,8 @@
 # shader-constants.txt disagrees with the defines below. The shaders are built by
 # `python3 linux/build/build_network.py rdna4` from linux/shaders/rdna4/pipelines.json.
 NR_GPU_ARCH=rdna4
+# linux/data/int4/<this>/: the int4 mixed option's tables (calibrated on the FP8 network).
+NR_INT4_DATA=rdna4
 NR_PRODUCT_SPV=build/linux/rdna4/network
 NR_PRODUCT_DEFINES=(
     -DNR_GEMM_WIDE_MT=64 -DNR_GEMM_WIDE_NT=256

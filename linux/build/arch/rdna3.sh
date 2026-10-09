@@ -6,6 +6,9 @@
 # shader-constants.txt disagrees with the defines below. The shaders are built by
 # `python3 linux/build/build_network.py rdna3` from linux/shaders/rdna3/pipelines.json.
 NR_GPU_ARCH=rdna3
+# linux/data/int4/<this>/: the int4 mixed option's tables. They are calibrated on the FP8 network and this build reproduces
+# its e4m3 values, so the RDNA4 tables apply as they are: the weights made from them have the same SHA-256.
+NR_INT4_DATA=rdna4
 NR_PRODUCT_SPV=build/linux/rdna3/network
 NR_PRODUCT_DEFINES=(
     -DNR_ARCH_RDNA3=1

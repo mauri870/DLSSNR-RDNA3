@@ -15,7 +15,7 @@
 #                       carries -rdna3 in its name
 #   NR_VERSION=...      override the version (default: from the git tags, linux/build/version.sh)
 #
-# RDNA4 x86_64 packages also carry int4/, the int4 mixed option install.sh adds when asked for: the programs built again
+# x86_64 packages also carry int4/, the int4 mixed option install.sh adds when asked for: the programs built again
 # with NR_INT4=1 (this script with NR_INT4=1 NR_PROGRAMS_ONLY=1), the int4 network, its data, the Vulkan layer and the
 # install-time weights generator (build_int4.sh), and its dlssnr-amd.ini.
 set -euo pipefail
@@ -223,10 +223,9 @@ python3 linux/package/make_ini.py linux/src/pe/nr_pe_config.cpp "$pkg/ini" > /de
 
 # int4/: the int4 mixed option. The int4 build of the programs that differ, dlssnr-amd/int4 (network,
 # quantisers, recovery tables, settings, layer), the weights generator and the SHA-256 of what it must make from the
-# model (linux/data/int4/<arch>/dlssnr-int4.sha256, checked by install.sh).
+# model (linux/data/int4/<NR_INT4_DATA>/dlssnr-int4.sha256, checked by install.sh).
 # i686: no OptiScaler route, so only the add-on; the layer comes in both widths (build_int4.sh NR_LAYER32).
-# RDNA4 only: it rewrites the RDNA4 programs' machine code, so an RDNA3 package has no int4/.
-if [[ "$gpu" == rdna4 && ( "$arch" == x86_64 || "$arch" == i686 ) ]]; then
+if [[ "$arch" == x86_64 || "$arch" == i686 ]]; then
     i4="$pkg/int4"
     NR_INT4=1 NR_PROGRAMS_ONLY=1 bash linux/build/build_package.sh "$out/int4"
     layer32=0; [[ "$arch" == i686 ]] && layer32=1
@@ -241,7 +240,7 @@ if [[ "$gpu" == rdna4 && ( "$arch" == x86_64 || "$arch" == i686 ) ]]; then
     fi
     cp -r -- "$out/int4/parts/data" "$i4/dlssnr-amd/int4"
     cp -- "$out/int4/parts/dlssnr-int4-weights" "$i4/"
-    cp -- "linux/data/int4/$NR_GPU_ARCH/dlssnr-int4.sha256" "$i4/dlssnr-int4.bin.sha256"
+    cp -- "linux/data/int4/$NR_INT4_DATA/dlssnr-int4.sha256" "$i4/dlssnr-int4.bin.sha256"
     python3 linux/package/make_ini.py linux/src/pe/nr_pe_config.cpp "$i4/ini" --int4 > /dev/null
 fi
 cp -- linux/package/install.sh linux/package/README.txt "$pkg/"
