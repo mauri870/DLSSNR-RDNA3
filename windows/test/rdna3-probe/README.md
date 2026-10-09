@@ -18,6 +18,12 @@ one `results.txt`.
   persistent kernels) and with them, each with barriers between dispatches and with tile counters (`NR_TCHAIN`). It
   compares the picture with RADV's (the reference is the committed `docs/ngx-verification` output) and times 1080p
   and 720p.
+- Before the tests it runs the two exhaustive rounding self-checks (`e4m3_emul_test`, `e4m3_round_test`: every f32 and
+  f16 input), which show whether the driver's compiler keeps the add-and-subtract e4m3 rounding.
+- After them, `nr_graph --value-stats` runs the network layer by layer and the tester compares every activation's
+  rms, largest value, share of zeros and count of NaN or saturated entries with `layers-reference-1080.txt` (made
+  with RADV), then lists the first values that are off, by step and producer layer. That names the first wrong layer
+  when the picture is wrong.
 - When all four fail, `probe.exe` creates every pipeline of the network in its own process, plus the tiny shaders
   in `micro/` and `micro2/`, and prints a table: OK, or CRASH with the module and offset inside the driver.
 
@@ -56,8 +62,10 @@ unsigned compares, which no passing shader has. The first two tests leave them o
 workgroup memory than the 32 KB the driver advertises (`fswin256`, `fswinds256`, `fswindsp256`, `fswinfusedup256` at
 64 KB, `fswinfusedup128` at 36 KB); whether they run is not known yet.
 
-Not yet known: whether the unrolled network dispatches and gives the right picture on LLPC, how fast it is, and
-whether tile counters make progress there. That is what the kit's tests answer.
+First dispatch on that driver (kit built from `8f3bd55`): the layer-by-layer network runs to the end, with barriers and
+with tile counters, with no hang or crash. It takes 27.4 ms at 1080p and 15.6 ms at 720p (RADV: 18.9 and 10.4 ms), and
+the picture is wrong (9.8 and 10.9 dB against RADV's, 0 to 0.2 % of pixels identical). The persistent modes still crash.
+The layer check in the next kit is there to name the first wrong layer.
 
 ## Files
 
@@ -66,3 +74,5 @@ whether tile counters make progress there. That is what the kit's tests answer.
 - `diag.patch`: step trace (`NRVK_TRACE`), crash report and the `NRVK_NO_*` switches, for `run_frame`.
 - `unroll_network.py`, `make_variants.py`: the unrolled shader set; one-define-removed variants of a pipeline.
 - `micro/`, `micro2/`: the tiny shaders, one construct each.
+- `layers-reference-1080.txt`: the per-value statistics RADV gives for the 1080p frame (`NR_NO_PERSIST=1`,
+  `--no-reuse`); regenerate it with `nr_graph --value-stats` after any change that alters the arithmetic.

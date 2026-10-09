@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <regex>
 #include <string>
 #include <vector>
@@ -62,6 +63,101 @@ static std::string key_lines(const std::string& s) {
     for (size_t i = trace.size() > 4 ? trace.size() - 4 : 0; i < trace.size(); ++i) out += "    " + trace[i] + "\n";
     for (const std::string& line : crash) out += "    " + line + "\n";
     return out;
+}
+
+static std::wstring quote(const fs::path& p);
+static bool run(const std::wstring& command_line, const fs::path& dir, const fs::path& log, DWORD timeout_ms, DWORD* exit_code,
+                bool* timed_out);
+
+// ---- the layer check: nr_graph --value-stats against the RADV reference --------------------------------------
+struct ValueRow {
+    std::string key, step, producer, type, view;
+    double rms = 0, absmax = 0, zero = 0;
+    long long bad = 0;
+};
+
+// One row of the table nr_graph prints:  key step producer type view... elements rms absmax zero% nan+sat hash
+static std::vector<ValueRow> parse_value_rows(const std::string& text) {
+    static const std::regex row(R"(^\s*(\d+)\s+(-?\d+)\s+(\S+)\s+(\S+)\s+(e4m3 twin|arena as f16)\s+(\d+)\s+(\S+)\s+(\S+)\s+([0-9.]+)%\s+(\d+)\s+([0-9a-f]+)\s*$)");
+    std::vector<ValueRow> rows;
+    size_t start = 0;
+    while (start < text.size()) {
+        size_t end = text.find('\n', start);
+        if (end == std::string::npos) end = text.size();
+        std::string line = text.substr(start, end - start);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        std::smatch m;
+        if (std::regex_match(line, m, row)) {
+            ValueRow r;
+            r.key = m[1]; r.step = m[2]; r.producer = m[3]; r.type = m[4]; r.view = m[5];
+            r.rms = std::atof(m[7].str().c_str());
+            r.absmax = std::atof(m[8].str().c_str());
+            r.zero = std::atof(m[9].str().c_str());
+            r.bad = std::atoll(m[10].str().c_str());
+            rows.push_back(r);
+        }
+        start = end + 1;
+    }
+    return rows;
+}
+
+// Runs the network layer by layer on the 1080p frame, prints every activation's size, rms, largest value and count
+// of NaN or saturated entries, and names the first values that differ from the reference by more than rounding can.
+static void layer_check(const fs::path& base) {
+    const fs::path reference_file = base / "layers-reference-1080.txt";
+    if (!fs::exists(base / "nr_graph.exe") || !fs::exists(reference_file) || !fs::exists(base / "plan_1080.txt")) return;
+    say("");
+    say("Layer check: the network layer by layer, every value against the Linux driver's");
+    {   // the frame as float32, 0..1, RGBA
+        std::ifstream in(base / "in_1080p.rgba8", std::ios::binary);
+        std::vector<unsigned char> bytes((std::istreambuf_iterator<char>(in)), {});
+        std::vector<float> floats(bytes.size());
+        for (size_t i = 0; i < bytes.size(); ++i) floats[i] = float(bytes[i]) / 255.0f;
+        std::ofstream(base / "in_1080p.f32", std::ios::binary).write(reinterpret_cast<const char*>(floats.data()), std::streamsize(floats.size() * 4));
+    }
+    SetEnvironmentVariableA("NR_NO_PERSIST", "1");
+    SetEnvironmentVariableA("NR_TCHAIN", "0");
+    DWORD code = 0;
+    bool timed_out = false;
+    run(quote(base / "nr_graph.exe") + L" --plan plan_1080.txt --model-pack dlssnr-amd\\dlssnr.bin --spv-dir dlssnr-amd\\shaders"
+        L" --host-boundary --no-reuse --source-width 1920 --source-height 1080 --in-image in_1080p.f32 --value-stats",
+        base, base / "log_layers.txt", 15 * 60000, &code, &timed_out);
+    SetEnvironmentVariableA("NR_NO_PERSIST", nullptr);
+    SetEnvironmentVariableA("NR_TCHAIN", nullptr);
+    fs::remove(base / "in_1080p.f32");
+    const std::string text = read_text(base / "log_layers.txt");
+    const std::vector<ValueRow> got = parse_value_rows(text), ref = parse_value_rows(read_text(reference_file));
+    if (timed_out || got.empty()) {
+        say(timed_out ? "  the layer check timed out" : "  the layer check did not finish (exit code " + std::to_string(long(code)) + "); last lines:");
+        say(tail_lines(text, 25));
+        return;
+    }
+    std::map<std::string, const ValueRow*> by_key;
+    for (const ValueRow& r : got) by_key[r.key + "|" + r.view] = &r;
+    int compared = 0, off = 0, first_shown = 0;
+    std::string first_line;
+    for (const ValueRow& r : ref) {
+        const auto it = by_key.find(r.key + "|" + r.view);
+        if (it == by_key.end()) continue;
+        ++compared;
+        const ValueRow& g = *it->second;
+        const double rms_error = r.rms > 0 ? std::fabs(g.rms - r.rms) / r.rms : (g.rms > 0 ? 1.0 : 0.0);
+        const double max_error = r.absmax > 0 ? std::fabs(g.absmax - r.absmax) / r.absmax : (g.absmax > 0 ? 1.0 : 0.0);
+        const bool is_off = rms_error > 0.02 || max_error > 0.25 || std::fabs(g.zero - r.zero) > 2.0 || g.bad > r.bad + 100;
+        if (!is_off) continue;
+        ++off;
+        if (first_shown < 12) {
+            ++first_shown;
+            char line[300];
+            std::snprintf(line, sizeof line, "  step %-4s %-8s %-9s %-13s rms %.4g (reference %.4g)  absmax %.4g (%.4g)  zero %.2f%% (%.2f%%)  nan or saturated %lld (%lld)",
+                          g.step.c_str(), g.producer.c_str(), g.type.c_str(), g.view.c_str(), g.rms, r.rms, g.absmax, r.absmax, g.zero, r.zero, g.bad, r.bad);
+            say(line);
+        }
+    }
+    char summary[200];
+    std::snprintf(summary, sizeof summary, "  %d of %d values differ from the reference by more than rounding can explain.", off, compared);
+    say(summary);
+    if (off == 0) say("  Every layer is within rounding of the Linux driver's values.");
 }
 
 static std::string sha256_file(const fs::path& p) {
@@ -281,6 +377,17 @@ int wmain() {
             finish(base, 1);
         }
 
+    // ---- self-checks: does the driver's compiler keep the e4m3 rounding? (exhaustive over every input) ----------
+    for (const char* test : {"e4m3_emul_test", "e4m3_round_test"}) {
+        if (!fs::exists(base / (std::string(test) + ".exe"))) continue;
+        DWORD code = 0;
+        bool timed_out = false;
+        run(quote(base / (std::string(test) + ".exe")) + L" " + quote(base / (std::string(test) + ".spv")), base,
+            base / (std::string("log_") + test + ".txt"), 10 * 60000, &code, &timed_out);
+        say(std::string("Self-check ") + test + (timed_out ? ": TIMED OUT" : code == 0 ? ": passed" : ": FAILED (exit code " + std::to_string(long(code)) + ")"));
+        say(tail_lines(read_text(base / (std::string("log_") + test + ".txt")), 4));
+    }
+
     // ---- the model ----------------------------------------------------------------------------------
     const fs::path model = base / "dlssnr-amd" / "dlssnr.bin";
     say("");
@@ -360,6 +467,8 @@ int wmain() {
     bool probed = false;
     bool all_failed = true;
     for (const auto& m : all_modes) all_failed = all_failed && m.result->verdict.rfind("OK", 0) != 0;
+    // No picture was right: find the first layer whose values are wrong.
+    layer_check(base);
     if (all_failed && fs::exists(base / "probe.exe")) {
         say("");
         say("All four tests failed. Now trying each shader on its own to find the cause. This can take up to 45 minutes;");

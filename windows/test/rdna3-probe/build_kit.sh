@@ -98,6 +98,17 @@ x86_64-w64-mingw32-strip -s "$kit/run_frame.exe"
 "$cxx" "${common[@]}" -s -municode "$here/probe.cpp" -o "$kit/probe.exe" "${tail[@]}"
 "$cxx" -std=c++17 -O2 -s -municode -static -static-libgcc -static-libstdc++ "$here/nr_tester.cpp" -o "$kit/nr_tester.exe" \
     -lbcrypt -ladvapi32
+# nr_graph prints every activation's statistics (--value-stats): the tester compares them with the RADV reference.
+"$cxx" "${common[@]}" -s "$work/src/linux/src/core/nr_graph.cpp" -o "$kit/nr_graph.exe" "${tail[@]}"
+# The two exhaustive e4m3 rounding tests (every f32 and f16 input): does the driver's compiler keep the rounding?
+for t in e4m3_emul_test e4m3_round_test; do
+    "$cxx" "${common[@]}" -s "linux/test/$t.cpp" -o "$kit/$t.exe" "${tail[@]}"
+    "$glslang" -V --target-env vulkan1.3 -Ilinux/shaders/rdna3/include "linux/test/$t.comp" -o "$kit/$t.spv" > /dev/null
+done
+# The plan of the 1080p network (what nr_graph runs) and the reference statistics from RADV.
+g++ -std=c++20 -O1 -w $defines -Ilinux/src/core -Ilinux/test linux/test/mkplan.cpp linux/src/core/nr_native_plan.cpp -o "$work/mkplan"
+"$work/mkplan" 1920 1080 > "$kit/plan_1080.txt"
+cp -- "$here/layers-reference-1080.txt" "$kit/"
 bash windows/package/model-tools/build_extract_model.sh "$work/extract" > /dev/null
 cp -- "$work/extract/dlssnr_extract_model.exe" "$kit/model-tools/"
 
