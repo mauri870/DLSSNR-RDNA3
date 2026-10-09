@@ -24,9 +24,10 @@ one `results.txt`.
 bash windows/test/rdna3-probe/build_kit.sh [output dir]      # NR_UNROLL=0 keeps the shaders as built
 ```
 
-Needs the Windows package's toolchain (`toolchain/glslang`, `toolchain/Vulkan-Headers`, and
-`artifacts/ref/Vulkan-Loader` built by `linux/build/build_vulkan_loader.sh`), mingw-w64, python3 with PIL and
-numpy. No GPU and no model are needed; `NR_MODEL` makes the reference picture again with RADV.
+Needs, on Linux or in WSL: mingw-w64, g++, patch, zip, python3 with numpy and PIL, `toolchain/glslang`
+(glslang 16.5.0) and `toolchain/Vulkan-Headers`, both from `fetch_deps.sh`. The import library for `vulkan-1.dll` is
+generated from the headers, so no Vulkan loader needs building. No GPU and no model are needed; the reference
+picture is the RDNA3 output committed in `docs/ngx-verification`, and `NR_MODEL` makes it again with RADV.
 `run_frame.exe` is built with `diag.patch` (a step trace and a crash report); the build keeps a copy with symbols in
 `work/run_frame_symbols.exe` so a crash offset maps to a line with `x86_64-w64-mingw32-addr2line`.
 

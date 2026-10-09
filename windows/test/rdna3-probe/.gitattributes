@@ -1,0 +1,9 @@
+# The scripts run in WSL or Linux and must keep LF whatever git does on Windows; the .bat must keep CRLF.
+*.sh   text eol=lf
+*.py   text eol=lf
+*.cpp  text eol=lf
+*.comp text eol=lf
+*.patch text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+*.bat  text eol=crlf

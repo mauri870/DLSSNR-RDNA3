@@ -15,8 +15,9 @@
 # NR_UNROLL=0     keep the shaders as they are (default 1: the pipelines LLPC crashes on, unrolled).
 # NR_ZIP=0        do not zip the kit.
 #
-# Cross-compiled with mingw-w64. Needs what the Windows package build needs (toolchain/glslang,
-# toolchain/Vulkan-Headers, artifacts/ref/Vulkan-Loader built by linux/build/build_vulkan_loader.sh) and PIL.
+# Cross-compiled with mingw-w64, from Linux or WSL. Needs toolchain/glslang (glslang 16.5.0) and
+# toolchain/Vulkan-Headers (both from fetch_deps.sh), mingw-w64, g++, patch, zip, and python3 with numpy and PIL.
+# The import library for vulkan-1.dll is generated here from the Vulkan headers; no loader build is needed.
 # The diagnostic patch (diag.patch) is applied to a copy of the sources; the tree is not touched.
 set -euo pipefail
 cd -- "$(dirname -- "$0")/../../.."
@@ -26,16 +27,27 @@ case "$out" in "$(pwd)"/*) ;; *) echo 'output directory must be in the project' 
 cxx=x86_64-w64-mingw32-g++
 command -v "$cxx" >/dev/null || { echo "no mingw cross compiler ($cxx)" >&2; exit 1; }
 glslang=toolchain/glslang/bin/glslang
-implib=artifacts/ref/Vulkan-Loader/build-x86_64/loader/libvulkan-1.dll.a
-for f in "$glslang" "$implib" toolchain/Vulkan-Headers/include/vulkan/vulkan.h; do
-    [[ -e "$f" ]] || { echo "missing: $f" >&2; exit 1; }
+for f in "$glslang" toolchain/Vulkan-Headers/include/vulkan/vulkan_core.h; do
+    [[ -e "$f" ]] || { echo "missing: $f (bash fetch_deps.sh)" >&2; exit 1; }
 done
+for tool in x86_64-w64-mingw32-dlltool x86_64-w64-mingw32-strip g++ patch zip python3; do
+    command -v "$tool" >/dev/null || { echo "missing tool: $tool" >&2; exit 1; }
+done
+python3 -c 'import numpy, PIL' 2>/dev/null || { echo 'python3 needs numpy and PIL (apt install python3-numpy python3-pil)' >&2; exit 1; }
 version=$(bash linux/build/version.sh)
 work="$out/work"
 kit="$out/rdna3-windows-test-$version"
 mkdir -p -- "$out"
 rm -rf -- "${work:?}" "${kit:?}"
 mkdir -p -- "$work" "$kit/dlssnr-amd" "$kit/model-tools" "$kit/source" "$kit/probe-micro" "$kit/probe-micro2"
+
+# Import library for vulkan-1.dll: every vk* function the header declares. A symbol the loader does not export
+# costs nothing unless something links against it.
+{ echo 'LIBRARY vulkan-1.dll'; echo 'EXPORTS'
+  grep -ohE 'VKAPI_CALL +vk[A-Za-z0-9_]+' toolchain/Vulkan-Headers/include/vulkan/vulkan_core.h | awk '{print $2}' | sort -u
+} > "$work/vulkan-1.def"
+x86_64-w64-mingw32-dlltool -d "$work/vulkan-1.def" -l "$work/libvulkan-1.dll.a"
+implib="$work/libvulkan-1.dll.a"
 defines=$(bash -c 'source linux/build/arch/rdna3.sh; printf "%s " "${NR_PRODUCT_DEFINES[@]}"')
 
 # ---- the network ----------------------------------------------------------------------------------------
