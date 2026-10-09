@@ -1537,6 +1537,90 @@ layout(set = 0, binding = 0, std430) NR_COH    buffer ActE4M3 { NR_E4M3 act_e4m3
 layout(set = 0, binding = 1, std430) NR_COH    buffer ActF16  { NR_F16  act_f16[]; };
 layout(set = 0, binding = 2, std430) readonly buffer WgtE4M3 { NR_E4M3 wgt_e4m3[]; };
 layout(set = 0, binding = 3, std430) readonly buffer WgtF32  { float   wgt_f32[]; };
+#ifndef NR_SWI4
+#define NR_SWI4 0
+#endif
+// NR_SWI4_MASKQ: the int4 x/y packing and the expansion's dequantisation skip the tiles whose MMAs the
+// edge masks already skip (their results are never used).
+#ifndef NR_SWI4_MASKQ
+#define NR_SWI4_MASKQ 0
+#endif
+#if NR_SWI4_MASKQ
+#define NR_MSK4(g) g
+#else
+#define NR_MSK4(g)
+#endif
+#if defined(NR_SWQ4) && NR_SWQ4 && !NR_SWI4
+#error "NR_SWQ4 needs NR_SWI4 (the record, lds_y4 and the int4 helpers)"
+#endif
+#if NR_SWI4 && (NR_PBATCH > 1 || !NR_HWAVES || NR_HEADS == 1 || !NR_ACT_F32)
+#error "NR_SWI4: the head-split multi-head body with f32 activation, one item a workgroup"
+#endif
+#if NR_SWI4
+// NR_SWI4: the multi-head MLP on int4 (the host rewrites the int8 WMMA to iu4). pc.e_off
+// points at a u32 record: [0] magic, [1] expansion-input quantiser (vec2 index: 1/step, zero + 1.5*2^23),
+// [2] expansion int4 weights (bytes; [4C/16][C/64] records of 512 B), [3] expansion scale index (s[4C], c[4C]).
+// LDS: the window's x as int4 records after the first 32C bytes of lds_y (lds_y4), token tile m at m*8C.
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_control_flow_attributes : require
+// u32 index of the int4 copies in lds_y4: byte 32C, but not below 8 KB. lds_k and lds_v (FP16 here, 4 KB each at
+// every width) live in the first 8 KB while the Q, K and V products read the y copy, and at C=128 byte 32C is 4 KB.
+#if NR_C >= 256
+#define NR_SWI4_X4 uint(NR_C * 8)
+#else
+#define NR_SWI4_X4 2048u
+#endif
+#define NR_SWI4_REC (pc.e_off / 4u)       // u32 index of the record
+// k steps of 32 nibbles (a step is two 16-channel fragments) and records of two steps, for the Q, K and V products.
+#define NR_Q4STEPS (NR_CF / 2)
+#define NR_Q4REC ((NR_Q4STEPS + 1) / 2)
+// gfx11 has only the 16x16x16 iu4, which reads two of an int8 fragment's four operand registers; a fragment holds
+// all 16 bytes (32 nibbles) of a lane's row and is multiplied twice into the same accumulator (NR_I4_MMA2): the host
+// rewrites the marked second WMMA to read the fragment's other two registers (gemm1x1.comp NR_I4FRAG).
+#define NR_S4FRAG(dst, u) { const i8vec4 x0_ = unpack8(int((u).x)), x1_ = unpack8(int((u).y)), \
+        x2_ = unpack8(int((u).z)), x3_ = unpack8(int((u).w)); \
+    for (int v = 0; v < 4; ++v) { dst[v] = x0_[v]; dst[v + 4] = x1_[v]; dst[v + 8] = x2_[v]; dst[v + 12] = x3_[v]; } }
+// fragment F of a record from its two slots (slot r, slot r + 16): F = 0: .xy | .xy; F = 1: .zw | .zw
+#define NR_S4SLOTS0(lo, hi) uvec4((lo).x, (lo).y, (hi).x, (hi).y)
+#define NR_S4SLOTS1(lo, hi) uvec4((lo).z, (lo).w, (hi).z, (hi).w)
+NR_FRAG_IACC nr_s4mma(NR_FRAG_IACC c, uvec4 w, uvec4 x) {
+    NR_FRAG_I8A a; NR_S4FRAG(a, w) NR_FRAG_I8B b; NR_S4FRAG(b, x)
+    NR_I4_MMA2(c, a, b)
+    return c;
+}
+// Quantisers are one u32 a channel: f16 1/step (low), f16 zero point (high), loaded once a channel fragment.
+void nr_s4q(out uint q[8], uint qi) { for (int c = 0; c < 8; ++c) q[c] = floatBitsToUint(wgt_f32[qi + uint(c)]); }
+// The same for a gfx11 accumulator's components: component c is row 2c + lane/16, so qi is the row's parity
+// and the rows are two apart.
+void nr_s4q2(out uint q[8], uint qi) { for (int c = 0; c < 8; ++c) q[c] = floatBitsToUint(wgt_f32[qi + 2u * uint(c)]); }
+// eight values -> eight signed nibbles (q - 8): clamp(fma(v, a, z), 0, 15) + 1.5*2^23 rounds to the integer
+// in the low mantissa bits; shifted into place by add, the exponent bits removed once, ^8 makes q - 8.
+uint nr_s4pk(float v[8], uint q[8]) {
+    uint u = 0u, mk = 0u;
+    for (int c = 0; c < 8; ++c) {
+        const vec2 az = unpackHalf2x16(q[c]);
+        u += floatBitsToUint(clamp(fma(v[c], az.x, az.y), 0.0, 15.0) + 12582912.0) << (4u * uint(c));
+        mk += floatBitsToUint(12582912.0) << (4u * uint(c));
+    }
+    return (u - mk) ^ 0x88888888u;
+}
+uint nr_s4pack(float v[8], uint qi) { uint q[8]; nr_s4q(q, qi); return nr_s4pk(v, q); }
+// A lane's accumulator components are the rows 2c + lane/16 of its column; this returns the eight consecutive
+// rows 8(lane/16) + k, by trading four values with the lane 16 away (gemm1x1.comp). Every lane takes part.
+float[8] nr_rows8(float[8] v, uint lane) {
+    const bool hi = (lane & 16u) != 0u;
+    float own[4], got[4], r[8];
+    for (int j = 0; j < 4; ++j) {
+        own[j] = hi ? v[4 + j] : v[j];
+        got[j] = subgroupShuffleXor(hi ? v[j] : v[4 + j], 16u);
+    }
+    for (int j = 0; j < 4; ++j) {
+        r[2 * j]     = hi ? got[j] : own[j];
+        r[2 * j + 1] = hi ? own[j] : got[j];
+    }
+    return r;
+}
+#endif
 layout(set = 0, binding = 4, std430) readonly buffer WgtF16  { NR_F16  wgt_f16[]; };
 // **The same bytes, read 32 bits at a time.** The fused RGB projection's 128
 // weights are wave-uniform - the index is a push constant plus an unrolled
@@ -2111,6 +2195,16 @@ bool nr_mlive[NR_WIN / 16];
 #define NR_MGK(m)
 #define NR_MGJ(j)
 #endif
+#if NR_SWI4
+// NR_MGQ: the tiles whose int4 QKV products run. Elsewhere a tile without queries has zero input, so its K and V
+// come out of the always-run epilogue; in the post block a tile past the image but inside the grid has real input
+// and its K/V products must run (the input mask).
+#if NR_EDGE_BODIES && defined(NR_FUSED_IMAGE_OUTPUT)
+#define NR_MGQ(m) NR_MG(m)
+#else
+#define NR_MGQ(m) NR_MGA(m)
+#endif
+#endif
 
 #ifdef NR_FUSED_UPS_BLEND
 #if !NR_IMAGE || NR_ACC_F16 != 0
@@ -2135,7 +2229,15 @@ bool nr_mlive[NR_WIN / 16];
 #error "NR_UPS_ALIAS: head-split wide or one-wave C=32 upsample bodies"
 #endif
 #if (defined(NR_FUSED_UPS_PROJECT) || defined(NR_WIDE_UPS_PROJECT)) && !NR_UPS_ALIAS
+#if NR_SWI4 && NR_HWAVES
+// NR_SWI4 makes every shared variable a block (they alias at offset 0): the projected pixels then share
+// lds_y's first 32C bytes, dead before the middle output (written after the staging barrier) - the
+// NR_UPS_ALIAS reasoning; the int4 x copy lives above 32C.
+#extension GL_EXT_shared_memory_block : require
+shared NrUpsProj { NR_F16 ups_projected[NR_C*16]; };
+#else
 shared NR_F16 ups_projected[NR_C*16];
+#endif
 #endif
 
 // K as [head][token][dim] so the logit product reads it as a plain RowMajor A,
@@ -2173,10 +2275,18 @@ shared NR_F16 ups_projected[NR_C*16];
 #extension GL_EXT_shared_memory_block : require
 shared NrLdsYX { NR_E4M3 lds_y[NR_WIN * NR_C]; NR_E4M3 lds_x[NR_WIN * NR_C]; };
 shared NrUpsProj { NR_F16 ups_projected[NR_C * 16]; };
+#if NR_SWI4
+shared NrLdsY4 { uint lds_y4[NR_WIN * NR_C / 2]; };   // as large as lds_y itself (FP16 here)
+#endif
 #else
 #if NR_PBATCH > 1
 shared NR_E4M3 lds_x[NR_PBATCH * NR_WIN * NR_C];
 shared NR_E4M3 lds_y[NR_PBATCH * NR_WIN * NR_C];
+#elif NR_SWI4
+// NR_SWI4: lds_y also read and written as u32 (the int4 MLP operands), through aliasing blocks.
+#extension GL_EXT_shared_memory_block : require
+shared NrLdsYX { NR_E4M3 lds_y[NR_WIN * NR_C]; NR_E4M3 lds_x[NR_WIN * NR_C]; };
+shared NrLdsY4 { uint lds_y4[NR_WIN * NR_C / 2]; };   // as large as lds_y itself (FP16 here)
 #else
 shared NR_E4M3 lds_x[NR_WIN * NR_C];
 shared NR_E4M3 lds_y[NR_WIN * NR_C];
@@ -2433,10 +2543,23 @@ shared fe4m3vec4 nr_wl[3072];
 #error "NR_PERSIST_DS: head-split dependency-driven persistent body with NR_DS_PROJECT"
 #endif
 #if NR_ACT_HORNER
+// NR_ACT_HS: hard-swish s*x*clamp(a*x + b, 0, 1) for MpCubicSilu, fitted
+// (relative MSE 1e-3 under N(0, 2) inputs); the clamp is the fma's output modifier, s a multiply (to be folded).
+#ifndef NR_ACT_HS
+#define NR_ACT_HS 0
+#endif
+#ifndef NR_HS_A
+#define NR_HS_A 0.184
+#define NR_HS_B 0.505
+#endif
 float nr_act_horner(float x) {
+#if NR_ACT_HS == 2
+    return x * clamp(fma(x, NR_HS_A, NR_HS_B), 0.0, 1.0);   // s folded into the next weights (host NR_HS_FOLD)
+#else
     const float t=clamp(x,-4.0,4.0);
     const float u=fma(-0.055908203125,abs(t),0.447265625);
     return x*fma(t,u,0.89453125);
+#endif
 }
 #define nr_mp_cubic_silu nr_act_horner
 // NR_ACT_ALT: the second value of each pair spells the same Horner steps
@@ -2458,6 +2581,9 @@ float nr_act_horner(float x) {
 #define NR_ALT_M (NR_ACT_ALT == 1 || NR_ACT_ALT == 2)
 #endif
 float nr_act_horner_b(float x) {
+#if NR_ACT_HS == 2
+    return x * clamp(fma(x, NR_HS_A, NR_HS_B), 0.0, 1.0);   // s folded into the next weights (host NR_HS_FOLD)
+#else
     const float t=clamp(x,-4.0,4.0);
 #if NR_ALT_U
     const float u=fma(abs(t),-0.055908203125,0.447265625);
@@ -2473,6 +2599,7 @@ float nr_act_horner_b(float x) {
     return w*x;
 #else
     return x*w;
+#endif
 #endif
 }
 #if NR_ACT_ALT

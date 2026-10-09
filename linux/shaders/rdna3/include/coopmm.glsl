@@ -129,6 +129,25 @@
 // `NR_FRAG_E4M3(acc)` conversion on RDNA4 goes through `NR_QUANT_FRAG` instead.
 #define NR_FRAG_E4M3 coopmat<NR_E4M3, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
 
+// NR_I4: int8 fragments whose bytes each hold two signed int4 (low nibble = even k). The SPIR-V and the driver see
+// v_wmma_i32_16x16x16_iu8; the host rewrites that opcode to v_wmma_i32_16x16x16_iu4 (0xcc44 -> 0xcc45) in the
+// pipeline binary (nrvk.hpp). The iu4 form reads the first two of the fragment's four operand registers, so
+// one multiply is 16 x 16 x 16 int4 at twice the iu8 and f16 rate (linux/test/wmma_rate): only the first eight
+// bytes of a lane's sixteen carry data (gemm1x1.comp NR_I4FRAG).
+#if defined(NR_I4) || defined(NR_I4_OUT) || (defined(NR_I4_SIDE) && NR_I4_SIDE)
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#define NR_FRAG_I8A  coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define NR_FRAG_I8B  coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+#define NR_FRAG_IACC coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define NR_IACC_ZERO NR_FRAG_IACC(0)
+// The int8 fragment holds 32 nibbles, a gfx11 iu4 WMMA reads 16: a fragment is multiplied twice into the same accumulator
+// and the second multiply is marked saturating, which the host's rewrite (nrvk.hpp rewrite_iu4) turns into "read the
+// other half of the operands". Accumulations of nibble products never get near saturating.
+#define NR_I4_MMA2(c, a, b) { (c) = coopMatMulAdd((a), (b), (c)); \
+    (c) = coopMatMulAdd((a), (b), (c), gl_MatrixOperandsSaturatingAccumulation); }
+#endif
+
 // ---- the fragment layout this target actually uses ----------------------
 //
 // Measured with a layout probe on gfx1100 / RADV at wave32, a 16x16 Accumulator:
