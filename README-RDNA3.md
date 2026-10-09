@@ -11,6 +11,8 @@ without warranty.
   [docs/ngx-verification](docs/ngx-verification/NGX-VERIFICATION.md): 45.47 dB at 1080p, 47.71 dB at
   1440p and 49.02 dB at 4K, against 45.56, 47.99 and 49.06 dB for the RDNA4 build. Moving sequences
   have not been run on RDNA3.
+- The package also carries the optional [int4 mixed](#int4-mixed-optional) network: 7 to 8 % less time a
+  frame for 3.5 to 5.4 dB less against NVIDIA's output. The installer asks; the default is the network above.
 
 ## What it costs
 
@@ -20,6 +22,7 @@ The network's time per frame on an RX 7900 XTX, one pass, measured from submit t
 | | 720p | 1080p | 1440p | 4K |
 | --- | --- | --- | --- | --- |
 | RDNA3 (this branch) | 8.5 ms | 15 ms | 26 ms | 56 ms |
+| RDNA3, [int4 mixed](#int4-mixed-optional) | | 13.3 ms | 22.8 ms | 50.8 ms |
 | RDNA3, first working version | | 30 ms | 54 ms | 116 ms |
 | RDNA4, RX 9070 XT (main README) | | 5.6 ms | 9.7 ms | 21.9 ms |
 
@@ -136,6 +139,64 @@ realistic 75 %, against 56 ms now. By family at 4K (ms of the frame, share of th
 The C=64 runs are limited by LDS occupancy (8 KB a wave, four waves a SIMD) and cannot be raised exactly:
 both 64-token buffers are live in the same stage and every wave reads both.
 
+## int4 mixed (optional)
+
+The main project's second network, ported: the heavy matrices of the ViT (the FFN and the QKV), of the C=512
+attention (the QKV) and of the C=256 and C=128 Swin runs (the MLP expansion and the Q, K, V products) run in
+int4, the Swin activations use a hard-swish folded into the next weights, and the rest is the default
+network. Its picture is not the default network's: the tables (`linux/data/int4/rdna4`, 1,112 game frames
+of calibration) are what define it. The installer asks (`--int4`, `--no-int4`; Enter is no), makes the weights
+from your model on your machine, checks them against the pinned SHA-256 and prints the two launch options the
+Vulkan layer needs (`VK_ADD_LAYER_PATH`, `VK_INSTANCE_LAYERS`); Ctrl+F11 in game switches between the two
+networks; `[Int4Mixed]` in `dlssnr-amd.ini`. RDNA3 makes the same weights as RDNA4: the tables are calibrated on
+the FP8 network, whose e4m3 values this build reproduces, and `dlssnr-int4.bin` has the same SHA-256.
+
+Against the default network (RX 7900 XTX, `linux/test/check_rdna3_int4.py --perf`, wall time of the network):
+
+| | 1080p | 1440p | 4K |
+| --- | --- | --- | --- |
+| default | 14.8 ms, 45.47 dB | 25.2 ms, 47.71 dB | 56.1 ms, 49.02 dB |
+| int4 mixed | 13.3 ms, 41.92 dB | 22.8 ms, 43.36 dB | 50.8 ms, 43.62 dB |
+
+The dB are PSNR against NVIDIA's own output. At 50 % model resolution at 4K the frame takes 13.7 ms instead of 15.0.
+The ViT's own kernels go from 3.8 to 2.4 ms at 4K; the C=256 Swin runs gain only 5 to 6 % (4.8 to 4.5 and 4.6 to
+4.3 ms), where the matrix time they hold would allow far more: they are at the register limit (see below).
+
+How it runs on gfx11:
+
+- **The instruction.** gfx11 has `v_wmma_i32_16x16x16_iu4`, K = 16, and it runs at twice the rate of iu8 and f16:
+  249 against 131 to 134 TOPS (`linux/test/wmma_rate/run.sh`). gfx12 has the K = 32 form instead, a one-byte opcode
+  swap of the iu8 one. Vulkan has no int4 matrix type, so the shaders multiply int8 fragments whose bytes hold two
+  nibbles, and the host rewrites the opcode in the pipeline binary (`VK_KHR_pipeline_binary`, which RADV has;
+  `nrvk.hpp` `rewrite_iu4`, markers `g_<name>.spv.iu4`, 0xcc44 to 0xcc45).
+- **Half an operand.** The iu4 form reads the first two of an int8 operand's four registers: 16 nibbles of the 32 a
+  fragment holds. A fragment filled with 8 bytes and 8 zeros wastes half its registers, and the kernels were
+  at 256 VGPRs already: 8,000 to 14,000 scratch instructions in the persistent runs. So a fragment holds
+  16 bytes and is multiplied twice into the same accumulator, the second time marked saturating
+  (`NR_I4_MMA2`; a nibble accumulation never saturates). The mark is the instruction's clamp bit; the rewrite clears
+  it and points the marked WMMA at the other two registers of both operands. An earlier version matched the pairs by
+  register and broke whenever the compiler spilled between the two; the mark is in the instruction. The
+  rewrite counts the marked and the unmarked and refuses a pipeline where they differ, and it matches the whole
+  WMMA encoding, not the opcode word alone: that pattern also appeared twice in a 2,688-WMMA kernel's data.
+- **Records.** The weight and activation records are upstream's (512 bytes, slot l is row l%16, bytes 8(l/16)..+7 of
+  two steps); a gfx11 lane loads slots r and r + 16, whose first halves make fragment 0 and second halves fragment 1.
+  An accumulator component is channel 2c + l/16, not 8(l/16) + c, so the folds index that way and the
+  wave-wide epilogue goes through `nr_rows8` first.
+- **Where the int4 copies live.** In the Swin runs the x and y copies are `uint` views of `lds_y`. They sit at
+  byte max(32C, 8 KB): the K and V staging is FP16 here, 8 KB at every width, where upstream's is 4 KB. The y copy is
+  built after the barrier that ends the contraction loop, because that loop still reads the middle output out of
+  `lds_y` here (it does not on RDNA4), and read back from `lds_x`, where a gfx11 B fragment has the channels in
+  order.
+- **Registers.** An FP16 fragment is twice an FP8 one, so the int accumulators are kept to one hidden row group at
+  a time (`NR_EXPAND_GROUP=1`, one token tile at a time in the expansion), and the loops that would hoist the weight
+  loads are kept from it. 700 scratch instructions remain in the two 256-thread runs (280 in the default network).
+  Doing the Q and K products one token tile at a time as well spilled more.
+
+Limits: int4 mixed needs the persistent kernels (the hard-swish fold and the layer-by-layer C=128 pipelines do not
+go together; the runtime refuses it), `VK_KHR_pipeline_binary` and `VK_KHR_maintenance5` on the game's device
+(the layer adds them), and the first start takes longer (the rewritten pipelines are cached in
+`dlssnr-amd/int4/pipeline-binaries`). `check_rdna3_int4.py` has the checks; it has not been run in a game yet.
+
 ## What did not work
 
 Each of these looked promising and did not pay off.
@@ -161,7 +222,8 @@ Each of these looked promising and did not pay off.
 - INT8 matrix instructions instead of FP16: on RDNA3 they are not faster. `linux/test/wmma_rate/run.sh` times
   16x16x16 cooperative-matrix multiplies on an RX 7900 XTX and gets 131 to 135 TFLOPS in f16 and 132 to 140 TOPS
   in int8, so int8 would only change the memory traffic, and a simulated int8 network loses 1 to 2.6 dB
-  against NVIDIA.
+  against NVIDIA. The iu4 form of the same multiply is twice as fast, which is what [int4 mixed](#int4-mixed-optional)
+  uses.
 - Other tile shapes for the `gemmprojw` GEMM that keep the host's 64x128 tile: the best gains 0.15 ms on
   one of its two uses and loses 0.4 ms on the other. The frame time itself varies by about 0.1 ms from
   run to run.
@@ -251,6 +313,7 @@ python3 linux/test/check_rdna3.py --model dlssnr.bin             # build, then c
 python3 linux/test/check_rdna3.py --model dlssnr.bin --perf      # also the time per frame
 python3 linux/test/check_rdna3.py --model dlssnr.bin --profile   # and the time of every kernel at 4K
 python3 linux/test/check_rdna3.py --model dlssnr.bin --isa       # and instruction mix, VGPRs, spills
+python3 linux/test/check_rdna3_int4.py --model dlssnr.bin         # the same for int4 mixed (--perf, --update-golden)
 ```
 
 It builds the network and host, runs the e4m3 quantiser against the reference over every input, runs the
