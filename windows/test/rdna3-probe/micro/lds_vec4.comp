@@ -1,0 +1,28 @@
+#version 460
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 32) in;
+layout(set = 0, binding = 0, std430) buffer OutF { float outf[]; };
+layout(set = 0, binding = 1, std430) buffer InH { float16_t inh[]; };
+layout(push_constant) uniform P { uint off; uint stride; } pc;
+#define FA coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define FB coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+#define FC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define FC16 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define ROW gl_CooperativeMatrixLayoutRowMajor
+#define COL gl_CooperativeMatrixLayoutColumnMajor
+shared f16vec4 lv[256];
+void main() {
+  const uint t = gl_LocalInvocationID.x;
+  for (uint i = t; i < 256u; i += 32u) lv[i] = f16vec4(inh[(i * 4u) & 255u], inh[(i * 4u + 1u) & 255u], inh[(i * 4u + 2u) & 255u], inh[(i * 4u + 3u) & 255u]);
+  barrier();
+
+  FA a; FB b;
+  coopMatLoad(a, lv, 0u, 4u, ROW);
+  coopMatLoad(b, lv, 64u, 4u, COL);
+  FC c = FC(0.0);
+  c = coopMatMulAdd(a, b, c);
+  coopMatStore(c, outf, 0u, 16u, ROW);
+}

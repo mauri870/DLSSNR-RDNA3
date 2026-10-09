@@ -1,0 +1,221 @@
+diff --git a/linux/src/core/nr_graph.cpp b/linux/src/core/nr_graph.cpp
+index f73ba84..b88d341 100644
+--- a/linux/src/core/nr_graph.cpp
++++ b/linux/src/core/nr_graph.cpp
+@@ -4442,9 +4442,12 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
+         // garbage here, and nothing reads them through an e4m3 view.
+         std::array<uint16_t, 256> to_f16{};
+         for (int i = 0; i < 256; ++i) to_f16[size_t(i)] = tin::f_to_f16(tin::e4m3_to_f(uint8_t(i)));
++        NRVK_STEP("expanding %zu weight bytes to FP16", wblob.size());
+         std::vector<uint16_t> expanded(wblob.size());
+         for (size_t i = 0; i < wblob.size(); ++i) expanded[i] = to_f16[wblob[i]];
++        NRVK_STEP("expanded; uploading the FP16 weights");
+         ctx.upload(wgt_e, 0, expanded.data(), expanded.size() * 2);
++        NRVK_STEP("FP16 weights uploaded");
+     }
+ #endif
+     timer.mark("weights-upload");
+diff --git a/linux/src/core/nrvk.hpp b/linux/src/core/nrvk.hpp
+index 56a8080..be49897 100644
+--- a/linux/src/core/nrvk.hpp
++++ b/linux/src/core/nrvk.hpp
+@@ -22,6 +22,7 @@
+ #include <map>
+ #include <set>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <fstream>
+ #include <functional>
+@@ -37,6 +38,12 @@ inline void check(VkResult r, const char* what) {
+         throw std::runtime_error(std::string(what) + ": VkResult=" + std::to_string(r));
+ }
+ #define NRVK_CHECK(expr) ::nrvk::check((expr), #expr)
++// Diagnostic breadcrumbs on stderr (-DNRVK_TRACE): the last one printed before a crash names the step.
++#ifdef NRVK_TRACE
++#define NRVK_STEP(...) do { std::fprintf(stderr, "[trace] " __VA_ARGS__); std::fputc('\n', stderr); std::fflush(stderr); } while (0)
++#else
++#define NRVK_STEP(...) do {} while (0)
++#endif
+ 
+ struct Buffer {
+     VkBuffer handle{};
+@@ -144,7 +151,8 @@ struct Context {
+         // the first one. It is here for `--storage-barrier`, which says
+         // "storage buffer" where the legacy mask can only say "shader read".
+         f13.synchronization2 = VK_TRUE;
+-        coop.pNext = &fp8; fp8.pNext = &f11; f11.pNext = &f12; f12.pNext = &f13;
++        coop.pNext = (NR_ARCH_RDNA3 && std::getenv("NRVK_NO_FP8_STRUCT")) ? static_cast<void*>(&f11) : static_cast<void*>(&fp8);
++        fp8.pNext = &f11; f11.pNext = &f12; f12.pNext = &f13;
+ 
+         VkPhysicalDeviceSubgroupSizeControlProperties sg{
+             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+@@ -184,7 +192,7 @@ struct Context {
+             q.pNext = &wml;
+             vkGetPhysicalDeviceFeatures2(physical, &q);
+         }
+-        const bool have_wml = wml.workgroupMemoryExplicitLayout && wml.workgroupMemoryExplicitLayout8BitAccess
++        const bool have_wml = !std::getenv("NRVK_NO_WML") && wml.workgroupMemoryExplicitLayout && wml.workgroupMemoryExplicitLayout8BitAccess
+                               && wml.workgroupMemoryExplicitLayout16BitAccess;
+         wml.pNext = nullptr;
+         wml.workgroupMemoryExplicitLayoutScalarBlockLayout = VK_FALSE;
+@@ -206,6 +214,18 @@ struct Context {
+         NRVK_CHECK(vkCreateDevice(physical, &di, nullptr, &device));
+         vkGetDeviceQueue(device, family, 0, &queue);
+         vkGetPhysicalDeviceMemoryProperties(physical, &mem);
++#ifdef NRVK_TRACE
++        {
++            VkPhysicalDeviceProperties pr; vkGetPhysicalDeviceProperties(physical, &pr);
++            VkPhysicalDeviceDriverProperties dp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
++            VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2}; p2.pNext = &dp;
++            vkGetPhysicalDeviceProperties2(physical, &p2);
++            NRVK_STEP("device '%s' vendor 0x%x id 0x%x type %d api %u.%u.%u driver 0x%x", pr.deviceName, pr.vendorID, pr.deviceID, int(pr.deviceType), VK_VERSION_MAJOR(pr.apiVersion), VK_VERSION_MINOR(pr.apiVersion), VK_VERSION_PATCH(pr.apiVersion), pr.driverVersion);
++            NRVK_STEP("driver '%s' '%s'", dp.driverName, dp.driverInfo);
++            for (uint32_t i = 0; i < mem.memoryHeapCount; ++i) NRVK_STEP("heap %u: %.0f MB flags 0x%x", i, double(mem.memoryHeaps[i].size) / 1e6, unsigned(mem.memoryHeaps[i].flags));
++            for (uint32_t i = 0; i < mem.memoryTypeCount; ++i) NRVK_STEP("memory type %u: heap %u flags 0x%x", i, mem.memoryTypes[i].heapIndex, unsigned(mem.memoryTypes[i].propertyFlags));
++        }
++#endif
+     }
+ 
+     // ---- running on somebody else's device --------------------------------
+@@ -424,11 +444,16 @@ struct Context {
+                                                   : "no device-local, non-host-visible memory type");
+         VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+         alloc.allocationSize = req.size; alloc.memoryTypeIndex = type;
++        NRVK_STEP("buffer %llu bytes (host visible %d): memory type %u flags 0x%x, allocating %llu bytes", (unsigned long long)bytes, int(host_visible), type, unsigned(mem.memoryTypes[type].propertyFlags), (unsigned long long)req.size);
+         NRVK_CHECK(vkAllocateMemory(device, &alloc, nullptr, &b.memory));
++        NRVK_STEP("allocated; binding");
+         NRVK_CHECK(vkBindBufferMemory(device, b.handle, b.memory, 0));
+         if (host_visible) {
++            NRVK_STEP("mapping");
+             NRVK_CHECK(vkMapMemory(device, b.memory, 0, bytes, 0, &b.mapped));
++            NRVK_STEP("mapped at %p; clearing %llu bytes", b.mapped, (unsigned long long)bytes);
+             std::memset(b.mapped, 0, bytes);
++            NRVK_STEP("cleared");
+         }
+         return b;
+     }
+@@ -437,8 +462,11 @@ struct Context {
+     // the staging buffer lives exactly as long as the copy.
+     void transfer(Buffer& gpu, VkDeviceSize offset, void* host, VkDeviceSize bytes, bool to_gpu) {
+         if (!bytes) return;
++        NRVK_STEP("transfer %s: %llu bytes", to_gpu ? "to the GPU" : "from the GPU", (unsigned long long)bytes);
+         Buffer stage = buffer(bytes, true);
++        NRVK_STEP("staging buffer ready");
+         if (to_gpu) std::memcpy(stage.mapped, host, bytes);
++        NRVK_STEP("copied into the staging buffer");
+         VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+         cpi.queueFamilyIndex = family;
+         VkCommandPool pool;
+@@ -462,8 +490,11 @@ struct Context {
+         VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+         VkFence fence;
+         NRVK_CHECK(vkCreateFence(device, &fi, nullptr, &fence));
++        NRVK_STEP("submitting the copy");
+         submit(si, fence);
++        NRVK_STEP("waiting for the copy");
+         NRVK_CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, 30000000000ull));
++        NRVK_STEP("copy finished");
+         if (!to_gpu) std::memcpy(host, stage.mapped, bytes);
+         vkDestroyFence(device, fence, nullptr);
+         vkDestroyCommandPool(device, pool, nullptr);
+@@ -773,6 +804,7 @@ struct Kernel {
+         const uint32_t ni = uint32_t(images.size());
+         const uint32_t na = uint32_t(aliases.size());
+         const uint32_t n = nb + ni + na;
++        NRVK_STEP("pipeline %s: %u buffers, %u images, %u aliases, push %u bytes", spirv_path.c_str(), nb, ni, na, push_bytes);
+         std::vector<VkDescriptorSetLayoutBinding> lb(n);
+         for (uint32_t i = 0; i < nb; ++i)
+             lb[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+@@ -784,12 +816,14 @@ struct Kernel {
+             lb[nb + ni + i] = {aliases[i].first, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+         VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+         li.bindingCount = n; li.pBindings = lb.data();
++        NRVK_STEP("  descriptor set layout");
+         NRVK_CHECK(vkCreateDescriptorSetLayout(device, &li, nullptr, &dsl));
+ 
+         VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, push_bytes};
+         VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+         pli.setLayoutCount = 1; pli.pSetLayouts = &dsl;
+         pli.pushConstantRangeCount = push_bytes ? 1 : 0; pli.pPushConstantRanges = &pcr;
++        NRVK_STEP("  pipeline layout");
+         NRVK_CHECK(vkCreatePipelineLayout(device, &pli, nullptr, &layout));
+ 
+         std::vector<VkDescriptorPoolSize> ps;
+@@ -799,9 +833,11 @@ struct Kernel {
+                                              : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1});
+         VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+         dpi.maxSets = 1; dpi.poolSizeCount = uint32_t(ps.size()); dpi.pPoolSizes = ps.data();
++        NRVK_STEP("  descriptor pool");
+         NRVK_CHECK(vkCreateDescriptorPool(device, &dpi, nullptr, &pool));
+         VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+         dai.descriptorPool = pool; dai.descriptorSetCount = 1; dai.pSetLayouts = &dsl;
++        NRVK_STEP("  descriptor set");
+         NRVK_CHECK(vkAllocateDescriptorSets(device, &dai, &set));
+         std::vector<VkDescriptorBufferInfo> bi(nb + na);
+         std::vector<VkDescriptorImageInfo> ii(ni);
+@@ -831,17 +867,20 @@ struct Kernel {
+ 
+         VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+         smi.codeSize = code.size() * 4; smi.pCode = code.data();
++        NRVK_STEP("  shader module (%zu bytes of SPIR-V)", code.size() * 4);
+         NRVK_CHECK(vkCreateShaderModule(device, &smi, nullptr, &module));
+         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo req{
+             VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
+         req.requiredSubgroupSize = 32;
+         VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+         cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+-        cpi.stage.pNext = &req;
++        if (!std::getenv("NRVK_NO_SUBGROUP_SIZE")) cpi.stage.pNext = &req;
+         cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+         cpi.stage.module = module; cpi.stage.pName = "main";
+         cpi.layout = layout;
+-        NRVK_CHECK(vkCreateComputePipelines(device, ctx.pipeline_cache, 1, &cpi, nullptr, &pipeline));
++        NRVK_STEP("  compute pipeline (required subgroup size %s, pipeline cache %s)", cpi.stage.pNext ? "32" : "off", (!std::getenv("NRVK_NO_PIPELINE_CACHE") && ctx.pipeline_cache) ? "on" : "off");
++        NRVK_CHECK(vkCreateComputePipelines(device, std::getenv("NRVK_NO_PIPELINE_CACHE") ? VkPipelineCache(VK_NULL_HANDLE) : ctx.pipeline_cache, 1, &cpi, nullptr, &pipeline));
++        NRVK_STEP("  pipeline ready");
+     }
+ 
+     void destroy() {
+diff --git a/linux/test/run_frame.cpp b/linux/test/run_frame.cpp
+index 33ba1ca..6001855 100644
+--- a/linux/test/run_frame.cpp
++++ b/linux/test/run_frame.cpp
+@@ -45,7 +45,37 @@ static float from_half(uint16_t h) {
+     return std::ldexp(float(m | 0x400), e - 25);
+ }
+ 
++#ifdef _WIN32
++#define NOMINMAX
++#include <windows.h>
++// A crash prints where it happened (module, offset, the address touched) and a short stack, to stderr.
++static void describe(void* address, char* out, size_t size) {
++    HMODULE module = nullptr;
++    char name[MAX_PATH] = "?";
++    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)address, &module) && module) GetModuleFileNameA(module, name, MAX_PATH);
++    const char* slash = std::strrchr(name, '\\');
++    std::snprintf(out, size, "%s+0x%llx", slash ? slash + 1 : name, (unsigned long long)((char*)address - (char*)module));
++}
++static LONG WINAPI crash_filter(EXCEPTION_POINTERS* e) {
++    const EXCEPTION_RECORD* r = e->ExceptionRecord;
++    char where[400];
++    describe(r->ExceptionAddress, where, sizeof where);
++    std::fprintf(stderr, "[crash] exception 0x%08lx at %s (exe loaded at %p)\n", r->ExceptionCode, where, (void*)GetModuleHandleW(nullptr));
++    if (r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r->NumberParameters >= 2)
++        std::fprintf(stderr, "[crash] %s address %p\n", r->ExceptionInformation[0] == 0 ? "reading" : r->ExceptionInformation[0] == 1 ? "writing" : "executing", (void*)r->ExceptionInformation[1]);
++    void* frames[62];
++    const USHORT count = CaptureStackBackTrace(0, 62, frames, nullptr);
++    for (USHORT i = 0; i < count; ++i) { describe(frames[i], where, sizeof where); std::fprintf(stderr, "[crash]   #%u %s\n", unsigned(i), where); }
++    std::fflush(stderr);
++    return EXCEPTION_EXECUTE_HANDLER;
++}
++#endif
++
+ int main(int argc, char** argv) try {
++#ifdef _WIN32
++    SetUnhandledExceptionFilter(crash_filter);
++#endif
++    if (std::getenv("RUN_FRAME_TEST_CRASH")) *(volatile int*)0 = 1;   // exercises the crash report
+     if (argc < 6) { std::fprintf(stderr, "usage: run_frame <root> <in.rgba8> <w> <h> <out.rgba8> [timed passes]\n"); return 2; }
+     const uint32_t width = uint32_t(atoi(argv[3])), height = uint32_t(atoi(argv[4]));
+     const int timed = argc > 6 ? atoi(argv[6]) : 0;
