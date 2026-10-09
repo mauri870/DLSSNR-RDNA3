@@ -2,7 +2,8 @@
 // and int8 (int32 accumulator). run.sh builds the four shaders this loads (f1, f2: f16 with 5000 and 20000 loop
 // iterations; i1, i2: the same in int8) and this program. Each pass is timed from the host, including pipeline
 // creation, so the rate comes from the difference between the two loop lengths, which cancels that cost.
-// On an RX 7900 XTX both types run at about 132 to 136 T(FL)OPS: int8 is not faster than f16 on RDNA3.
+// On an RX 7900 XTX both types run at about 132 to 136 T(FL)OPS: int8 is not faster than f16 on RDNA3. iu4_rate.cpp
+// measures the same int8 kernel rewritten to iu4, which is.
 #include "../vkrun.hpp"
 #include <chrono>
 
