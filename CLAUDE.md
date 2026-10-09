@@ -39,7 +39,12 @@ Notes for contributors and coding assistants. README.md covers what the project 
   leaves the arithmetic alone must be EXACT; a change that does not is a new golden and needs a reason in the
   commit. Time kernels with the GPU idle.
 - A raw 32-bit view of an arena (counters, sync words, scale tables) goes at alias binding 16 plus the arena's
-  binding, never next to an e4m3 view: the e4m3 bindings read the FP16 twin buffer.
+  binding, never next to an e4m3 view: the e4m3 bindings read the FP16 twin buffer. The int4 data's views are such.
+- int4 mixed on RDNA3 (`pipelines-int4.json`, `NR_INT4=1` on the host): run `python3 linux/test/check_rdna3_int4.py
+  --model dlssnr.bin` before and after any change to it, as above; its picture is not the default network's and has
+  its own golden. Every int8 fragment in those kernels is multiplied twice with `NR_I4_MMA2` (the second marked
+  saturating): the host rewrite turns the pair into the two halves of the fragment and refuses a pipeline whose
+  WMMAs are not in marked pairs, so a WMMA added outside `NR_I4_MMA2` fails the build of that pipeline.
 
 ## Performance work on RDNA4 (RADV / ACO)
 
