@@ -4013,10 +4013,12 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                     const size_t bytes=rows*K;
                     if(rows%16 || K%16 || size_t(offset)+bytes>wblob.size())
                         throw std::runtime_error("kswap: weight matrix bounds");
-                    uint8_t* t=wblob.data()+offset;
+                    std::vector<uint8_t> t(bytes);
+                    wblob.read(offset, t.data(), bytes);
                     for(size_t tile=0;tile<bytes/256;++tile)
                         for(size_t r=1;r<16;r+=2) for(size_t k=0;k<16;k+=2)
                             std::swap(t[tile*256+r*16+k],t[tile*256+r*16+k+1]);
+                    wblob.write(offset, t.data(), bytes);
                     ++kswap_count;
                 };
                 const std::string& k=pd.kern;
