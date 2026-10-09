@@ -1869,6 +1869,15 @@ void Runtime::set_history_strength(float v) {
 
 void Runtime::release_feature(uint64_t feature) {
     if (!feature) return;
+    // Temporal reuse belongs to the feature that first used it; a host that rebuilds its feature (OptiScaler
+    // does when a setting changes) would otherwise find the stored edit owned by a feature that is gone, and
+    // the network would run on every frame from then on.
+    if (impl_->reuse_owned && impl_->reuse_feature == feature) {
+        impl_->reuse_owned = false;
+        impl_->reuse_feature = 0;
+        impl_->reuse_have = false;
+        impl_->reuse_since = 0;
+    }
     auto it = impl_->features.find(feature);
     if (it == impl_->features.end()) return;
     if (it->second.history.handle)
