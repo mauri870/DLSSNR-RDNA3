@@ -337,6 +337,31 @@
             NR_STORE_ACC_COL(dst, lds_x, NR_LXB_ (uint(m) * uint(NR_CF) + k) * 256u, 16u);
 #endif
         }
+#if NR_SWI4
+    // NR_SWI4: this wave's 32 channels (one int4 k step, 2g) of every token tile, from its own lds_x stores. The
+    // k step's record slots are (token l%16, half hh = l/16): half hh holds the 16 channels of fragment 2g+hh as
+    // 8 bytes. A gfx11 B fragment has all 16 channels of the lane's token in both lane halves, so each lane loads
+    // both fragments of the step and packs the one its half owns: no exchange with the lane 16 away.
+    {
+        subgroupMemoryBarrierShared();
+        const uint xq = pc.e_off / 4u;
+        const uint qix = wgt_u32[xq + 1u];
+        const uint hh = lane / 16u;
+        for (int m = 0; m < NR_MF; ++m) NR_MSK4(NR_MG(m)) {
+            NR_FRAG_B xf0, xf1;
+            NR_LOAD_B(xf0, lds_x, NR_LXB_ (uint(m) * uint(NR_CF) + uint(nrhw_h * 2)) * 256u, 16u);
+            NR_LOAD_B(xf1, lds_x, NR_LXB_ (uint(m) * uint(NR_CF) + uint(nrhw_h * 2 + 1)) * 256u, 16u);
+            float v_[16];
+            for (int j = 0; j < 16; ++j) v_[j] = hh == 0u ? float(xf0[j]) : float(xf1[j]);
+            const uint qb = qix + (uint(nrhw_h * 2) + hh) * 16u;
+            float lo_[8], hi_[8];
+            for (int j = 0; j < 8; ++j) { lo_[j] = v_[j]; hi_[j] = v_[8 + j]; }
+            const uvec2 w2 = uvec2(nr_s4pack(lo_, qb), nr_s4pack(hi_, qb + 8u));
+            const uint a4 = NR_LXB_ NR_SWI4_X4 + uint(m) * uint(NR_C * 2) + uint(nrhw_h / 2) * 128u + lane * 4u + uint(nrhw_h % 2) * 2u;
+            lds_y4[a4] = w2.x; lds_y4[a4 + 1u] = w2.y;
+        }
+    }
+#endif
     NR_BODY_BARRIER();
 #else
 #if defined(NR_FUSED_POST_BLEND) && NR_POST_BLEND_PK && NR_BLEND_VECTOR_LOAD && NR_POST_REUSE && !NR_BLEND_G32
@@ -666,8 +691,8 @@
 #ifndef NR_EXPAND_GROUP
 #define NR_EXPAND_GROUP 2
 #endif
-#if NR_EXPAND_GROUP != 2 && NR_EXPAND_GROUP != 4
-#error "NR_EXPAND_GROUP must be 2 or 4"
+#if NR_EXPAND_GROUP != 2 && NR_EXPAND_GROUP != 4 && !(NR_SWI4 && NR_EXPAND_GROUP == 1)
+#error "NR_EXPAND_GROUP must be 2 or 4 (1 on the int4 expansion, which has no paired weights)"
 #endif
 #if (NR_HGF % NR_EXPAND_GROUP) != 0
 #error "NR_EXPAND_GROUP must divide the hidden-fragment count per head"
@@ -693,6 +718,50 @@
 #endif
         for (int h = 0; h < NR_HGF; h += NR_EXPAND_GROUP) {
             NR_ACCF a[NR_EXPAND_GROUP][NR_MF];
+#if NR_SWI4
+            {
+                // int4: X from lds_y4 (one 16-byte record a token tile and 64 channels), W from the record's
+                // weights; then acc = float(int) * s + c per hidden row. One token tile at a time: an FP16 fragment
+                // is twice the registers of an FP8 one here and these kernels already hold ~250, so the four tiles'
+                // int accumulators (64 registers for a group of two) spilled thousands of instructions; the
+                // weights are read again for every tile instead (L1).
+                const uint xq = pc.e_off / 4u, w4 = wgt_u32[xq + 2u], sci = wgt_u32[xq + 3u];
+#define NR_S4STEPS (NR_CF / 2)
+#define NR_S4REC ((NR_S4STEPS + 1) / 2)
+                // (scale, constant) as one f16 pair a row: half the live registers of two f32 (sci indexes u32).
+                // Component c of a gfx11 accumulator is hidden row 2c + lane/16.
+                uint sp_[NR_EXPAND_GROUP][8];
+                for (int p = 0; p < NR_EXPAND_GROUP; ++p)
+                    nr_s4q2(sp_[p], sci + uint(g * NR_HGF + h + p) * 16u + (lane / 16u));
+                // A record's slot l holds row l%16, bytes 8*(l/16)..+7 of two k steps of 32 nibbles. A gfx11 lane needs
+                // its row's k steps of 16 nibbles (8 bytes): slot r (first half of both steps) and slot r + 16 (the
+                // second half), so the four k steps of a record are slot r .xy, slot r + 16 .xy, slot r .zw and
+                // slot r + 16 .zw, for X and W alike (gemm1x1.comp).
+                for (int m = 0; m < NR_MF; ++m) {
+                    NR_FRAG_IACC ia[NR_EXPAND_GROUP];
+                    for (int p = 0; p < NR_EXPAND_GROUP; ++p) ia[p] = NR_IACC_ZERO;
+                    NR_MG(m) {
+                        for (int r = 0; r < NR_S4REC; ++r) {
+                            const uint b = NR_LXB_ NR_SWI4_X4 + uint(m) * uint(NR_C * 2) + uint(r) * 128u + (lane & 15u) * 4u;
+                            const uvec4 xr = uvec4(lds_y4[b], lds_y4[b + 1u], lds_y4[b + 2u], lds_y4[b + 3u]);
+                            const uvec4 xh = uvec4(lds_y4[b + 64u], lds_y4[b + 65u], lds_y4[b + 66u], lds_y4[b + 67u]);
+                            for (int p = 0; p < NR_EXPAND_GROUP; ++p) {
+                                const uint wb = (w4 + (uint(g * NR_HGF + h + p) * uint(NR_S4REC) + uint(r)) * 512u) / 4u + (lane & 15u) * 4u;
+                                const uvec4 wr = uvec4(wgt_u32[wb], wgt_u32[wb + 1u], wgt_u32[wb + 2u], wgt_u32[wb + 3u]);
+                                const uvec4 wh = uvec4(wgt_u32[wb + 64u], wgt_u32[wb + 65u], wgt_u32[wb + 66u], wgt_u32[wb + 67u]);
+                                ia[p] = nr_s4mma(ia[p], NR_S4SLOTS0(wr, wh), NR_S4SLOTS0(xr, xh));
+                                if (2 * r + 1 < NR_S4STEPS) ia[p] = nr_s4mma(ia[p], NR_S4SLOTS1(wr, wh), NR_S4SLOTS1(xr, xh));
+                            }
+                        }
+                    }
+                    for (int p = 0; p < NR_EXPAND_GROUP; ++p)
+                        NR_MSK4(NR_MG(m)) for (int c = 0; c < 8; ++c) {
+                            const vec2 sc_ = unpackHalf2x16(sp_[p][c]);
+                            a[p][m][c] = fma(float(ia[p][c]), sc_.x, sc_.y);
+                        }
+                }
+            }
+#else
             for (int p = 0; p < NR_EXPAND_GROUP; ++p)
                 for (int m = 0; m < NR_MF; ++m) a[p][m] = NR_ACCZERO;
             NR_EXPAND_KLOOP for (int k = 0; k < NR_CF; ++k) {
@@ -759,6 +828,7 @@
                     for (int p = 0; p < NR_EXPAND_GROUP; ++p)
                         for (int m = 0; m < NR_MF; ++m) NR_RND(a[p][m])
             }
+#endif
             for (int p = 0; p < NR_EXPAND_GROUP; ++p)
             for (int m = 0; m < NR_MF; ++m) NR_MG(m)
 #if NR_ACTIVATION_LUT
@@ -875,6 +945,11 @@
             for(int m=0;m<NR_MF;++m) NR_MG(m) NR_MMA(nr_mid_acc[0][m],wf0,eqg[m][k]);
             for(int m=0;m<NR_MF;++m) NR_MG(m) NR_MMA(nr_mid_acc[1][m],wf1,eqg[m][k]);
         }
+#endif
+#if NR_SWI4
+        // the e4m3 middle output fills all of lds_y, the int4 x copy included: every wave must be done
+        // with its expansion first.
+        NR_BODY_BARRIER();
 #endif
         // This group's output channels are [g*hd, (g+1)*hd), which is NR_DF
         // fragments. No activation here - the host applies none between middle
@@ -1144,6 +1219,11 @@
         for(int m=0;m<NR_MF;++m) NR_MG(m) NR_MMA(nr_contract_acc[1][m],wf1,ctx[m]);
     }
 #endif
+#if NR_SWQ4
+    // NR_SWQ4: every head is done reading the
+    // middle output in lds_y before the int4 y copy overwrites [32C, 64C).
+    NR_BODY_BARRIER();
+#endif
 #if NR_HWAVES
     for (int nn = 0; nn < NR_DF; ++nn) {
         const int n = nrhw_h * NR_DF + nn;
@@ -1303,6 +1383,31 @@
     }
 #if NR_HWAVES
     NR_BODY_BARRIER();                          // y is now everyone's; lds_y is free
+#if NR_SWQ4
+    // NR_SWQ4: the int4 copy of y, for the Q, K and V products. It is built here, once every wave is out of the loop
+    // above, and not inside it: that loop's contraction still reads the middle output out of lds_y, and the copy
+    // lives in lds_y. Fragment n = this wave's 16 channels of token tile m are read back from lds_x, where the loop
+    // stored them: a gfx11 B fragment has all 16 channels of the lane's token in both lane halves, so half hh
+    // packs channels 8hh..8hh+7 (one u32), the word the NR_I4_PAIR record keeps at (token l%16, half nn4 of the
+    // step), word 2(h%2) + hh: record h/2 with h = n/2.
+    {
+        const uint hh4 = lane / 16u;
+        for (int nn = 0; nn < NR_DF; ++nn) {
+            const uint r4 = uint(nrhw_h * NR_DF + nn);
+            const uint st4 = r4 / 2u, nn4 = r4 % 2u;
+            uint yq4[8]; nr_s4q(yq4, wgt_u32[NR_SWI4_REC + 10u] + r4 * 16u + 8u * hh4);
+            for (int m = 0; m < NR_MF; ++m) NR_MSK4(NR_MGQ(m)) {
+                NR_FRAG_B yf;
+                NR_LOAD_B(yf, lds_x, NR_LXB_ (uint(m) * uint(NR_CF) + r4) * 256u, 16u);
+                float v_[8];
+                for (int c = 0; c < 8; ++c) v_[c] = hh4 == 0u ? float(yf[c]) : float(yf[8 + c]);
+                lds_y4[NR_SWI4_X4 + uint(m) * uint(2 * NR_C) + (st4 / 2u) * 128u
+                       + 4u * ((lane % 16u) + 16u * nn4) + 2u * (st4 % 2u) + hh4] = nr_s4pk(v_, yq4);
+            }
+        }
+        NR_BODY_BARRIER();                      // every wave's piece of the copy is in before any product reads it
+    }
+#endif
 #endif
 
 #if NR_DUMP == 1
@@ -1384,6 +1489,41 @@
 #define NR_QK_ROWS ((1 + NR_QK_TOGETHER) * NR_DF)
             NR_ACCF acc[NR_MF][NR_QK_ROWS];
             // ---- pass Q: rows [hh*3*NR_DF, +NR_DF) ----
+#if NR_SWQ4
+            // Q and K on int4 from the y copy (lds_y4 at 32C): A = the head's QKV rows (int4 records,
+            // record word 11), B = y; acc = float(int) * s + c per row (f16 pairs, word 12), zero for skipped
+            // tiles (no affine term on a tile whose MMAs did not run).
+            {
+                const uint xq = NR_SWI4_REC, qw4 = wgt_u32[xq + 11u], qsc = wgt_u32[xq + 12u];
+                NR_FRAG_IACC iq[NR_MF][NR_QK_ROWS];
+                for (int m = 0; m < NR_MF; ++m) for (int d = 0; d < NR_QK_ROWS; ++d) iq[m][d] = NR_IACC_ZERO;
+                // two record slots a lane, two fragments a record (see the expansion)
+                for (int r_ = 0; r_ < NR_Q4REC; ++r_) {
+                    uvec4 wr[NR_QK_ROWS], wh[NR_QK_ROWS];
+                    for (int d = 0; d < NR_QK_ROWS; ++d) {
+                        const uint wb = (qw4 + (uint(hh * 3 * NR_DF + d) * uint(NR_Q4REC) + uint(r_)) * 512u) / 4u + (lane & 15u) * 4u;
+                        wr[d] = uvec4(wgt_u32[wb], wgt_u32[wb + 1u], wgt_u32[wb + 2u], wgt_u32[wb + 3u]);
+                        wh[d] = uvec4(wgt_u32[wb + 64u], wgt_u32[wb + 65u], wgt_u32[wb + 66u], wgt_u32[wb + 67u]);
+                    }
+                    for (int m = 0; m < NR_MF; ++m) NR_MGQ(m) {
+                        const uint b = NR_SWI4_X4 + uint(m) * uint(2 * NR_C) + uint(r_) * 128u + (lane & 15u) * 4u;
+                        const uvec4 xr = uvec4(lds_y4[b], lds_y4[b + 1u], lds_y4[b + 2u], lds_y4[b + 3u]);
+                        const uvec4 xh = uvec4(lds_y4[b + 64u], lds_y4[b + 65u], lds_y4[b + 66u], lds_y4[b + 67u]);
+                        for (int d = 0; d < NR_QK_ROWS; ++d) {
+                            iq[m][d] = nr_s4mma(iq[m][d], NR_S4SLOTS0(wr[d], wh[d]), NR_S4SLOTS0(xr, xh));
+                            if (2 * r_ + 1 < NR_Q4STEPS) iq[m][d] = nr_s4mma(iq[m][d], NR_S4SLOTS1(wr[d], wh[d]), NR_S4SLOTS1(xr, xh));
+                        }
+                    }
+                }
+                for (int d = 0; d < NR_QK_ROWS; ++d) {
+                    uint sp_[8]; nr_s4q2(sp_, qsc + uint(hh * 3 * NR_DF + d) * 16u + (lane / 16u));
+                    for (int m = 0; m < NR_MF; ++m) {
+                        acc[m][d] = NR_ACCZERO;
+                        NR_MGQ(m) for (int c = 0; c < 8; ++c) { const vec2 sc_ = unpackHalf2x16(sp_[c]); acc[m][d][c] = fma(float(iq[m][d][c]), sc_.x, sc_.y); }
+                    }
+                }
+            }
+#else
             for (int m = 0; m < NR_MF; ++m)
                 for (int d = 0; d < NR_QK_ROWS; ++d) acc[m][d] = NR_ACCZERO;
             for (int k = 0; k < NR_CF; ++k) {
@@ -1412,6 +1552,7 @@
                     for (int m = 0; m < NR_MF; ++m)
                         for (int r = 0; r < NR_QK_ROWS; ++r) NR_RND(acc[m][r])
             }
+#endif
             for (int m = 0; m < NR_MF; ++m) NR_MGA(m) {
 #if NR_NORM_F32
                 float sqp[4];
@@ -1564,6 +1705,43 @@
                 }
             }
             // ---- pass V: rows [hh*3*NR_DF + 2*NR_DF, +NR_DF) ----
+#if NR_SWQ4
+#if !NR_V_SWAP
+#error "NR_SWQ4: the swapped V (register-resident) body"
+#endif
+            // V on int4: A = y (lds_y4), B = the head's V rows; the accumulator is [token][dim], so a lane holds
+            // one channel (l%16) of fragment d: one (s, c) a lane. One token tile at a time: two int accumulators
+            // live instead of eight (Q and K are live here; eight cost 40 VGPRs and three waves a SIMD).
+            {
+                // A shared-memory barrier between the passes: without it NIR reuses the Q/K pass's y-record loads
+                // (same addresses, no store between) and keeps all sixteen live across the Q/K epilogue (+43 VGPRs).
+                memoryBarrierShared();
+                const uint xq = NR_SWI4_REC, qw4 = wgt_u32[xq + 11u], qsc = wgt_u32[xq + 12u];
+                vec2 vsc_[NR_DF];
+                for (int d = 0; d < NR_DF; ++d)
+                    vsc_[d] = unpackHalf2x16(floatBitsToUint(wgt_f32[qsc + uint(hh * 3 * NR_DF + 2 * NR_DF + d) * 16u + (lane & 15u)]));
+                for (int m = 0; m < NR_MF; ++m) {
+                    for (int d = 0; d < NR_DF; ++d) acc[m][d] = NR_ACCZERO;
+                    NR_MGQ(m) {
+                        NR_FRAG_IACC iv[NR_DF];
+                        for (int d = 0; d < NR_DF; ++d) iv[d] = NR_IACC_ZERO;
+                        for (int r_ = 0; r_ < NR_Q4REC; ++r_) {
+                            const uint b = NR_SWI4_X4 + uint(m) * uint(2 * NR_C) + uint(r_) * 128u + (lane & 15u) * 4u;
+                            const uvec4 xr = uvec4(lds_y4[b], lds_y4[b + 1u], lds_y4[b + 2u], lds_y4[b + 3u]);
+                            const uvec4 xh = uvec4(lds_y4[b + 64u], lds_y4[b + 65u], lds_y4[b + 66u], lds_y4[b + 67u]);
+                            for (int d = 0; d < NR_DF; ++d) {
+                                const uint wb = (qw4 + (uint(hh * 3 * NR_DF + 2 * NR_DF + d) * uint(NR_Q4REC) + uint(r_)) * 512u) / 4u + (lane & 15u) * 4u;
+                                const uvec4 wr = uvec4(wgt_u32[wb], wgt_u32[wb + 1u], wgt_u32[wb + 2u], wgt_u32[wb + 3u]);
+                                const uvec4 wh = uvec4(wgt_u32[wb + 64u], wgt_u32[wb + 65u], wgt_u32[wb + 66u], wgt_u32[wb + 67u]);
+                                iv[d] = nr_s4mma(iv[d], NR_S4SLOTS0(xr, xh), NR_S4SLOTS0(wr, wh));
+                                if (2 * r_ + 1 < NR_Q4STEPS) iv[d] = nr_s4mma(iv[d], NR_S4SLOTS1(xr, xh), NR_S4SLOTS1(wr, wh));
+                            }
+                        }
+                        for (int d = 0; d < NR_DF; ++d) for (int c = 0; c < 8; ++c) acc[m][d][c] = fma(float(iv[d][c]), vsc_[d].x, vsc_[d].y);
+                    }
+                }
+            }
+#else
             for (int m = 0; m < NR_MF; ++m)
                 for (int d = 0; d < NR_DF; ++d) acc[m][d] = NR_ACCZERO;
             for (int k = 0; k < NR_CF; ++k) {
@@ -1616,6 +1794,7 @@
                     for (int m = 0; m < NR_MF; ++m)
                         for (int r = 0; r < NR_DF; ++r) NR_RND(acc[m][r])
             }
+#endif
 #if NR_V_SWAP
             for (int m = 0; m < NR_MF; ++m) NR_MGK(m)
                 for (int d = 0; d < NR_DF; ++d)
@@ -1949,6 +2128,10 @@
         }
 #endif
 #if !NR_HWAVES
+        NR_BODY_BARRIER();
+#endif
+#if NR_SWQ4
+        // every head is done reading the int4 y copy before the context overwrites lds_y.
         NR_BODY_BARRIER();
 #endif
 
