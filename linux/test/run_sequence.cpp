@@ -92,8 +92,13 @@ int main(int argc, char** argv) try {
         }
         return runtime.record_engine(cmd, frame, controls);
     };
+    // RUN_SEQUENCE_NEWFEATURE=N: from frame N on the host has a new feature (the old one released), as OptiScaler
+    // does when a setting changes. Reuse has to carry on with it.
+    const int new_feature_at = std::getenv("RUN_SEQUENCE_NEWFEATURE") ? atoi(std::getenv("RUN_SEQUENCE_NEWFEATURE")) : -1;
     std::printf("%5s %8s %6s %6s %9s\n", "frame", "reused", "gated", "disp", "wall_ms");
     for (int i = 0; i < frames; ++i) {
+        const bool new_feature = i == new_feature_at;
+        if (new_feature) { runtime.release_feature(frame.feature); frame.feature += 1; }
         const auto rgba = slurp(in_pattern, i);
         if (rgba.size() != size_t(width) * height * 4) throw std::runtime_error("input is not width x height RGBA8");
         std::vector<uint16_t> half(rgba.size());
@@ -107,7 +112,7 @@ int main(int argc, char** argv) try {
             for (size_t k = 0; k < mv.size(); ++k) mv[k] = to_half(f[k]);
         }
         ctx.upload(motion_image, mv.data(), mv.size() * 2);
-        frame.reset = i == 0;
+        frame.reset = i == 0 || new_feature;
         nr::EngineResult result{};
         const auto begin = std::chrono::steady_clock::now();
         ctx.one_shot([&](VkCommandBuffer cmd) { result = record(cmd); });
