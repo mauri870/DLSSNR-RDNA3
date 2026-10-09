@@ -1200,9 +1200,14 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         // hook: vulkan-1.dll is in the process and the game's vkCreateDevice
         // has not happened yet, which is exactly when the device watcher's
         // hooks have to go in. ReShade as dxgi.dll over DXVK/vkd3d-proton finds
-        // vulkan-1 loaded as well; the hooks are harmless there, as long as
-        // they leave with the add-on (DLL_PROCESS_DETACH below).
-        if (GetModuleHandleW(L"vulkan-1.dll")) {
+        // vulkan-1 loaded as well, but takes its Vulkan handles from DXVK and has no use for
+        // the watch - and must not get it: ReShade unloads the add-on when the game's first
+        // (probe) device goes away and loads it again at another address, and a hook that
+        // something else put on top of the watch's detours (it follows jumps) then writes its
+        // saved bytes back into the second copy's code. Only the layer's own module name marks
+        // the layer route.
+        if (GetModuleHandleW(L"vulkan-1.dll") &&
+            (GetModuleHandleW(L"ReShade64.dll") || GetModuleHandleW(L"ReShade32.dll"))) {
             const MH_STATUS mh = MH_Initialize();
             if (mh == MH_OK || mh == MH_ERROR_ALREADY_INITIALIZED) {
                 minhook_initialized = true;
