@@ -977,8 +977,10 @@ struct Kernel {
 #if NR_INT4
         // `<spv>.iu4` marks an int4 pipeline (int8 cooperative matrices whose bytes
         // hold int4 pairs). Its binary is captured, every v_wmma_i32_16x16x16_iu8 (dword hi16 0xcc44)
-        // becomes v_wmma_i32_16x16x32_iu4 (0xcc4a; the second dword is identical), and the copy is
-        // imported under a fresh key. Only this pipeline changes; the file holds the expected count.
+        // becomes the iu4 form (the second dword is identical), and the copy is imported under a fresh
+        // key. Only this pipeline changes; the file holds the expected count. gfx12 has a 16x16x32 iu4
+        // (0xcc4a) that takes the same operand registers; gfx11 has only the 16x16x16 one (0xcc45), which reads
+        // the first half of them.
         std::ifstream iu4(spirv_path + ".iu4");
         if (iu4) {
             int want = -1; iu4 >> want;
@@ -992,6 +994,44 @@ struct Kernel {
     }
 
     int iu4_rewrites = 0;
+    static constexpr uint32_t kIu4Opcode = NR_ARCH_RDNA3 ? 0xcc45u : 0xcc4au;
+    // Rewrites the int8 WMMAs of a shader binary to the iu4 form and returns how many it rewrote (-1: see below).
+    //
+    // gfx12: every v_wmma_i32_16x16x16_iu8 becomes the 16x16x32 iu4 form (0xcc4a); the operand registers are the same.
+    //
+    // gfx11 has only the 16x16x16 iu4 (0xcc45), which reads the first two of an int8 operand's four registers: 16 nibbles
+    // of the 32 a fragment holds. The shader multiplies the two halves of each fragment as two WMMAs into the same
+    // accumulator (NR_I4_MMA2 in coopmm.glsl) and marks the second one saturating, which sets the instruction's clamp
+    // bit (the accumulation never gets near saturating, and RADV advertises it for s8 x s8 -> s32). The rewrite
+    // clears that bit and makes the marked WMMA read the last two registers of both operands (source fields + 2).
+    // The mark is in the instruction, so it survives whatever the register allocator does to the operands. The
+    // marked and unmarked WMMAs are equally many, or -1 is returned.
+    static int rewrite_iu4(uint8_t* code, size_t size) {
+        int n = 0;
+#if NR_ARCH_RDNA3
+        int marked = 0;
+        for (size_t o = 0; o + 8 <= size; o += 4) {
+            uint32_t d1; std::memcpy(&d1, code + o, 4);
+            if ((d1 >> 16) != 0xcc44u) continue;
+            uint32_t d2; std::memcpy(&d2, code + o + 4, 4);
+            // The opcode word alone also matches data (two dwords in a 2,688-WMMA kernel): the rest of the encoding
+            // has to be a WMMA's too - no op_sel, signed A and B (neg_lo:[1,1,0]), VGPR sources, a VGPR or zero accumulator.
+            const uint32_t src0 = d2 & 0x1ffu, src1 = (d2 >> 9) & 0x1ffu, src2 = (d2 >> 18) & 0x1ffu;
+            if ((d1 & 0x7f00u) != 0x4000u || (d2 >> 29) != 3u || src0 < 256u || src1 < 256u || (src2 < 256u && src2 != 128u)) continue;
+            if (d1 & 0x8000u) { d1 &= ~0x8000u; d2 += 2u + (2u << 9); ++marked; }
+            d1 = (d1 & 0xffffu) | (kIu4Opcode << 16);
+            std::memcpy(code + o, &d1, 4); std::memcpy(code + o + 4, &d2, 4);
+            ++n; o += 4;
+        }
+        if (2 * marked != n) return -1;
+#else
+        for (size_t o = 0; o + 8 <= size; o += 4) {
+            uint32_t d; std::memcpy(&d, code + o, 4);
+            if ((d >> 16) == 0xcc44u) { d = (d & 0xffffu) | (kIu4Opcode << 16); std::memcpy(code + o, &d, 4); ++n; o += 4; }
+        }
+#endif
+        return n;
+    }
     void create_iu4(VkComputePipelineCreateInfo cpi, int want, const std::string& path, VkPhysicalDevice physical,
                     const std::vector<uint32_t>& code) {
 #define NRVK_PB(n) auto n = reinterpret_cast<PFN_##n>(vkGetDeviceProcAddr(device, #n))
@@ -1063,10 +1103,9 @@ struct Kernel {
             NRVK_CHECK(vkGetPipelineBinaryDataKHR(device, &gi, &keys[i], &sz, nullptr));
             data[i].resize(sz);
             NRVK_CHECK(vkGetPipelineBinaryDataKHR(device, &gi, &keys[i], &sz, data[i].data()));
-            for (size_t o = 0; o + 8 <= sz; o += 4) {
-                uint32_t d; std::memcpy(&d, &data[i][o], 4);
-                if ((d >> 16) == 0xcc44u) { d = (d & 0xffffu) | (0xcc4au << 16); std::memcpy(&data[i][o], &d, 4); ++n; o += 4; }
-            }
+            const int rewritten = rewrite_iu4(data[i].data(), sz);
+            if (rewritten < 0) throw std::runtime_error("int4 rewrite: the WMMAs are not in marked pairs: " + path);
+            n += rewritten;
             for (uint32_t k = 0; k < keys[i].keySize; ++k) keys[i].key[k] ^= 0x5a;   // never aliases the original
             pdata[i] = {sz, data[i].data()};
             vkDestroyPipelineBinaryKHR(device, bins[i], nullptr);
