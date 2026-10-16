@@ -57,6 +57,9 @@ Notes for contributors and coding assistants. README.md covers what the project 
   its own golden. Every int8 fragment in those kernels is multiplied twice with `NR_I4_MMA2` (the second marked
   saturating): the host rewrite turns the pair into the two halves of the fragment and refuses a pipeline whose
   WMMAs are not in marked pairs, so a WMMA added outside `NR_I4_MMA2` fails the build of that pipeline.
+- The small model (`dlssnr-small.bin`, `[Network] Model`): run `python3 linux/test/check_rdna3_small.py --model
+  dlssnr-small.bin` as above for a change that reaches it; a change to `nr_graph.cpp` or the planner also needs
+  `check_rdna3.py` to stay EXACT.
 
 ## Performance work on RDNA4 (RADV / ACO)
 

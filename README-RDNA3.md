@@ -197,6 +197,27 @@ go together; the runtime refuses it), `VK_KHR_pipeline_binary` and `VK_KHR_maint
 (the layer adds them), and the first start takes longer (the rewritten pipelines are cached in
 `dlssnr-amd/int4/pipeline-binaries`). `check_rdna3_int4.py` has the checks; it has not been run in a game yet.
 
+## The small model (310.9.16's default)
+
+nvngx_dlssnr.dll 310.9.16 holds a second, smaller network (`WEIGHTS_CC_SMALL_FP8`: 31 blocks and 76 layers
+against 71 and 152) and uses it by default. Upstream's loader runs it here unchanged: the same layer families at
+the same widths, on the same shaders. The installer makes `dlssnr-small.bin` from the 310.9.16 DLL, installs both
+models and sets `[Network] Model` in `dlssnr-amd.ini` (`small` by default, `original` for the 310.8.0 model); there
+is no int4 mixed for the small model.
+
+Against NVIDIA's own output of the 310.9.16 DLL (`docs/ngx-verification/310.9.16`), and the network time on an
+RX 7900 XTX (`linux/test/check_rdna3_small.py --perf`, wall time of the network):
+
+| | 1080p | 1440p | 4K |
+| --- | --- | --- | --- |
+| 310.8.0 model | 14.8 ms, 45.47 dB | 25.2 ms, 47.71 dB | 56.1 ms, 49.02 dB |
+| small model | 9.6 ms, 49.36 dB | 15.3 ms, 49.45 dB | 32.3 ms, 50.58 dB |
+| small model, RDNA4 (upstream) | | | 49.15 / 49.40 / 50.59 dB |
+
+The 310.8.0 row is scored against NVIDIA's 310.8.0 output, the small model's against its own, so the dB figures
+are not one scale. `check_rdna3_small.py --model dlssnr-small.bin` checks the pictures and every layer against a
+golden.
+
 ## What did not work
 
 Each of these looked promising and did not pay off.
