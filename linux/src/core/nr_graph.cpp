@@ -5621,6 +5621,7 @@ int main(int argc, char** argv) try {
     auto& reader_tokens = S.reader_tokens;
     auto& persist_err = S.persist_err;
     const bool host_boundary = S.host_boundary;
+    const int vit_first = S.vit_first, vit_last = S.vit_last, vit_last_layer = S.vit_last_layer;
     auto& in_w = S.in_w; auto& in_h = S.in_h;
     auto& out_w = S.out_w; auto& out_h = S.out_h;
     const char* seed_path = S.seed_path;
