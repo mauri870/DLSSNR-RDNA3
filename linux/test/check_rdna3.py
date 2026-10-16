@@ -42,7 +42,7 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parents[2]
 BUILD = ROOT / "build" / "test"
 GOLDEN = ROOT / "linux" / "test" / "golden" / "rdna3"
-DOCS = ROOT / "docs" / "ngx-verification"
+DOCS = ROOT / "docs" / "ngx-verification" / "310.8.0"
 FRAMES = {"1080p": (1920, 1080), "1440p": (2560, 1440), "4k": (3840, 2160)}
 PNG_NAMES = {"1080p": "1920x1080", "1440p": "2560x1440", "4k": "3840x2160"}
 PSNR_FLOOR_MARGIN, SSIM_FLOOR_MARGIN, CLOSE_TO_GOLDEN_DB = 0.15, 0.0005, 60.0
