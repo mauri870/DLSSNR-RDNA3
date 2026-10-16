@@ -1,0 +1,17 @@
+{
+ "1080p": {
+  "sha256": "6ed0a25423e3d497508eee63313ae3d39a1ac53929ba5f387bb3f87aa58c13ef",
+  "psnr_nvidia": 49.36,
+  "ssim_nvidia": 0.99707
+ },
+ "1440p": {
+  "sha256": "0a9c1835155a54eab82ab89a069f20b7b8aecdd5a6d83046bdcd4908dae07fa8",
+  "psnr_nvidia": 49.45,
+  "ssim_nvidia": 0.99684
+ },
+ "4k": {
+  "sha256": "fdb4a1b3f3788ee370fd10216fda4a5ef93caf2ffb11c6c304df4d2da442d8fa",
+  "psnr_nvidia": 50.58,
+  "ssim_nvidia": 0.99713
+ }
+}
