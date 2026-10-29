@@ -78,7 +78,8 @@ def main():
         base = pipelines[v['base']]
         glslang(a.arch, R / 'linux/shaders' / a.arch / base['source'], base['defines'] + v['add'],
                 out / 'temporal' / f'{name}.spv')
-    grade = table['style_grade']
+    # RDNA3's network has no Style grade pipelines: the runtime runs the plain post block without them
+    grade = table.get('style_grade', {'pipelines': [], 'variants': [], 'add': []})
     for name in grade['pipelines']:
         e = pipelines[name]
         glslang(a.arch, R / 'linux/shaders' / a.arch / e['source'], e['defines'] + grade['add'], out / f'g_{name}_grade.spv')

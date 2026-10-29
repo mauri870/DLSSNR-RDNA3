@@ -351,10 +351,12 @@ fi
 # from the small model's (linux/data/experimental: each changed entry XOR the small model's, so it holds none of
 # NVIDIA's weights), the program that applies it, and the SHA-256 of the result. Its shaders are in
 # dlssnr-amd/experimental/.
-mkdir -p -- "$pkg/experimental"
-cp -- linux/data/experimental/dlssnr-small-experimental.delta "$pkg/experimental/"
-cp -- linux/build/experimental_weights.py "$pkg/experimental/"
-cp -- linux/data/experimental/dlssnr-small-experimental.sha256 "$pkg/experimental/dlssnr-small-experimental.bin.sha256"
+if [[ -f "linux/shaders/$NR_GPU_ARCH/pipelines-experimental.json" ]]; then
+    mkdir -p -- "$pkg/experimental"
+    cp -- linux/data/experimental/dlssnr-small-experimental.delta "$pkg/experimental/"
+    cp -- linux/build/experimental_weights.py "$pkg/experimental/"
+    cp -- linux/data/experimental/dlssnr-small-experimental.sha256 "$pkg/experimental/dlssnr-small-experimental.bin.sha256"
+fi
 cp -- linux/package/install.sh linux/package/README.txt linux/package/lumenite.py "$pkg/"
 chmod +x "$pkg/install.sh" "$mt/extract_model.sh"
 

@@ -33,13 +33,16 @@ bash linux/build/build_renodx.sh "$dst/shaders/renodx" > /dev/null   # the RenoD
 bash linux/build/build_wilsjo2.sh "$dst/shaders/wilsjo2" > /dev/null   # HUD FIX on every route
 # wilsjo2_classic.spv carries AMD FidelityFX Super Resolution 1 (MIT): its notice goes with it
 cp -- linux/shaders/passes/include/fsr1/LICENSE.txt "$dst/shaders/wilsjo2/FidelityFX-FSR1-LICENSE.txt"
-xs="$dst/experimental/shaders"; mkdir -p -- "$xs/temporal"
-python3 linux/build/build_network.py "$NR_GPU_ARCH" --experimental --out "$NR_PRODUCT_SPV-experimental" > /dev/null
-cp -- "$NR_PRODUCT_SPV-experimental"/g_*.spv "$xs/"
-for f in accumulation.txt swin-bias-storage.txt coherent-act.txt shader-constants.txt fixed-attention.txt; do
-    cp -- "$NR_PRODUCT_SPV-experimental/$f" "$xs/"
-done
-cp -- "$NR_PRODUCT_SPV-experimental"/temporal/* "$xs/temporal/"
+# The experimental network exists for RDNA4 only (no pipelines-experimental.json for RDNA3)
+if [[ -f "linux/shaders/$NR_GPU_ARCH/pipelines-experimental.json" ]]; then
+    xs="$dst/experimental/shaders"; mkdir -p -- "$xs/temporal"
+    python3 linux/build/build_network.py "$NR_GPU_ARCH" --experimental --out "$NR_PRODUCT_SPV-experimental" > /dev/null
+    cp -- "$NR_PRODUCT_SPV-experimental"/g_*.spv "$xs/"
+    for f in accumulation.txt swin-bias-storage.txt coherent-act.txt shader-constants.txt fixed-attention.txt; do
+        cp -- "$NR_PRODUCT_SPV-experimental/$f" "$xs/"
+    done
+    cp -- "$NR_PRODUCT_SPV-experimental"/temporal/* "$xs/temporal/"
+fi
 cp -- linux/shaders/renodx/LICENSE "$dst/shaders/renodx/RenoDX-LICENSE.txt"
 
 # The weights are NVIDIA's and are never part of this repository: --model takes a dlssnr.bin and
