@@ -59,4 +59,23 @@ void set_device_callback(void (*callback)(VkDevice));
 // Vulkan init does. Recording it here keeps one source of truth.
 void note_handles(VkInstance instance, VkPhysicalDevice physical, VkDevice device);
 
+// A device the game made, seen by someone other than the watcher (the .asi's vkCreateDevice wrap): its handles and
+// the queue families it asked for, so queue_for() can find a queue of one of them.
+void note_device(VkInstance instance, VkPhysicalDevice physical, VkDevice device, const std::vector<uint32_t>& families);
+
+// The game destroys `device`: its queues and handles are forgotten (a later device may get the same handle).
+void forget_device(VkDevice device);
+
+// Submits of ours onto a queue the game also submits to, serialised with the game's own: once enabled (the .asi on a
+// Vulkan game, which wraps the game's queue calls with the same per-queue lock), lock_queue / unlock_queue take the
+// queue's recursive lock; before that they do nothing (the ReShade routes: ReShade serialises its own queues).
+void enable_queue_locks();
+bool queue_locks_enabled();
+void lock_queue(VkQueue queue);
+void unlock_queue(VkQueue queue);
+// The same for a call that may begin before enable_queue_locks and end after it (a hook installed earlier): the lock
+// is released only if it was taken.
+bool lock_queue_held(VkQueue queue);
+void unlock_queue_held(VkQueue queue, bool held);
+
 }  // namespace nr::pe::vkdevice

@@ -20,6 +20,9 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <new>
 #include <stdexcept>
 #include <string>
@@ -57,6 +60,28 @@ struct Buffer {
     VkDeviceAddress address{};   // buffer(.., device_address = true) only
     template <class T> T* as() { return static_cast<T*>(mapped); }
 };
+
+// Device memory several runtimes' images take turns in (the resize path): two regions; a runtime built at a new frame
+// size takes its images from the region the size before it did not use, so the memory of the sizes a game's dynamic
+// resolution leaves behind is reused at once instead of waiting for their retirement. A region's previous runtime is
+// stale from then on (`gen`) and never recorded again; its images alias the new ones, which the GPU sees in order
+// after a full barrier (the new runtime's first transitions are from UNDEFINED). An image that does not fit takes
+// memory of its own, and `need` says how big the regions should have been.
+struct ImageHeap {
+    VkDevice device{};
+    VkDeviceMemory memory{};
+    uint32_t type{};
+    VkDeviceSize region_cap{};
+    VkDeviceSize cursor[2]{};
+    uint64_t gen[2]{};
+    VkDeviceSize need[2]{};   // bytes the region's runtime asked for, fitted or not
+    ImageHeap() = default;
+    ImageHeap(const ImageHeap&) = delete;
+    ImageHeap& operator=(const ImageHeap&) = delete;
+    ~ImageHeap() { if (memory) vkFreeMemory(device, memory, nullptr); }
+};
+
+struct SharedPipeline;   // below; Context::pin
 
 struct Context {
     VkInstance instance{};
@@ -646,10 +671,27 @@ struct Context {
         }
         if (type == mem.memoryTypeCount)
             throw std::runtime_error("no device-local memory type for an image");
-        VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        alloc.allocationSize = req.size; alloc.memoryTypeIndex = type;
-        NRVK_CHECK(vkAllocateMemory(device, &alloc, nullptr, &im.memory));
-        NRVK_CHECK(vkBindImageMemory(device, im.handle, im.memory, 0));
+        image_bytes += req.size;
+        bool placed = false;
+        if (heap && heap->memory && (req.memoryTypeBits & (1u << heap->type))) {
+            // In this runtime's region of the shared heap (ImageHeap); memory of its own when it does not fit.
+            VkDeviceSize& cur = heap->cursor[heap_region];
+            const VkDeviceSize off = (cur + req.alignment - 1) / req.alignment * req.alignment;
+            heap->need[heap_region] = off + req.size;
+            if (off + req.size <= heap->region_cap) {
+                NRVK_CHECK(vkBindImageMemory(device, im.handle, heap->memory, heap->region_cap * heap_region + off));
+                cur = off + req.size;
+                placed = true;
+            } else {
+                cur = off + req.size;
+            }
+        }
+        if (!placed) {
+            VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            alloc.allocationSize = req.size; alloc.memoryTypeIndex = type;
+            NRVK_CHECK(vkAllocateMemory(device, &alloc, nullptr, &im.memory));
+            NRVK_CHECK(vkBindImageMemory(device, im.handle, im.memory, 0));
+        }
 
         VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         vi.image = im.handle; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = format;
@@ -674,10 +716,27 @@ struct Context {
         return im;
     }
 
+    // Construction inside a recording (the resize path builds a runtime on the render thread): nothing is submitted.
+    // `transition` keeps its barrier in `pending`, in order, for the first recording to record; anything else that
+    // would submit throws, and the caller builds in the background instead.
+    bool defer_transitions = false;
+    std::vector<VkImageMemoryBarrier> pending;
+    // Inside a recording: a pipeline not made yet (SharedPipeline) throws instead of compiling.
+    bool registry_only = false;
+    // Device memory every image made so far asked for.
+    uint64_t image_bytes = 0;
+    // Kept alive here as well as by the kernels (a network memory keeps every pipeline its runtimes used, so one built
+    // inside a frame finds it made): null, none.
+    std::vector<std::shared_ptr<SharedPipeline>>* pin = nullptr;
+    // Images from this heap's region `heap_region` (ImageHeap); null: each its own allocation.
+    ImageHeap* heap = nullptr;
+    uint32_t heap_region = 0;
+
     // A one-shot submit, the same shape as `transfer`. `cb` records into the
     // command buffer and everything around it is boilerplate.
     template <typename F>
     void one_shot(F&& cb) {
+        if (defer_transitions) throw std::runtime_error("a submit during construction inside a recording");
         VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         cpi.queueFamilyIndex = family;
         VkCommandPool pool;
@@ -706,6 +765,18 @@ struct Context {
     void transition(Image& im, VkImageLayout to) {
         if (im.layout == to) return;
         const VkImageLayout from = im.layout;
+        if (defer_transitions) {
+            VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            b.oldLayout = from; b.newLayout = to;
+            b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = im.handle;
+            b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+            b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            pending.push_back(b);
+            im.layout = to;
+            return;
+        }
         one_shot([&](VkCommandBuffer cmd) {
             VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
             b.oldLayout = from; b.newLayout = to;
@@ -820,8 +891,35 @@ inline std::vector<uint32_t> read_spirv(const std::string& path) {
 // One compute pipeline over N storage-buffer bindings in set 0 plus a push
 // constant block. That is decision 6's binding model, which is also the one
 // that maps onto a D3D12 root signature.
+// The parts of a compute pipeline that do not depend on what is bound: its shader module, set layout, pipeline layout
+// and pipeline. Kernels of one device built from the same SPIR-V file, with the same binding types, push range and
+// robustness, share one (the runtimes of one network at several frame sizes, the resize path); each keeps its own
+// descriptor pool and set. Freed with the last kernel that uses it.
+struct SharedPipeline {
+    VkDevice device{};
+    VkShaderModule module{};
+    VkDescriptorSetLayout dsl{};
+    VkPipelineLayout layout{};
+    VkPipeline pipeline{};
+    SharedPipeline() = default;
+    SharedPipeline(const SharedPipeline&) = delete;
+    SharedPipeline& operator=(const SharedPipeline&) = delete;
+    ~SharedPipeline() {
+        if (pipeline) vkDestroyPipeline(device, pipeline, nullptr);
+        if (module) vkDestroyShaderModule(device, module, nullptr);
+        if (layout) vkDestroyPipelineLayout(device, layout, nullptr);
+        if (dsl) vkDestroyDescriptorSetLayout(device, dsl, nullptr);
+    }
+};
+inline std::mutex& shared_pipelines_lock() { static std::mutex m; return m; }
+inline std::map<std::string, std::weak_ptr<SharedPipeline>>& shared_pipelines() {
+    static std::map<std::string, std::weak_ptr<SharedPipeline>> m;
+    return m;
+}
+
 struct Kernel {
     VkDevice device{};
+    std::shared_ptr<SharedPipeline> shared;
     VkShaderModule module{};
     VkDescriptorSetLayout dsl{};
     VkPipelineLayout layout{};
@@ -877,15 +975,30 @@ struct Kernel {
             lb[nb + i] = {nb + i, images[i]->sampler ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
                                                      : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                           1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-        VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        li.bindingCount = n; li.pBindings = lb.data();
-        NRVK_CHECK(vkCreateDescriptorSetLayout(device, &li, nullptr, &dsl));
-
-        VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, push_bytes};
-        VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        pli.setLayoutCount = 1; pli.pSetLayouts = &dsl;
-        pli.pushConstantRangeCount = push_bytes ? 1 : 0; pli.pPushConstantRanges = &pcr;
-        NRVK_CHECK(vkCreatePipelineLayout(device, &pli, nullptr, &layout));
+        // The shared part: found by device, file, binding types, push range and robustness, or made here.
+        std::string key = std::to_string(reinterpret_cast<uintptr_t>(device)) + "|" + spirv_path + "|" +
+                          std::to_string(push_bytes) + "|" + (ctx.pipeline_robustness ? "r" : "-") + "|";
+        for (const auto& b : lb) key += char('0' + int(b.descriptorType));
+        {
+            std::lock_guard<std::mutex> guard(shared_pipelines_lock());
+            auto it = shared_pipelines().find(key);
+            if (it != shared_pipelines().end()) shared = it->second.lock();
+        }
+        if (!shared && ctx.registry_only) throw std::runtime_error("a pipeline not made yet: " + spirv_path);
+        if (!shared) {
+            auto made = std::make_shared<SharedPipeline>();
+            made->device = device;
+            make_pipeline(ctx, spirv_path, push_bytes, lb, *made);
+            std::lock_guard<std::mutex> guard(shared_pipelines_lock());
+            auto& slot = shared_pipelines()[key];
+            shared = slot.lock();   // another thread made it meanwhile: theirs, ours goes
+            if (!shared) { slot = made; shared = made; }
+        }
+        module = shared->module; dsl = shared->dsl; layout = shared->layout; pipeline = shared->pipeline;
+        if (ctx.pin) {   // a memory's runtimes are built on two threads (inside frames, in the background)
+            std::lock_guard<std::mutex> guard(shared_pipelines_lock());
+            if (std::find(ctx.pin->begin(), ctx.pin->end(), shared) == ctx.pin->end()) ctx.pin->push_back(shared);
+        }
 
         std::vector<VkDescriptorPoolSize> ps;
         if (nb) ps.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nb});
@@ -917,11 +1030,25 @@ struct Kernel {
             w[nb + i].pImageInfo = &ii[i];
         }
         vkUpdateDescriptorSets(device, n, w.data(), 0, nullptr);
+    }
+
+    // The shared part of create: layouts, module, pipeline (an ACO record or the driver's compile).
+    void make_pipeline(Context& ctx, const std::string& spirv_path, uint32_t push_bytes,
+                       const std::vector<VkDescriptorSetLayoutBinding>& lb, SharedPipeline& out) {
+        VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        li.bindingCount = uint32_t(lb.size()); li.pBindings = lb.data();
+        NRVK_CHECK(vkCreateDescriptorSetLayout(device, &li, nullptr, &out.dsl));
+
+        VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, push_bytes};
+        VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pli.setLayoutCount = 1; pli.pSetLayouts = &out.dsl;
+        pli.pushConstantRangeCount = push_bytes ? 1 : 0; pli.pPushConstantRanges = &pcr;
+        NRVK_CHECK(vkCreatePipelineLayout(device, &pli, nullptr, &out.layout));
 
         const std::vector<uint32_t> code = read_spirv(spirv_path);
         VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         smi.codeSize = code.size() * 4; smi.pCode = code.data();
-        NRVK_CHECK(vkCreateShaderModule(device, &smi, nullptr, &module));
+        NRVK_CHECK(vkCreateShaderModule(device, &smi, nullptr, &out.module));
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo req{
             VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
         req.requiredSubgroupSize = 32;
@@ -929,8 +1056,8 @@ struct Kernel {
         cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
         cpi.stage.pNext = &req;
         cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        cpi.stage.module = module; cpi.stage.pName = "main";
-        cpi.layout = layout;
+        cpi.stage.module = out.module; cpi.stage.pName = "main";
+        cpi.layout = out.layout;
         VkPipelineRobustnessCreateInfoEXT robustness{VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO_EXT};
         robustness.storageBuffers = robustness.uniformBuffers = robustness.vertexInputs =
             VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT;
@@ -938,7 +1065,7 @@ struct Kernel {
         if (ctx.pipeline_robustness) cpi.pNext = &robustness;
 #ifndef NR_PIPELINE_STATS
         NRVK_CHECK(nr::binary::create_or_default(device, ctx.pipeline_cache, cpi, spirv_path,
-                                                code.data(), code.size() * 4, &pipeline, push_bytes));
+                                                code.data(), code.size() * 4, &out.pipeline, push_bytes));
 #else
         if (ctx.pipeline_stats) cpi.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
         // NR_DUMP_IR=<dir> (evaluation builds): also capture the driver's internal representations
@@ -948,7 +1075,7 @@ struct Kernel {
             cpi.flags |= VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
         const auto t0 = std::chrono::steady_clock::now();
         const VkResult made = nr::binary::create_or_default(device, (dump_ir && *dump_ir) ? VK_NULL_HANDLE : ctx.pipeline_cache,
-                                                       cpi, spirv_path, code.data(), code.size() * 4, &pipeline, push_bytes);
+                                                       cpi, spirv_path, code.data(), code.size() * 4, &out.pipeline, push_bytes);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         const std::string base = spirv_path.substr(spirv_path.find_last_of("/\\") + 1);
         std::printf("pipeline %s: %s in %.1f ms", base.c_str(), made == VK_SUCCESS ? "built" : "FAILED", ms);
@@ -958,12 +1085,12 @@ struct Kernel {
             auto stats = reinterpret_cast<PFN_vkGetPipelineExecutableStatisticsKHR>(
                 vkGetDeviceProcAddr(device, "vkGetPipelineExecutableStatisticsKHR"));
             VkPipelineInfoKHR pi{VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR};
-            pi.pipeline = pipeline;
+            pi.pipeline = out.pipeline;
             uint32_t ne = 0;
             if (props && stats && props(device, &pi, &ne, nullptr) == VK_SUCCESS) {
                 for (uint32_t e = 0; e < ne; ++e) {
                     VkPipelineExecutableInfoKHR ei{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR};
-                    ei.pipeline = pipeline; ei.executableIndex = e;
+                    ei.pipeline = out.pipeline; ei.executableIndex = e;
                     uint32_t ns = 0;
                     if (stats(device, &ei, &ns, nullptr) != VK_SUCCESS) continue;
                     std::vector<VkPipelineExecutableStatisticKHR> s(
@@ -1008,11 +1135,9 @@ struct Kernel {
     }
 
     void destroy() {
-        vkDestroyPipeline(device, pipeline, nullptr);
-        vkDestroyShaderModule(device, module, nullptr);
         vkDestroyDescriptorPool(device, pool, nullptr);
-        vkDestroyPipelineLayout(device, layout, nullptr);
-        vkDestroyDescriptorSetLayout(device, dsl, nullptr);
+        pool = VK_NULL_HANDLE; set = VK_NULL_HANDLE;
+        shared.reset();   // the pipeline itself goes with the last kernel that uses it
     }
 };
 

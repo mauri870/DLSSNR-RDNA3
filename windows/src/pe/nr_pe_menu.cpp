@@ -2,6 +2,7 @@
 #include "nr_pe_menu.hpp"
 #include "mingw_d3d12_compat.h"
 #include "nr_control_shared.hpp"
+#include "nr_ini_network.hpp"
 #include "nr_control_ui.hpp"
 #include "nr_pe_control.hpp"
 #include "nr_pe_d3d12split.hpp"
@@ -308,7 +309,8 @@ struct Menu {
     }
     ~Menu() { if (context) ImGui::DestroyContext(context); }
 
-    // This frame's input; whether the menu is to be drawn. The caller has made `context` current.
+    // This frame's input; whether anything is to be drawn (the menu, or with the menu closed the OSD when it is due).
+    // The caller has made `context` current.
     bool input(uint32_t width, uint32_t height) {
         ++shared()->menu_seq;
         auto& io = ImGui::GetIO();
@@ -317,11 +319,84 @@ struct Menu {
         previous = now;
         io.DisplaySize = {float(width), float(height)};
         g_input.update(io, width, height);
-        return g_input.open;
+        osd_only = !g_input.open && osd_due(now);
+        return g_input.open || osd_only;
     }
 
-    // The menu's draw data, after the backend's NewFrame.
+    // [Network] OSD with the menu closed: while a switch builds, its progress, then the network now running for 3 s
+    // (switch, the default); the running network all the time (always); nothing (off). The mode is read from the file
+    // once a second.
+    bool osd_only = false;
+    int osd_mode = 1;
+    uint32_t osd_want = ~0u, osd_running = ~0u;
+    std::chrono::steady_clock::time_point osd_until{}, osd_read{};
+    bool osd_due(std::chrono::steady_clock::time_point now) {
+        if (now - osd_read > std::chrono::seconds(1)) {
+            osd_read = now;
+            if (ini.refresh()) loaded = -1;   // the menu loads the rest when it opens
+            const std::string m = ini.get("Network", "OSD", "switch");
+            osd_mode = m == "off" ? 0 : m == "always" ? 2 : 1;
+        }
+        const nr::control::Shared* s = shared();
+        if (!s || !s->route || !s->net_known) return false;
+        if (s->net_want != osd_want || (s->net_running < 3 && s->net_running != osd_running)) {
+            if (osd_want != ~0u && osd_running != ~0u) osd_until = now + std::chrono::seconds(3);
+            osd_want = s->net_want;
+            if (s->net_running < 3) osd_running = s->net_running;
+        }
+        if (osd_mode == 0 || s->net_running >= 3) return false;
+        return osd_mode == 2 || switching(s) || now < osd_until;
+    }
+    static bool switching(const nr::control::Shared* s) {
+        return s->building && s->building_net < 3 && s->building_net != s->net_running;
+    }
+    void draw_osd() {
+        const nr::control::Shared* s = shared();
+        ImGui::SetNextWindowPos({24, 24});
+        ImGui::SetNextWindowBgAlpha(0.65f);
+        ImGui::Begin("##nr-osd", nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize |
+                         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
+        if (switching(s))
+            ImGui::Text("NR: switching to %s ... %.0f%%", nr::network_codename(int(s->building_net)),
+                        double(s->build_progress) * 100.0);
+        else
+            ImGui::Text("NR: %s", s->nr_on ? nr::network_codename(int(s->net_running)) : "off");
+        ImGui::End();
+    }
+
+    // A 0/1 key as a checkbox, written at once.
+    void flag(const char* label, const char* section, const char* key, const char* def, const char* help) {
+        bool on = ini.get(section, key, def) == "1";
+        if (ImGui::Checkbox(label, &on)) ini.set(section, key, on ? "1" : "0");
+        nr::control_ui::help(help);
+    }
+
+    // A hotkey as text, written when the field is let go (the DLL reads the file again and takes it at once).
+    void hotkey_text(const char* label, const char* section, const char* help) {
+        static std::unordered_map<std::string, std::string> editing;
+        auto it = editing.find(label);
+        std::string& t = it != editing.end() ? it->second : (editing[label] = ini.get(section, "Hotkey", ""));
+        char buf[64];
+        std::snprintf(buf, sizeof buf, "%s", t.c_str());
+        if (ImGui::InputText(label, buf, sizeof buf)) t = buf;
+        if (ImGui::IsItemDeactivatedAfterEdit()) { ini.set(section, "Hotkey", t); editing.erase(label); }
+        else if (!ImGui::IsItemActive()) editing.erase(label);
+        nr::control_ui::help(help);
+    }
+
+    // The menu's draw data (or the OSD's alone), after the backend's NewFrame.
     void build(uint32_t height) {
+        if (osd_only) {
+            auto& io = ImGui::GetIO();
+            const bool cursor = io.MouseDrawCursor;
+            io.MouseDrawCursor = false;
+            ImGui::NewFrame();
+            draw_osd();
+            ImGui::Render();
+            io.MouseDrawCursor = cursor;
+            return;
+        }
         if (ini.refresh() || loaded < 0) { renodx.load(ini); loaded = 1; }
         static bool set_done = false;
         if (const char* e = std::getenv("NR_CONTROL_SET"); e && !set_done && g_drawn >= control_at()) {
@@ -384,7 +459,7 @@ struct Menu {
             } else {
                 ImGui::TextUnformatted("NR cost: --");
             }
-            if (s->int4 != 2) ImGui::Text("Network: %s", s->int4 ? "int4 mixed" : "default");
+            if (s->net_running < 3) ImGui::Text("Network: %s", nr::network_codename(int(s->net_running)));
             if (s->building) ImGui::TextDisabled("Building a network...");
             if (s->state[0]) ImGui::TextWrapped("%s", s->state);
         } else {
@@ -398,17 +473,82 @@ struct Menu {
                 if (s && s->screenshot[0]) ImGui::TextWrapped("Screenshot: %s", s->screenshot);
             }))
             renodx.store(ini);
-        if (ini.has_section("Int4Mixed") && ImGui::CollapsingHeader("int4 mixed")) {
-            bool on = ini.get("Int4Mixed", "Enabled", "1") == "1";
-            if (ImGui::Checkbox("int4 mixed##on", &on)) ini.set("Int4Mixed", "Enabled", on ? "1" : "0");
-            nr::control_ui::help("[Int4Mixed] Enabled. Switches the network; the other one is built in the background. "
-                                 "Needs [Network] ACO Mode = 1.");
-            bool keep = ini.get("Int4Mixed", "KeepBoth", "0") == "1";
-            if (ImGui::Checkbox("Keep both networks", &keep)) ini.set("Int4Mixed", "KeepBoth", keep ? "1" : "0");
-            nr::control_ui::help("[Int4Mixed] KeepBoth. Both networks stay in memory: switching is instant.");
-            bool sound = ini.get("Int4Mixed", "Sound", "1") == "1";
-            if (ImGui::Checkbox("Sound##int4", &sound)) ini.set("Int4Mixed", "Sound", sound ? "1" : "0");
-            ImGui::TextDisabled("Hotkey: %s", ini.get("Int4Mixed", "Hotkey", "").c_str());
+        // [Network]: which network runs (the three by the DLL's codenames); one that cannot run in this run is
+        // greyed out with the reason the DLL found (net_why), and the DLL skips it
+        // (not "Network": the RenoDX table has a group of that name, and the same label is the same header)
+        if (ImGui::CollapsingHeader("Network model and options", ImGuiTreeNodeFlags_DefaultOpen)) {
+            const int file_model = std::max(0, nr::network_choice(ini.get("Network", "Model", "CC_SMALL_FP8")));
+            const int shown = s && s->net_known && s->net_want < 3 ? int(s->net_want) : file_model;
+            if (ImGui::BeginCombo("Network##model", nr::network_codename(shown))) {
+                for (int n = 0; n < nr::kNetworkChoices; ++n) {
+                    const char* why = s && s->net_known ? s->net_why[n] : "";
+                    const bool ok = !why[0];
+                    if (ImGui::Selectable(nr::network_codename(n), n == shown, ok ? 0 : ImGuiSelectableFlags_Disabled))
+                        ini.set("Network", "Model", nr::network_codename(n));
+                    if (!ok) { ImGui::SameLine(); ImGui::TextDisabled("- %s", why); }
+                }
+                ImGui::EndCombo();
+            }
+            nr::control_ui::help("[Network] Model. CC_SMALL_FP8: 310.9.16's default network, the fastest. CC_SILVER_AARDWOLD: "
+                                 "310.8.0's network (310.9.16's preset 1). CC_SILVER_AARDWOLD_INT4_MIXED: that network with part "
+                                 "of its arithmetic in int4, faster, a slightly different picture; needs ACO Mode. Switching "
+                                 "builds the new network in the background; the running one serves until it is ready.");
+            for (int n = 0; n < nr::kNetworkChoices; ++n)
+                if (s && s->net_known && s->net_why[n][0]) ImGui::TextDisabled("%s: %s", nr::network_codename(n), s->net_why[n]);
+            hotkey_text("Hotkey##net", "Network", "[Network] Hotkey: cycles through the networks that can run. Ctrl, Shift, "
+                        "Alt and one key, e.g. Ctrl+F11 or Alt+F9; empty: no hotkey.");
+            bool sound = ini.get("Network", "Sound", "1") == "1";
+            if (ImGui::Checkbox("Sound##net", &sound)) ini.set("Network", "Sound", sound ? "1" : "0");
+            nr::control_ui::help("[Network] Sound. A cue on every switch: one note CC_SMALL_FP8, two going down "
+                                 "CC_SILVER_AARDWOLD, two going up CC_SILVER_AARDWOLD_INT4_MIXED.");
+            static const char* const residencies[] = {"auto", "resident", "offload", "minimal"};
+            const std::string r = ini.get("Network", "Residency", "auto");
+            int ri = 0;
+            for (int k = 0; k < 4; ++k) if (r == residencies[k]) ri = k;
+            if (ImGui::Combo("Residency", &ri, residencies, 4)) ini.set("Network", "Residency", residencies[ri]);
+            nr::control_ui::help("[Network] Residency: what is kept of a network not in use. The networks share one "
+                                 "activation memory, so mostly their weights. auto (default): the weights stay in video "
+                                 "memory, switching back is quick; moved to RAM when video memory runs short, freed when RAM "
+                                 "does too. resident: kept whole, switching back is instant, the most video memory. offload: "
+                                 "the weights in RAM, all video memory freed. minimal: everything freed, switching back builds "
+                                 "anew. While the other network gets ready, the running one keeps serving. NR off for 10 s: "
+                                 "offload and minimal do the same to the running network, auto only when video memory is short.");
+            static const char* const osds[] = {"off", "switch", "always"};
+            const std::string o = ini.get("Network", "OSD", "switch");
+            int oi = 1;
+            for (int k = 0; k < 3; ++k) if (o == osds[k]) oi = k;
+            if (ImGui::Combo("OSD", &oi, osds, 3)) ini.set("Network", "OSD", osds[oi]);
+            nr::control_ui::help("[Network] OSD: the running network in the corner of the picture. switch (default): while "
+                                 "a switch builds, its progress; then the new network for 3 s. always: all the time. off: never.");
+            flag("Style grade (Natural / Cinematic)", "Network", "Style Grade", "1",
+                 "[Network] Style Grade. On (default): Natural and Cinematic are graded after the network as NVIDIA's DLL "
+                 "does. Off: the picture these styles had up to 0.0.6, without that grade. Standard is not affected. "
+                 "Takes effect at once.");
+            flag("Motion without depth", "Network", "Motion Without Depth", "1",
+                 "[Network] Motion Without Depth. Where the network's previous-frame lookup reads its motion vector.\n"
+                 "On (default): the pixel's own vector, depth not used, as NVIDIA's DLL does.\n"
+                 "Off: with depth, the vector of the nearest of the pixel and its four diagonal neighbours.\n"
+                 "Only moving edges between frames with motion vectors and depth differ. Takes effect after a restart.");
+            flag("Resize history", "Network", "Resize History", "0",
+                 "[Network] Resize History. Only when NR runs before the upscaler and the game changes its render size\n"
+                 "(dynamic resolution):\n"
+                 "Off (default): NR's previous result is dropped and NR starts again at the new size, as NVIDIA's DLL does.\n"
+                 "On: the previous result is scaled to the new size and kept. Steadier on our tests when the size changes\n"
+                 "often, but not what NVIDIA's DLL does. Games with jittered input (most DLSS games) hide most of the\n"
+                 "restart, so the default is off.");
+            flag("ACO Mode", "Network", "ACO Mode", "1",
+                 "[Network] ACO Mode. On (default): the network's machine code made in advance by the ACO compiler, loaded by "
+                 "the AMD driver; when it cannot be used, the driver's compiler is used and dlssnr-amd.log says why. Off: the "
+                 "AMD driver's own compiler. CC_SILVER_AARDWOLD_INT4_MIXED needs it on. Takes effect after a restart.");
+        }
+        // What the game hands NR, and who covers what it does not (the DLL's lines, nr_engine_panel.hpp)
+        if (s && s->route && s->panel_lines && ImGui::CollapsingHeader("Engine data")) {
+            nr::control_ui::engine_legend();
+            for (uint32_t i = 0; i < std::min(s->panel_lines, nr::control::kPanelLines); ++i) {
+                char line[sizeof s->panel[0] + 1];
+                std::snprintf(line, sizeof line, "%s", s->panel[i]);
+                nr::control_ui::engine_line(line);
+            }
         }
         if (ImGui::CollapsingHeader("Preprocess")) {
             bool on = ini.get("Preprocess", "Enabled", "0") == "1";
@@ -442,7 +582,18 @@ struct Menu {
             combo("Curve", "Curve", curves, 7, "[Preprocess] Curve. The display curve of the picture NR is shown.");
             slider("Contrast", "Contrast", 0.5f, 2.f, 1.f, "[Preprocess] Contrast.");
             slider("Saturation", "Saturation", 0.05f, 2.f, 1.f, "[Preprocess] Saturation.");
-            ImGui::TextDisabled("Hotkey: %s", ini.get("Preprocess", "Hotkey", "").c_str());
+            hotkey_text("Hotkey##prep", "Preprocess", "[Preprocess] Hotkey: switches the whole preprocess on or off for "
+                        "this run (not written to the file). Ctrl, Shift, Alt and one key; empty: no hotkey.");
+            flag("Sound##prep", "Preprocess", "Sound", "1",
+                 "[Preprocess] Sound. A cue when it switches: two notes going up = on, going down = off.");
+        }
+        // [Log]: read once when the game starts
+        if (ImGui::CollapsingHeader("Log")) {
+            flag("Write the log", "Log", "Enabled", "1",
+                 "[Log] Enabled. dlssnr-amd.log in the game's folder. Takes effect after a restart.");
+            flag("Clear on start", "Log", "ClearOnStart", "1",
+                 "[Log] ClearOnStart. On: each start of the game begins a new log; off: appends to the last one. "
+                 "Takes effect after a restart.");
         }
         ImGui::Separator();
         ImGui::TextDisabled("End: close. Changes are saved to dlssnr-amd.ini at once.");
@@ -735,12 +886,16 @@ struct D3D11Overlay {
             ++g_drawn;
             if (dump_wanted()) dump(back, desc.BufferDesc.Format, enc.mode);
         } catch (...) {
+            context->OMSetRenderTargets(0, nullptr, nullptr);
             release(rtv);
             context1->SwapDeviceContextState(game, nullptr);
             release(game);
             release(back);
             throw;
         }
+        // Our context state keeps what is bound in it while the game's is current: a back buffer view left bound
+        // there is a reference the game's ResizeBuffers fails on (window size, fullscreen switch).
+        context->OMSetRenderTargets(0, nullptr, nullptr);
         release(rtv);
         context1->SwapDeviceContextState(game, nullptr);
         release(game);

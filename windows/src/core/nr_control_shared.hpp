@@ -11,7 +11,8 @@
 namespace nr::control {
 
 inline constexpr uint32_t kMagic = 0x4C4F5243u;   // "CROL"
-inline constexpr uint32_t kVersion = 4;
+inline constexpr uint32_t kVersion = 5;
+inline constexpr uint32_t kPanelLines = 10;
 
 struct Shared {
     uint32_t magic, version;
@@ -26,7 +27,7 @@ struct Shared {
     uint32_t render_width, render_height;   // the game's render extent (the depth guide's), 0 unknown
     uint32_t placement;             // where NR runs: 0 not known, 1 after the upscaler, 2 before it
     uint32_t passes;                // model passes a frame
-    uint32_t int4;                  // 0 the default network, 1 int4 mixed, 2 not installed
+    uint32_t net_running;           // the network serving (nr::NetworkChoice), 3 none yet
     uint32_t preprocess;            // Preprocess on
     uint32_t building;              // a network is being built
     char state[96];                 // a line for the menu (empty: nothing to add)
@@ -49,7 +50,17 @@ struct Shared {
     // DLL -> menu
     uint32_t output_width, output_height;   // the upscaler's output (the game's DLSS evaluate), 0 unknown
     uint32_t game_focused;          // the foreground window is the game's (X11: the menu takes it as focus)
-    uint32_t reserved[13];
+    // DLL -> menu: the network asked for ([Network] Model as the switch has it), and why each network cannot run in
+    // this run ("" it can; before the DLL has looked: all empty, net_known 0)
+    uint32_t net_want, net_known;
+    char net_why[3][96];
+    // DLL -> menu: the network being built (nr::NetworkChoice, 3 none) and how far (0..1), for the OSD
+    uint32_t building_net;
+    float build_progress;
+    // DLL -> menu: the engine-data panel (nr_engine_panel.hpp), one line each; '!' starts the hint
+    uint32_t panel_lines;
+    char panel[kPanelLines][192];
+    uint32_t reserved[11];
 };
 static_assert(sizeof(Shared) % 4 == 0, "a plain array of words");
 

@@ -119,5 +119,10 @@
   "temporal_post_fp32": {"base": "fswinimagepost32", "add": ["NR_TEMPORAL_HISTORY=1"]},
   "temporal_post_fp32hp": {"base": "fswinimagepost32", "add": ["NR_TEMPORAL_HISTORY=1", "NR_TEMPORAL_HPASS=1"]},
   "temporal_post_fp32h16": {"base": "fswinimagepost32", "add": ["NR_TEMPORAL_HISTORY=1", "NR_HIST_F16=1"]}
+ },
+ "style_grade": {"about": "<name>_grade.spv next to each of these: the post block with the DLL's Natural/Cinematic grade, dispatched only for those Styles",
+  "add": ["NR_STYLE_GRADE=1"],
+  "pipelines": ["fswinimagepost32"],
+  "variants": ["temporal_post_fp32", "temporal_post_fp32hp", "temporal_post_fp32h16"]
  }
 }

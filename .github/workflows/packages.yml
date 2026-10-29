@@ -32,7 +32,7 @@ jobs:
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake ninja-build mingw-w64 g++-multilib python3 libx11-dev libxcb1-dev
+          sudo apt-get install -y --no-install-recommends cmake ninja-build mingw-w64 g++-multilib python3 p7zip-full
 
       - name: Cache pinned dependencies
         uses: actions/cache@v4
@@ -99,7 +99,7 @@ jobs:
           python3 - windows/package/*.zip <<'PY'
           import sys, zipfile
           for f in sys.argv[1:]:
-              if any(n.endswith('dlssnr.bin') for n in zipfile.ZipFile(f).namelist()):
+              if any(n.endswith(('dlssnr.bin', 'dlssnr-small.bin')) for n in zipfile.ZipFile(f).namelist()):
                   sys.exit(f'model found in {f}')
           PY
 

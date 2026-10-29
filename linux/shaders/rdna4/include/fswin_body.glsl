@@ -1,3 +1,14 @@
+// CC_SMALL_FP8_EXPERIMENTAL (pipelines-experimental.json): NR_FIXP, the window's probability matrix is one fixed
+// 64x64 e4m3 table a layer ([query][key], 16384 bytes after the bias; written by the host for fixed-attention.txt's
+// pipelines) read as the PV product's B fragments - no QK^T, no softmax, the Q/K projections dead. NR_VOMERGE, with
+// it: the attention is linear, so the V and output projections are one matrix (in the V rows of qkv.bin); the f32
+// context is added to the residual instead of the output projection.
+#ifndef NR_VOMERGE
+#define NR_VOMERGE 0
+#endif
+#if NR_VOMERGE && (NR_HWAVES || NR_CONTEXT_LDS || !defined(NR_FIXP) || NR_HEADS != 1)
+#error "NR_VOMERGE: one-wave one-head C=32 bodies with NR_FIXP only"
+#endif
 // The per-item body of fswin_t.comp, moved here unchanged so that the
 // persistent kernels can instantiate it once per live-tile mask (NR_EDGE_BODIES).
 // Everything it declares is local to one instantiation. NR_LIVE (set by the
@@ -1383,6 +1394,9 @@
         const int hh = nrhw_h;
 #else
     NR_OPB cq[NR_MF][NR_CF];
+#if NR_VOMERGE
+    NR_ACCF nr_ctxf[NR_MF][NR_CF];
+#endif
     for (int hh = 0; hh < NR_HEADS; ++hh) {
 #endif
 #if NR_K_REGS
@@ -2359,6 +2373,13 @@
 #endif
         }
 #endif
+#if defined(NR_FIXP) && NR_FIXP   // the fixed probabilities replace P
+#if NR_HWAVES
+#error "NR_FIXP: one-wave C=32 bodies only"
+#endif
+        for (int m = 0; m < NR_MF; ++m) for (int j = 0; j < NR_JF; ++j)
+            NR_LOAD_B(pb[m][j], wgt_e4m3, pc.b_off * 4u + 16384u + (tok0 + uint(m) * 16u) * 64u + uint(j) * 16u, 64u);
+#endif
 #if !(NR_HWAVES && NR_EXP_NOHI_HEAD)
         // ctx^T = V^T . P^T; this head's output occupies channel fragments
         // [hh*NR_DF, (hh+1)*NR_DF) of the concatenated C rows.
@@ -2381,6 +2402,9 @@
                 if (NR_ACC_F16 > 0 && (j + 1) % NR_ACC_F16 == 0)
                     for (int m = 0; m < NR_MF; ++m) NR_RND(a[m])
             }
+#if NR_VOMERGE
+            for (int m = 0; m < NR_MF; ++m) nr_ctxf[m][hh * NR_DF + e] = a[m];
+#endif
             for (int m = 0; m < NR_MF; ++m) NR_MGA(m) {
 #if NR_CONTEXT_LDS || NR_HWAVES
                 NR_STAGE_FRAG out_context;
@@ -2618,6 +2642,9 @@
             a[m][c]=nr_round_f16(wgt_f32[pc.ars_off+uint(n)*16u+rbase+uint(c)]*NR_Y(m,n,c));
 #endif
 #endif
+#if NR_VOMERGE
+        for (int m = 0; m < NR_MF; ++m) a[m] = a[m] + nr_ctxf[m][n];
+#else
         for (int k = 0; k < NR_CF; ++k) {
 #if NR_HWAVES
             NR_FRAG_B cqk[NR_MF];
@@ -2640,6 +2667,7 @@
             if (NR_ACC_F16 > 0 && (k + 1) % NR_ACC_F16 == 0)
                 for (int m = 0; m < NR_MF; ++m) NR_RND(a[m])
         }
+#endif
 #endif
         // Again element-wise: `ars` is per accumulator row and `y` has been in
         // registers since stage 2. The block's output leaves ColumnMajor,

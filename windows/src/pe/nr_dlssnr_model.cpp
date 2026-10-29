@@ -28,6 +28,7 @@
 #include "nr_pe_log.hpp"
 #include "nr_pe_renodx_route.hpp"
 #include "nr_pe_control.hpp"
+#include "nr_engine_panel.hpp"
 #include "nr_pe_menu.hpp"
 #include "nr_screenshot.hpp"
 #include "nr_pe_session.hpp"
@@ -41,6 +42,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <string>
 #include <utility>
 #include <vector>
@@ -94,18 +96,45 @@ std::unique_ptr<nr::pe::Session> g_vk_session;
 // the model, exactly as it does after NVIDIA's DLL. So the model's answer must be the DLL's own
 // picture and nothing more: the post block's tail with the saturated Intensity lerp, no transfer
 // pass, no colour/model-scale controls of ours (RuntimeConfig::native_compose).
+// Once a second, under the evaluations' lock: Session::idle (NR off frees by [Network] Residency). Started with the first
+// session; it runs as long as the process, as the control channel's input thread does (nr_pe_control.cpp).
+void start_idle_clock() {
+    static std::once_flag started;
+    std::call_once(started, [] {
+        std::thread([] {
+            for (;;) {
+                Sleep(1000);
+                std::lock_guard<std::mutex> guard(g_lock);
+                if (g_d3d12_session) g_d3d12_session->idle();
+                if (g_vk_session) g_vk_session->idle();
+            }
+        }).detach();
+    });
+}
+
+// The game's motion vectors sampled at the nearest texel, as NVIDIA's DLL samples them (RuntimeConfig::motion_point).
+// NR_DEBUG_MOTION_POINT=0 (comparisons with builds before it): bilinear, as they did.
+bool motion_point() {
+    char v[4] = {};
+    return !(GetEnvironmentVariableA("NR_DEBUG_MOTION_POINT", v, sizeof v) && v[0] == '0');
+}
+
 nr::pe::Session& d3d12_session() {
+    start_idle_clock();
     if (!g_d3d12_session) {
         g_d3d12_session = std::make_unique<nr::pe::Session>(std::string());
         g_d3d12_session->set_native_compose(true);
+        g_d3d12_session->set_motion_point(motion_point());
     }
     return *g_d3d12_session;
 }
 
 nr::pe::Session& vk_session() {
+    start_idle_clock();
     if (!g_vk_session) {
         g_vk_session = std::make_unique<nr::pe::Session>(std::string());
         g_vk_session->set_native_compose(true);
+        g_vk_session->set_motion_point(motion_point());
     }
     return *g_vk_session;
 }
@@ -169,8 +198,52 @@ void note_finished(nr::pe::Session::RenoDXFrame& rf, bool finished) {
 
 // NR Control's status line (nr_pe_control.hpp): this evaluate's cost, sizes and network. `rs`: the RenoDX-style
 // option's settings when it ran the frame. OptiScaler's own passes are one feature each (`live`).
+// OptiScaler.ini [DlssNr] WhitePointSource (0 a fixed paper white, 1 the game's exposure), read again every 5 s; -1
+// when the file or the key is not there.
+int optiscaler_white_point_source() {
+    static int value = -1;
+    static ULONGLONG read = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (read && now - read < 5000) return value;
+    read = now;
+    char path[MAX_PATH + 32];
+    std::snprintf(path, sizeof path, "%s\\OptiScaler.ini", nr::pe::module_folder());
+    char v[16] = {};
+    GetPrivateProfileStringA("DlssNr", "WhitePointSource", "", v, sizeof v, path);
+    value = v[0] >= '0' && v[0] <= '9' ? std::atoi(v) : -1;
+    return value;
+}
+
+// The engine-data panel's facts an evaluate knows (nr_engine_panel.hpp): its colour's format and the guides given.
+struct PanelGuides {
+    std::string format;
+    bool float_colour = false;
+    bool motion = false, depth = false, reset = false;
+    uint32_t motion_width = 0, motion_height = 0;
+    float mv_scale_x = 0.f, mv_scale_y = 0.f;   // as the caller gave them
+};
+
+PanelGuides panel_guides_d3d12(ID3D12Resource* color, ID3D12Resource* motion, ID3D12Resource* depth,
+                               const Rect& motion_rect, bool reset, float mv_x, float mv_y) {
+    PanelGuides g;
+    g.mv_scale_x = mv_x; g.mv_scale_y = mv_y;
+    const D3D12_RESOURCE_DESC cd = color->GetDesc();
+    g.format = nr::pe::panel::dxgi_format_name(uint32_t(cd.Format));
+    g.float_colour = nr::pe::panel::dxgi_float(uint32_t(cd.Format));
+    g.motion = motion != nullptr;
+    if (motion) {
+        const D3D12_RESOURCE_DESC md = motion->GetDesc();
+        g.motion_width = motion_rect.width ? motion_rect.width : uint32_t(md.Width);
+        g.motion_height = motion_rect.height ? motion_rect.height : md.Height;
+    }
+    g.depth = depth != nullptr;
+    g.reset = reset;
+    return g;
+}
+
 void report_control(nr::pe::Session& session, const Feature* f, uint32_t route, unsigned int w, unsigned int h,
-                    const nr::renodx::Settings* rs, size_t live, uint32_t render_w = 0, uint32_t render_h = 0) {
+                    const nr::renodx::Settings* rs, size_t live, uint32_t render_w, uint32_t render_h,
+                    const PanelGuides& guides) {
     nr::pe::control::Status st;
     st.route = route;
     st.renodx = rs != nullptr;
@@ -192,8 +265,61 @@ void report_control(nr::pe::Session& session, const Feature* f, uint32_t route, 
     if (frame.known) { st.output_width = frame.output_width; st.output_height = frame.output_height; }
     session.network_size(&st.nr_width, &st.nr_height);
     st.passes = rs ? nr::renodx::stack_passes(*rs) : uint32_t(std::max<size_t>(live, 1));
-    const int int4 = session.state().running_int4;
-    st.int4 = int4 < 0 ? 2 : int4;
+    const auto ss = session.state();
+    // The engine-data panel
+    {
+        static uint64_t resets[3] = {};
+        if (guides.reset) ++resets[route % 3];
+        nr::pe::panel::Facts pf;
+        pf.renodx = rs != nullptr;
+        pf.format = guides.format;
+        pf.frame_known = frame.known;
+        pf.auto_exposure = frame.flags_known && (frame.create_flags & 0x40u) != 0;
+        if (frame.known)
+            pf.exposure_texture = (route == 2 ? frame.vk_exposure != 0 : frame.exposure != nullptr) ? 1 : 0;
+        if (frame.known && frame.flags_known) {
+            // as OptiScaler decides it (with fix 5): IsHDR or AutoExposure, on a float colour
+            pf.hdr = guides.float_colour && (frame.create_flags & 0x41u) != 0 ? 1 : 0;
+            pf.hdr_why = "the game's DLSS flags and the format";
+        }
+        pf.white_point_source = optiscaler_white_point_source();
+        // what OptiScaler's own encode did (the route's encode, read without changing it)
+        const auto seen = nr::pe::renodx_route::encode_seen();
+        if (seen.count && !rs) {
+            pf.encode = seen.linear ? 1 : 0;
+            pf.encode_white = seen.white_point;
+            pf.hdr = seen.linear ? 1 : 0;
+            pf.hdr_why = "OptiScaler's encode";
+        }
+        pf.renodx_divisor = ss.renodx.divisor;
+        pf.preprocess_ev = ss.prep_ev;
+        pf.motion_nearest = motion_point();
+        pf.mv_scale_x = guides.mv_scale_x; pf.mv_scale_y = guides.mv_scale_y;
+        pf.renodx_known = ss.renodx_known;
+        pf.renodx_hdr = ss.renodx.hdr_mode;
+        pf.renodx_absolute = ss.renodx.absolute;
+        pf.renodx_feed = ss.renodx.feed;
+        if (pf.renodx && ss.renodx_known) {
+            pf.hdr = ss.renodx.hdr_mode == 2 ? 2 : ss.renodx.hdr_mode;
+            pf.hdr_why = "RenoDX style's judgement";
+            if (ss.renodx.exposure_texture >= 0) pf.exposure_texture = ss.renodx.exposure_texture;
+        }
+        const nr::Preprocess& pp = f->controls.preprocess;
+        pf.preprocess_exposure = pp.active() ? pp.exposure : 0;
+        pf.motion = guides.motion ? 1 : 0;
+        pf.motion_width = guides.motion_width; pf.motion_height = guides.motion_height;
+        pf.depth = guides.depth ? 1 : 0;
+        pf.motion_without_depth = ss.motion_without_depth;
+        pf.resizes = ss.resizes; pf.carried = ss.carried; pf.resets = resets[route % 3];
+        st.panel = nr::pe::panel::lines(pf);
+    }
+    st.net_running = ss.running_net; st.net_want = ss.want_net;
+    for (int n = 0; n < 3; ++n) st.net_why[n] = ss.unavailable[n];
+    if (ss.building) {
+        char phase[128];
+        st.building_net = ss.building_net;
+        st.build_progress = nr::pe::build_progress(ss, phase, sizeof phase);
+    }
     nr::pe::control::report(st);
 }
 
@@ -1199,7 +1325,8 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
         log_evaluate(f, "D3D12", width, height, static_cast<const void*>(color), static_cast<const void*>(output),
                      resources.reset, ran, ran ? nullptr : session.failed() ? "failed" : session.building() ? "building"
                      : "declined", session.gpu_ms(), session.network_ms());
-        report_control(session, f, 1, width, height, &rf.settings, g_live_d3d12.size(), render_w, render_h);
+        report_control(session, f, 1, width, height, &rf.settings, g_live_d3d12.size(), render_w, render_h,
+                       panel_guides_d3d12(color, motion, depth, motion_rect, resources.reset, mv_scale_x, mv_scale_y));
         device->Release();
         if (!ran && session.failed()) return static_cast<int>(NVSDK_NGX_Result_FAIL_UnableToInitializeFeature);
         return static_cast<int>(NVSDK_NGX_Result_Success);
@@ -1244,7 +1371,8 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
                       : session.building() ? "building" : "declined";
     log_evaluate(f, "D3D12", width, height, static_cast<const void*>(color),
                  static_cast<const void*>(output), resources.reset, ran, why, session.gpu_ms(), session.network_ms());
-    report_control(session, f, 1, width, height, nullptr, g_live_d3d12.size(), render_w, render_h);
+    report_control(session, f, 1, width, height, nullptr, g_live_d3d12.size(), render_w, render_h,
+                   panel_guides_d3d12(color, motion, depth, motion_rect, resources.reset, mv_scale_x, mv_scale_y));
     if (readback && f->debug) readback_log(f, *f->debug);
     // The Vulkan identities behind the D3D12 pointers, for the multipass question: does pass k's
     // colour really alias the buffer pass k-1 wrote, or the untouched model input? Same rate limit.
@@ -1498,9 +1626,20 @@ int evaluate_vk(void* cmd_buffer, Feature* f, void* params, const void* color, c
     // uint64_t on i686, and static_cast is legal for only one of them.
     log_evaluate(f, "Vulkan", frame.width, frame.height, (const void*)(uintptr_t)(frame.colour),
                  (const void*)(uintptr_t)(out_image), frame.reset, ran, why, session.gpu_ms(), session.network_ms());
-    report_control(session, f, 2, frame.width, frame.height, frame.renodx ? &rf.settings : nullptr, g_live_vk.size(),
-                   frame.depth_subrect.width ? frame.depth_subrect.width : frame.depth_width,
-                   frame.depth_subrect.height ? frame.depth_subrect.height : frame.depth_height);
+    {
+        PanelGuides g;
+        g.format = nr::pe::panel::vk_format_name(uint32_t(frame.colour_format));
+        g.float_colour = nr::pe::panel::vk_float(uint32_t(frame.colour_format));
+        g.motion = frame.motion != VK_NULL_HANDLE;
+        g.motion_width = frame.motion_subrect.width ? frame.motion_subrect.width : frame.motion_width;
+        g.motion_height = frame.motion_subrect.height ? frame.motion_subrect.height : frame.motion_height;
+        g.depth = frame.depth != VK_NULL_HANDLE;
+        g.mv_scale_x = mv_scale_x; g.mv_scale_y = mv_scale_y;
+        g.reset = frame.reset;
+        report_control(session, f, 2, frame.width, frame.height, frame.renodx ? &rf.settings : nullptr, g_live_vk.size(),
+                       frame.depth_subrect.width ? frame.depth_subrect.width : frame.depth_width,
+                       frame.depth_subrect.height ? frame.depth_subrect.height : frame.depth_height, g);
+    }
     if (!ran && !session.status().empty()) {
         g_last_error = session.status();
         static std::string reported;

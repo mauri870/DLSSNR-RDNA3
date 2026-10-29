@@ -18,6 +18,9 @@
 #include "nr_pe_interop.hpp"
 #include "nr_runtime.hpp"
 #include "nr_renodx.hpp"
+#include "nr_ini_network.hpp"
+#include <cmath>
+#include <cstdio>
 #include <memory>
 #include <string>
 
@@ -46,6 +49,9 @@ class Session {
     // does its resolve after us. Set before the first frame; the OptiScaler
     // route sets it, the legacy module does not.
     void set_native_compose(bool);
+    // RuntimeConfig::motion_point: the game's motion vectors point-sampled as NVIDIA's DLL does. Set before the first
+    // frame; the NGX (OptiScaler) route sets it.
+    void set_motion_point(bool);
 
     // Run the network on `colour` and return the resource to hand the upscaler
     // in its place. Returns null when the pass could not run, in which case the
@@ -354,19 +360,30 @@ class Session {
     // What a host's UI shows: the network running and the one being built.
     struct State {
         bool running = false;           // a network is serving frames
-        int running_int4 = -1;          // 1 int4 mixed, 0 the default network, -1 none (or no int4 in this build)
+        int running_net = -1;           // the network serving (nr::NetworkChoice), -1 none
         uint32_t model_w = 0, model_h = 0;
-        int want_int4 = -1;             // [Int4Mixed]: what the switch asks for; -1 no int4 in this build
-        bool int4_available = false;    // int4 mixed can be switched to in this run
+        int want_net = -1;              // [Network] Model: what the switch asks for
+        std::string unavailable[nr::kNetworkChoices];   // why each network cannot run in this run ("" it can)
         bool building = false;
-        int building_int4 = -1;
+        int building_net = -1;
         float building_seconds = 0.0f;
         int stage = 0;                  // nr::g_build_stage while building
         uint32_t pipes_done = 0, pipes_total = 0;
+        // For the engine-data panel: size changes of a feature (each restarts its history, or carries it over with
+        // [Network] Resize History = 1: `carried`), the RenoDX-style option's last frame, [Network] Motion Without Depth.
+        uint64_t resizes = 0, carried = 0;
+        bool renodx_known = false;
+        renodx::Stage::Facts renodx{};
+        bool motion_without_depth = true;
+        float prep_ev = NAN;   // the running network's Preprocess auto exposure (smoothed EV), NaN not metered
     };
     State state() const;
-    // [Int4Mixed] from the host's UI, as the hotkey does (the caller saves Enabled to the ini).
-    void set_int4(bool on);
+    // [Network] Model from the host's UI, as the hotkey does (the switch writes Model to the ini).
+    void set_network(int n);
+    // Between evaluations, from the host's own clock (with whatever lock its evaluations hold): after a while with no
+    // evaluation (NR off), [Network] Residency frees what it would free of an inactive network, the running one included,
+    // and networks retired since are freed (their frames are long done).
+    void idle();
 
     // The largest device-local heap as the driver's memory budget sees it, this
     // process's use against its budget, in MB; "" before a device is known. For
@@ -378,5 +395,23 @@ class Session {
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+// How far a build is (0..1) by its stage, and the stage in words into `text` (the menus' progress bar, the OSD).
+inline float build_progress(const Session::State& st, char* text, size_t n) {
+    float f = 0.02f;
+    const char* what = "starting";
+    switch (st.stage) {
+        case 1: f = 0.05f; what = "planning"; break;
+        case 2: f = 0.20f; what = "reading the weights"; break;
+        case 3: f = 0.35f; what = "uploading the weights"; break;
+        case 4: f = 0.40f + 0.55f * (st.pipes_total ? float(st.pipes_done) / float(st.pipes_total) : 0.0f);
+                what = "creating pipelines"; break;
+        case 5: f = 0.97f; what = "finishing"; break;
+        default: break;
+    }
+    if (st.stage == 4) std::snprintf(text, n, "%s %u/%u, %.0f s", what, st.pipes_done, st.pipes_total, st.building_seconds);
+    else std::snprintf(text, n, "%s, %.0f s", what, st.building_seconds);
+    return f;
+}
 
 }  // namespace nr::pe

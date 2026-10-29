@@ -1,0 +1,177 @@
+{
+ "about": [
+  "CC_SMALL_FP8_EXPERIMENTAL, the faster variant of the small model (build_network.py <arch> --experimental; its own",
+  "weights, dlssnr-small-experimental.bin): every pipeline of pipelines.json, \"change\" adds defines to the pipeline of that",
+  "name, \"new\" builds extra pipelines from a base pipeline of pipelines.json. NR_SACT=1: ReLU as the Swin MLP activation",
+  "(every fswin_t pipeline but the small model's pre block, fswinimagepreds32nh); NR_FIXP: the window attention is one",
+  "fixed 64x64 probability table a layer (no QK^T, no softmax); NR_VOMERGE: with it, the V and output projections are one",
+  "matrix. fswin32nhd: the decoder's plain C=32 layer on its own pipeline (the encoder's keeps the full attention);",
+  "fixed-attention.txt lists the NR_FIXP pipelines (the host writes their tables). Temporal variants: pipelines.json."
+ ],
+ "change": {
+  "fswin128": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswin256": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswin32": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswin32nh": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswin64": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinds128": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinds256": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinds32": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinds64": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswindsp128": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswindsp256": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswindsp32": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswindsp32nh": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswindsp64": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinfusedup128": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinfusedup256": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinfusedup32": {
+   "add": [
+    "NR_SACT=1",
+    "NR_FIXP=1",
+    "NR_VOMERGE=1"
+   ]
+  },
+  "fswinfusedup32nh": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinfusedup64": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinimagepost32": {
+   "add": [
+    "NR_SACT=1",
+    "NR_FIXP=1",
+    "NR_VOMERGE=1"
+   ]
+  },
+  "fswinimagepreds32": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinp128": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinp256": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinp64": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinpds128": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinpds256": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinpds64": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinpup128": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinpup256": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinpup64": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  }
+ },
+ "new": {
+  "fswin32nhd": {
+   "base": "fswin32nh",
+   "add": [
+    "NR_SACT=1",
+    "NR_FIXP=1",
+    "NR_VOMERGE=1"
+   ]
+  }
+ }
+}

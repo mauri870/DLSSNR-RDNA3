@@ -1,5 +1,9 @@
 # DLSS Neural Rendering on AMD, through OptiScaler
 
+> Since 0.0.8 the Linux packages use the official OptiScaler with this project's NR as an OptiScaler plugin
+> (`dlssnr-amd.asi`, see `docs/ARCHITECTURE.md`); of this folder only `patch_ini.py` is used. What follows describes
+> the NGX-core backend for the OptiScaler-NR fork, which the Windows package still uses (`windows/`).
+
 OptiScaler's DLSS-NR forks already know how to find a game's colour, depth and motion vectors, encode
 a display-referred proxy, run a Neural Rendering model over it and composite the answer back. What
 they do not have is a model that runs on a Radeon: they reach NVIDIA's `nvngx_dlssnr.dll`, and that
@@ -36,8 +40,9 @@ list with `GetModuleHandleW` (never `LoadLibrary`) and routes through its export
 | **`dlssnr_core.dll`** | **the NGX core, and feature 18** (built as `_nvngx.dll`, shipped renamed; below) | `linux/build/build_optiscaler_nr.sh` |
 | **`nvngx.dll_dlssnr.dll`** | **the forwarder, for the older lineage** | same |
 | **`nvngx_dlssnr.dll`** | **a byte copy of the forwarder** | same |
-| `dlssnr-amd/` | the model, the network's SPIR-V, the pipeline cache (and with int4 mixed its network and Vulkan layer) | `linux/build/build_package.sh`'s package |
-| `dlssnr-amd.ini` | our own settings: `[Preprocess]`, and `[Int4Mixed]` with int4 mixed | written at install |
+| `vulkan-1.dll` | exports forwarded to `winevulkan.dll`, as Proton's own `vulkan-1.dll`; keeps OptiScaler's menu working when Proton loads a native Vulkan loader (not installed when the game brings its own) | `linux/vulkan-loader/vulkan1_forwarder.c`, built by `linux/build/build_package.sh` |
+| `dlssnr-amd/` | the models, the network's SPIR-V, the pipeline cache, int4 mixed's network and Vulkan layer, NR Control's Vulkan layer | `linux/build/build_package.sh`'s package |
+| `dlssnr-amd.ini` | our own settings: `[Network]`, `[Preprocess]`, `[RenoDX]`, `[Log]` | written at install |
 
 The package's `install.sh <game-dir> optiscaler` does all of it. (`install_optiscaler_nr.sh` in this
 directory predates the package layout - it expects `artifacts/optiscaler/nr` and a `build/` +

@@ -10,11 +10,13 @@ namespace {
 enum class Kind { Plain, Pre, Post, Down, SwinUp, DecoderUp, FinalHead };
 struct Record { const char* row; Kind kind; int skip; bool original; int sx, sy; };
 #include "nr_native_plan_data.hpp"
+#include "nr_native_plan_data_small.hpp"
 struct Shape { uint32_t w, h; }; // host tensor scalars, not raster axes
 struct LayerShape { Shape before, after; };
 struct Walk { std::string text; uint32_t nx{}, ny{}; };
 uint32_t up(uint32_t n, uint32_t alignment) { return (n + alignment - 1) / alignment * alignment; }
-Walk walk(uint32_t source_width, uint32_t source_height, bool emit) {
+template <size_t N>
+Walk walk(const Record (&records)[N], uint32_t source_width, uint32_t source_height, bool emit) {
     Shape current{source_height, source_width}, previous = current;
     std::vector<LayerShape> shapes;
     int last_block = -1;
@@ -49,7 +51,8 @@ Walk walk(uint32_t source_width, uint32_t source_height, bool emit) {
             if (record.kind == Kind::FinalHead) plan = out;
             if (record.kind == Kind::DecoderUp) plan = {up(out.w, 4), up(out.h, 4)};
             if (record.kind == Kind::Post) plan = {source_height / 2, source_width / 2};
-            const uint64_t tokens = block >= 31 && block <= 38
+            // ViT layers (310.8 blocks 31..38, small model 11..18) keep their token count unaligned.
+            const uint64_t tokens = row[17].rfind("CCVit1D", 0) == 0
                 ? uint64_t(plan.w) * plan.h : uint64_t(up(plan.w, 8)) * up(plan.h, 8);
             row[3] = std::to_string(plan.w); row[4] = std::to_string(plan.h); row[5] = std::to_string(tokens);
             Shape grid = record.kind == Kind::Post || record.kind == Kind::SwinUp ? out : plan;
@@ -63,17 +66,30 @@ Walk walk(uint32_t source_width, uint32_t source_height, bool emit) {
     result.text = text.str(); return result;
 }
 }
-NativePlan make_native_plan(uint32_t width, uint32_t height) {
+template <size_t N>
+NativePlan plan_for(const Record (&records)[N], const char* fingerprint, uint32_t width, uint32_t height,
+                    bool dll_align) {
     if (!width || !height || width > 16384 || height > 16384) throw std::invalid_argument("invalid source dimensions");
-    const auto probe = walk(width, height, false);
+    const auto probe = walk(records, width, height, false);
     if (probe.nx >= 16 || probe.ny >= 16) throw std::logic_error("invalid native reduction count");
-    const uint32_t ax = 1u << probe.nx, ay = 1u << probe.ny;
+    uint32_t ax = 1u << probe.nx, ay = 1u << probe.ny;
+    // The real DLL aligns an axis to twice that when the pre block's output along it,
+    // up((n + 1) / 2, 4), is 4 mod 8 (measured against nvngx_dlssnr 310.9: 1080 -> 1152).
+    // Small model only; the 310.8 model keeps its previous extents.
+    if (dll_align) {
+        if (up((width + 1) / 2, 4) % 8 == 4) ax *= 2;
+        if (up((height + 1) / 2, 4) % 8 == 4) ay *= 2;
+    }
     NativePlan result;
     result.reductions_x = probe.nx; result.reductions_y = probe.ny;
     result.width = std::max(320u, up(width, ax)); result.height = std::max(320u, up(height, ay));
     if (!(result.height % (ay * 4)) && !(result.width % (ax * 4))) result.width += ax;
-    result.text = walk(result.width, result.height, true).text;
-    result.model = model_fingerprint;
+    result.text = walk(records, result.width, result.height, true).text;
+    result.model = fingerprint;
     return result;
+}
+NativePlan make_native_plan(uint32_t width, uint32_t height, NetworkModel model) {
+    return model == NetworkModel::Small ? plan_for(records_small, model_fingerprint_small, width, height, true)
+                                        : plan_for(records, model_fingerprint, width, height, false);
 }
 } // namespace nr

@@ -1,0 +1,48 @@
+#version 460
+// Passes (fast): the guided filter's box mean over (2 radius + 1)^2 cells of the quarter-size grid, horizontal then
+// vertical (rows in shared memory), cells outside the grid left out; with `coef` the filter's coefficients of the means
+// (a = cov(I, p) / (var(I) + eps), b = mean(p) - a mean(I)). radius <= 4.
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) uniform texture2D InA;
+layout(set = 0, binding = 1) uniform texture2D InB;
+layout(set = 0, binding = 4, rgba32f) uniform writeonly image2D OutA;
+layout(set = 0, binding = 5, rgba32f) uniform writeonly image2D OutB;
+layout(push_constant) uniform Push { uvec2 low; uint radius, coef; float eps; } pc;
+shared vec4 s_a[24][16], s_b[24][16];
+void main() {
+    const ivec2 org = ivec2(gl_WorkGroupID.xy) * 16;
+    const ivec2 lid = ivec2(gl_LocalInvocationID.xy);
+    const int r = int(pc.radius);
+    const int col = org.x + lid.x;
+    for (int k = lid.y; k < 16 + 2 * r; k += 16) {
+        const int row = org.y - r + k;
+        if (row < 0 || row >= int(pc.low.y) || col >= int(pc.low.x)) continue;
+        vec4 A = vec4(0.0), B = vec4(0.0); float c = 0.0;
+        for (int i = -r; i <= r; ++i) {
+            const ivec2 t = ivec2(col + i, row);
+            if (t.x < 0 || t.x >= int(pc.low.x)) continue;
+            A += texelFetch(InA, t, 0); B += texelFetch(InB, t, 0); c += 1.0;
+        }
+        s_a[k][lid.x] = A / c; s_b[k][lid.x] = B / c;
+    }
+    barrier();
+    const ivec2 q = org + lid;
+    if (any(greaterThanEqual(q, ivec2(pc.low)))) return;
+    vec4 sa = vec4(0.0), sb = vec4(0.0); float c = 0.0;
+    for (int i = -r; i <= r; ++i) {
+        const int row = q.y + i;
+        if (row < 0 || row >= int(pc.low.y)) continue;
+        sa += s_a[lid.y + r + i][lid.x]; sb += s_b[lid.y + r + i][lid.x]; c += 1.0;
+    }
+    // the means as stored values: not contracted into the coefficients' arithmetic
+    precise const vec4 A = sa / c, B = sb / c;
+    if (pc.coef != 0u) {
+        const float mI = A.x, vI = max(A.y - mI * mI, 0.0);
+        const vec3 mp = vec3(A.z, A.w, B.x), mIp = B.yzw;
+        const vec3 a = (mIp - mI * mp) / (vI + pc.eps);
+        imageStore(OutA, q, vec4(a, mI)); imageStore(OutB, q, vec4(mp - a * mI, vI));
+    } else {
+        imageStore(OutA, q, A); imageStore(OutB, q, B);
+    }
+}

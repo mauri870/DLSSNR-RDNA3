@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """Build the Linux network for one GPU architecture from linux/shaders/<arch>/pipelines.json.
 
-    build_network.py <arch> [--int4] [--out DIR] [--check DIR]
+    build_network.py <arch> [--int4 | --experimental] [--out DIR] [--check DIR]
 
-Writes (default build/linux/<arch>/network, with --int4 build/linux/<arch>/network-int4):
+Writes (default build/linux/<arch>/network, with --int4 build/linux/<arch>/network-int4, with --experimental
+build/linux/<arch>/network-experimental):
     g_<name>.spv + the four marker files   the network, what --spv-dir points at
     runtime/                                 the arch-neutral passes (linux/shaders/passes)
-    temporal/                                the temporal variants and the motion estimator
+    g_<name>_grade.spv                      style_grade: the post block with the Natural/Cinematic grade
+    temporal/                                the temporal variants (+ their _grade twins) and the motion estimator
 
 The host must be compiled with the same constants: linux/build/arch/<arch>.sh.
 --int4: the int4 mixed network (pipelines.json with pipelines-int4.json applied; the host built with NR_INT4=1):
 the network and temporal/ (the runtime passes are the default network's), the host's g_<name>.spv.iu4 markers and
 hs-pipelines.txt (the pipelines built with the hard-swish, for the host's guard).
+--experimental: CC_SMALL_FP8_EXPERIMENTAL (pipelines.json with pipelines-experimental.json applied; the same host):
+the network and temporal/, and fixed-attention.txt (the pipelines whose fixed probability tables the host writes).
 --check DIR compares every network SPV and marker with DIR byte for byte and
 lists the differences (exit 1 if any).
 """
@@ -23,11 +27,10 @@ import sys
 from pathlib import Path
 
 R = Path(__file__).resolve().parents[2]
-RUNTIME = ['runtime_alpha', 'runtime_encode', 'runtime_transfer', 'runtime_upscale', 'runtime_prep', 'runtime_depth', 'cascade_lograt', 'cascade_blur', 'cascade_feed',
-           'runtime_downscale', 'runtime_taps',
+# the runtime's own passes around the network (it runs the network only: the composition is RenoDX's stage's and the
+# wilsjo2 flow's): the alpha restore and the depth guide's copy
+RUNTIME = ['runtime_alpha', 'runtime_depth',
            'runtime_reuse_store', 'runtime_reuse_motion', 'runtime_reuse_warp', 'runtime_reuse_stat']
-# runtime passes built from another pass's source with defines: name -> (source, defines)
-RUNTIME_VARIANTS = {'runtime_transfer_store': ('runtime_transfer', ['NR_STORE_NATIVE'])}
 MOTION = ['motion_luma', 'motion_estimate']
 
 
@@ -44,18 +47,23 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('arch')
     ap.add_argument('--int4', action='store_true')
+    ap.add_argument('--experimental', action='store_true')
     ap.add_argument('--out', type=Path)
     ap.add_argument('--check', type=Path)
     a = ap.parse_args()
     table = json.loads((R / 'linux/shaders' / a.arch / 'pipelines.json').read_text())
-    if a.int4:
-        i4 = json.loads((R / 'linux/shaders' / a.arch / 'pipelines-int4.json').read_text())
+    if a.int4 and a.experimental:
+        sys.exit('--int4 or --experimental, not both')
+    overlay = 'int4' if a.int4 else 'experimental' if a.experimental else ''
+    if overlay:
+        i4 = json.loads((R / 'linux/shaders' / a.arch / f'pipelines-{overlay}.json').read_text())
         default = table['pipelines']
         def derive(e, c):
             return dict(e, defines=[x for x in e['defines'] if x not in c.get('remove', [])] + c.get('add', []))
+        assert not set(i4['change']) - set(default), 'pipelines-%s.json changes unknown pipelines' % overlay
         table['pipelines'] = {k: derive(e, i4['change'].get(k, {})) for k, e in default.items()}
         table['pipelines'].update({k: derive(default[c['base']], c) for k, c in i4['new'].items()})
-    out = a.out or R / 'build/linux' / a.arch / ('network-int4' if a.int4 else 'network')
+    out = a.out or R / 'build/linux' / a.arch / (f'network-{overlay}' if overlay else 'network')
     if out.exists():
         shutil.rmtree(out)
     (out / 'runtime').mkdir(parents=True)
@@ -70,6 +78,15 @@ def main():
         base = pipelines[v['base']]
         glslang(a.arch, R / 'linux/shaders' / a.arch / base['source'], base['defines'] + v['add'],
                 out / 'temporal' / f'{name}.spv')
+    # RDNA3's network has no Style grade pipelines: the runtime runs the plain post block without them
+    grade = table.get('style_grade', {'pipelines': [], 'variants': [], 'add': []})
+    for name in grade['pipelines']:
+        e = pipelines[name]
+        glslang(a.arch, R / 'linux/shaders' / a.arch / e['source'], e['defines'] + grade['add'], out / f'g_{name}_grade.spv')
+    for name in grade['variants']:
+        base = pipelines[table['variants'][name]['base']]
+        glslang(a.arch, R / 'linux/shaders' / a.arch / base['source'],
+                base['defines'] + table['variants'][name]['add'] + grade['add'], out / 'temporal' / f'{name}_grade.spv')
     for k in MOTION:
         glslang(a.arch, R / 'linux/shaders/passes' / f'{k}.comp', [], out / 'temporal' / f'{k}.spv')
     shutil.copy2(out / 'shader-constants.txt', out / 'temporal' / 'shader-constants.txt')
@@ -79,15 +96,16 @@ def main():
         hs = sorted(k for k, e in pipelines.items() if 'NR_ACT_HS=2' in e['defines'])
         (out / 'hs-pipelines.txt').write_text('\n'.join(hs) + '\n')
         (out / 'runtime').rmdir()
+    elif a.experimental:
+        fixp = sorted(k for k, e in pipelines.items() if 'NR_FIXP=1' in e['defines'])
+        (out / 'fixed-attention.txt').write_text('\n'.join(fixp) + '\n')
+        (out / 'runtime').rmdir()
     else:
         for k in RUNTIME:
             glslang(a.arch, R / 'linux/shaders/passes' / f'{k}.comp', [], out / 'runtime' / f'{k}.spv')
-        for k, (src, defines) in RUNTIME_VARIANTS.items():
-            glslang(a.arch, R / 'linux/shaders/passes' / f'{src}.comp', defines, out / 'runtime' / f'{k}.spv')
-        # runtime_upscale.spv carries AMD FidelityFX Super Resolution 1 (MIT): its notice goes with it
-        shutil.copy2(R / 'linux/shaders/passes/include/fsr1/LICENSE.txt', out / 'runtime' / 'FidelityFX-FSR1-LICENSE.txt')
-    print(f'{out}: {len(pipelines)} network pipelines, {len(table["variants"]) + len(MOTION)} temporal, '
-          f'{0 if a.int4 else len(RUNTIME) + len(RUNTIME_VARIANTS)} runtime')
+    print(f'{out}: {len(pipelines) + len(grade["pipelines"])} network pipelines, '
+          f'{len(table["variants"]) + len(grade["variants"]) + len(MOTION)} temporal, '
+          f'{0 if overlay else len(RUNTIME)} runtime')
 
     if a.check:
         bad = [p.name for p in sorted(out.iterdir()) if p.is_file()

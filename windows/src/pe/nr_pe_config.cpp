@@ -4,6 +4,7 @@
 #if NR_INT4
 #include "nr_ini_int4.hpp"
 #endif
+#include "nr_ini_network.hpp"
 #include "nr_pe_log.hpp"
 #include "nr_pipeline_binary.hpp"
 
@@ -127,6 +128,35 @@ std::vector<char> make_cue(bool on) {
     return wav;
 }
 
+// One soft note (CC_SMALL_FP8's switch cue), the same envelope and level as make_cue's.
+void play_note(float hz) {
+    static std::vector<char> wav;
+    if (wav.empty()) {
+        const int rate = 44100, note = rate * 11 / 100;
+        std::vector<int16_t> pcm;
+        for (int i = 0; i < note; ++i) {
+            const float env = std::min({1.0f, float(i) / (0.01f * rate), float(note - i) / (0.03f * rate)});
+            pcm.push_back(int16_t(0.1f * 32767.0f * env * std::sin(6.2831853f * hz * float(i) / float(rate))));
+        }
+        const uint32_t data = uint32_t(pcm.size() * 2);
+        wav.resize(44 + data);
+        auto put32 = [&](size_t at, uint32_t v) { std::memcpy(&wav[at], &v, 4); };
+        auto put16 = [&](size_t at, uint16_t v) { std::memcpy(&wav[at], &v, 2); };
+        std::memcpy(&wav[0], "RIFF", 4); put32(4, 36 + data); std::memcpy(&wav[8], "WAVEfmt ", 8);
+        put32(16, 16); put16(20, 1); put16(22, 1); put32(24, uint32_t(rate)); put32(28, uint32_t(rate * 2));
+        put16(32, 2); put16(34, 16); std::memcpy(&wav[36], "data", 4); put32(40, data);
+        std::memcpy(&wav[44], pcm.data(), data);
+    }
+    std::thread([] {
+        using PlaySoundFn = BOOL(WINAPI*)(LPCSTR, HMODULE, DWORD);
+        static const PlaySoundFn play = [] {
+            const HMODULE winmm = LoadLibraryA("winmm.dll");
+            return winmm ? reinterpret_cast<PlaySoundFn>(GetProcAddress(winmm, "PlaySoundA")) : nullptr;
+        }();
+        if (play) play(wav.data(), nullptr, 0x0004 | 0x0002);   // SND_MEMORY | SND_NODEFAULT, synchronous
+    }).detach();
+}
+
 void play_cue(bool on) {
     static const std::vector<char> cues[2] = {make_cue(false), make_cue(true)};
     std::thread([on] {
@@ -155,6 +185,10 @@ bool parse(const std::string& path, Config& c, bool& legacy) {
     int passes = c.controls.passes;
     bool section = false;
     std::string name;   // the current section, lower case
+    // An old file: [Network] Model = small / original and [Int4Mixed] Enabled / Hotkey / Sound (before 0.0.7).
+    bool model_old_word = false, have_hotkey = false, have_sound = false;
+    int old_int4 = -1;
+    std::string old_hotkey; bool old_sound = true;
     char line[512];
     while (std::fgets(line, sizeof line, file)) {
         std::string text = line;
@@ -180,18 +214,33 @@ bool parse(const std::string& path, Config& c, bool& legacy) {
             continue;
         }
         if (name == "network") {
-            if (key == "aco" || key == "aco mode" || key == "acomode") { if (auto b = parse_bool(value)) c.aco = *b; }
+            auto& n = c.network;
+            if (key == "aco" || key == "aco mode" || key == "acomode") { if (auto b = parse_bool(value)) n.aco = *b; }
+            else if (key == "model") {
+                const int m = nr::network_choice(value);
+                if (m >= 0) { n.model = m; model_old_word = lower(value) == "small" || lower(value) == "original"; }
+            }
+            else if (key == "hotkey") { n.hotkey = value; have_hotkey = true; }
+            else if (key == "sound") { if (auto b = parse_bool(value)) { n.sound = *b; have_sound = true; } }
+            else if (key == "residency") {
+                const std::string v = lower(value);
+                for (int r = 0; r < 4; ++r) if (v == residency_name(r)) n.residency = r;
+            }
+            else if (key == "motion without depth") { if (auto b = parse_bool(value)) n.motion_without_depth = *b; }
+            else if (key == "resize history") { if (auto b = parse_bool(value)) n.resize_history = *b; }
+            else if (key == "style grade") { if (auto b = parse_bool(value)) n.style_grade = *b; }
+            else if (key == "osd") {
+                const std::string v = lower(value);
+                for (int o = 0; o < 3; ++o) if (v == osd_name(o)) n.osd = o;
+            }
             continue;
         }
-#if NR_INT4
-        if (name == "int4mixed") {
-            if (key == "enabled") { if (auto b = parse_bool(value)) c.int4 = *b; }
-            else if (key == "hotkey") c.int4_hotkey = value;
-            else if (key == "keepboth") { if (auto b = parse_bool(value)) c.int4_keep_both = *b; }
-            else if (key == "sound") { if (auto b = parse_bool(value)) c.int4_sound = *b; }
+        if (name == "int4mixed") {   // the old section
+            if (key == "enabled") { if (auto b = parse_bool(value)) old_int4 = *b ? 1 : 0; }
+            else if (key == "hotkey") old_hotkey = value;
+            else if (key == "sound") { if (auto b = parse_bool(value)) old_sound = *b; }
             continue;
         }
-#endif
         if (value.empty()) continue;
         auto& k = c.controls;
 
@@ -223,6 +272,11 @@ bool parse(const std::string& path, Config& c, bool& legacy) {
         else if (key == "history") c.history = number(value, 0, 1);
         else if (key == "noiseeveryframe") { if (auto b = parse_bool(value)) k.noise_every_frame = *b; }
         else if (key == "whitepoint" || key == "white_point") c.white_point = number(value, 0.01f, 100.0f);
+        else if (key == "motionvectors") {
+            const std::string v = lower(value);
+            if (v == "vort") c.motion_vectors = 0;
+            else if (v == "lumenite") c.motion_vectors = 1;
+        }
         else if (key.rfind("pass", 0) == 0 && key.size() > 5 && std::isdigit(static_cast<unsigned char>(key[4]))) {
             // Pass<N><Field>, or the old pass<N>_<field>.
             size_t end = 4;
@@ -240,6 +294,10 @@ bool parse(const std::string& path, Config& c, bool& legacy) {
     if (legacy && passes > 2) c.unlock_passes = true;   // the old file allowed up to 16
     c.controls.passes = std::clamp(passes, 1, c.pass_limit());
     c.resolve();
+    // An old file: int4 mixed was its own section on top of the original model.
+    if (model_old_word && c.network.model == nr::kSilverAardwold && old_int4 == 1) c.network.model = nr::kSilverAardwoldInt4;
+    if (!have_hotkey && !old_hotkey.empty()) c.network.hotkey = old_hotkey;
+    if (!have_sound) c.network.sound = old_sound;
     return true;
 }
 
@@ -915,39 +973,87 @@ std::string describe(const Preprocess& p) {
     return text;
 }
 
-#if NR_INT4
-void write_int4mixed(FILE* f, bool enabled, const std::string& hotkey, bool keep_both, bool sound) {
-    std::fprintf(f,
-        "[Int4Mixed]\n"
-        "; int4 mixed: part of the network runs in int4 and other lower precisions; faster, the picture differs somewhat.\n"
-        "; Edits take effect when saved, also in game. A switch builds the other network in the background; until it is\n"
-        "; ready the current one keeps running.\n"
-        "; This version needs [Network] ACO Mode = 1 for int4 mixed; a change of ACO Mode takes effect after a game restart.\n"
-        "\n"
-        "Enabled = %d\n"
-        "; 1 = int4 mixed (default)\n"
-        "; 0 = the default network\n"
-        "; With Enabled = 0 and no Hotkey when the game starts, int4 mixed cannot be switched to in that run (restart the game)\n"
-        "\n"
-        "Hotkey = %s\n"
-        "; Switches between int4 mixed and the default network in game, to compare them on the same picture.\n"
-        "; Switching to int4 mixed with it needs [Network] ACO Mode = 1; with ACO Mode = 0 the default network stays.\n"
-        "; For the current run only, not written back to this file. Empty = no hotkey. Ctrl, Shift, Alt and one key,\n"
-        "; e.g. Alt+F9\n"
-        "\n"
-        "KeepBoth = %d\n"
-        "; 0 = after a switch the other network is freed, so only one takes video memory; switching back builds it again\n"
-        ";     in the background (default)\n"
-        "; 1 = both networks stay in video memory and switching is instant, for comparing back and forth; takes one\n"
-        ";     more network's video memory\n"
-        "\n"
-        "Sound = %d\n"
-        "; a short sound when it switches (hotkey or this file): two notes going up = int4 mixed, going down = the\n"
-        "; default network. 0 = silent\n"
-        "\n", enabled ? 1 : 0, hotkey.c_str(), keep_both ? 1 : 0, sound ? 1 : 0);
+const char* osd_name(int o) {
+    static const char* const names[] = {"off", "switch", "always"};
+    return names[o >= 0 && o < 3 ? o : 1];
 }
 
-#endif
+const char* residency_name(int r) {
+    static const char* const names[4] = {"auto", "resident", "offload", "minimal"};
+    return names[std::clamp(r, 0, 3)];
+}
+
+void write_network(FILE* f, const NetworkConfig& n) {
+    std::fprintf(f,
+        "[Network]\n"
+        "; Which network NR runs. It can be changed in game at any time: the drop-down in NR Control (OptiScaler\n"
+        "; routes, opened with End) or on ReShade's Add-ons page, or the Hotkey; a change is written here, so the next\n"
+        "; game start uses it.\n"
+        "\n"
+        "Model = %s\n"
+        "; CC_SMALL_FP8                  = the default network of NVIDIA 310.9.16, the fastest\n"
+        "; CC_SILVER_AARDWOLD            = the network of 310.8.0 (also preset 1 of 310.9.16)\n"
+        "; CC_SILVER_AARDWOLD_INT4_MIXED = CC_SILVER_AARDWOLD with part of the work in int4 and other lower precisions;\n"
+        ";                                 faster, the picture differs somewhat; needs ACO Mode = 1 (below)\n"
+        "; A network that cannot run (e.g. no 310.9.16 model file) is greyed out in the menus with the reason, and the\n"
+        "; hotkey skips it.\n"
+        "\n"
+        "Hotkey = %s\n"
+        "; Cycles through the networks that can run, to compare them on the same picture. Empty = no hotkey. Ctrl,\n"
+        "; Shift, Alt and one key, e.g. Alt+F9\n"
+        "\n"
+        "Sound = %d\n"
+        "; A sound when the network changes (hotkey, menu or this file): one note = CC_SMALL_FP8, two notes going down =\n"
+        "; CC_SILVER_AARDWOLD, two notes going up = CC_SILVER_AARDWOLD_INT4_MIXED. 0 = silent\n"
+        "\n"
+        "Residency = %s\n"
+        "; What is kept of a network that is no longer running. The three networks share one activation memory, so\n"
+        "; what is kept is mainly the weights. When switching back, the current network keeps running until the other\n"
+        "; one is ready.\n"
+        "; auto     = only the weights stay in video memory, switching back is quick; when video memory runs short\n"
+        ";            they move to RAM, and are freed when RAM runs short too (default)\n"
+        "; resident = the whole network stays in video memory; switching back is instant, uses the most video memory\n"
+        "; offload  = the weights move to RAM and all video memory is freed; switching back copies them back\n"
+        "; minimal  = video memory and RAM are freed; switching back builds the network again\n"
+        "; NR off for more than 10 s: offload and minimal also treat the running network so; auto only when video\n"
+        "; memory runs short\n"
+        "\n"
+        "Motion Without Depth = %d\n"
+        "; Where the network reads a pixel's motion vector to fetch the previous frame. Applied after a game restart.\n"
+        "; 1 = the pixel's own motion vector, depth not used, as NVIDIA's DLL does (default)\n"
+        "; 0 = with depth, the motion vector of whichever of the pixel and its four diagonal neighbours is nearest\n"
+        ";     the camera\n"
+        "; Only matters for consecutive frames with motion vectors and depth: the edges of moving objects\n"
+        "\n"
+        "Resize History = %d\n"
+        "; What happens to NR's previous result when the game's render size changes (dynamic resolution). Only\n"
+        "; matters with NR before the upscaler.\n"
+        "; 0 = dropped, NR starts again at the new size, as NVIDIA's DLL does (default)\n"
+        "; 1 = scaled to the new size and kept. Steadier in our tests when the size changes often, but not what\n"
+        ";     NVIDIA's DLL does. Most DLSS games jitter their input, which hides most of the restart, so it is off\n"
+        ";     by default\n"
+        "\n"
+        "Style Grade = %d\n"
+        "; The grade of the Natural and Cinematic styles:\n"
+        "; 1 = as NVIDIA's DLL: the picture is graded for the style after the network (default)\n"
+        "; 0 = the picture of 0.0.6 and earlier (without that step after the network). Standard is not affected;\n"
+        ";     applied at once\n"
+        "\n"
+        "OSD = %s\n"
+        "; The current network shown in a corner of the screen:\n"
+        "; switch = while a network change builds, with its progress, then for 3 s (default)\n"
+        "; always = all the time\n"
+        "; off    = never\n"
+        "\n"
+        "ACO Mode = %d\n"
+        "; Which compiler made the network's machine code. Applied after a game restart.\n"
+        "; 1 = machine code made in advance by the ACO compiler (the one the Linux version uses), loaded by the AMD\n"
+        ";     driver (default). When it cannot be used, the driver's compiler is used instead and dlssnr-amd.log says why\n"
+        "; 0 = the AMD driver's own compiler. CC_SILVER_AARDWOLD_INT4_MIXED needs ACO Mode = 1\n"
+        "\n", nr::network_codename(n.model), n.hotkey.c_str(), n.sound ? 1 : 0, residency_name(n.residency),
+        n.motion_without_depth ? 1 : 0, n.resize_history ? 1 : 0, n.style_grade ? 1 : 0, osd_name(n.osd), n.aco ? 1 : 0);
+}
+
 void write_preprocess(FILE* f, const PreprocessConfig& p) {
     const auto& v = p.values;
     std::fprintf(f,
@@ -1024,23 +1130,11 @@ void write_log(FILE* f, bool enabled, bool clear) {
         enabled ? 1 : 0, clear ? 1 : 0);
 }
 
-void write_network(FILE* f, bool aco) {
-    std::fprintf(f,
-        "\n[Network]\n"
-        "; Which compiler makes the network's machine code. Takes effect when the game restarts.\n"
-        "\n"
-        "ACO Mode = %d\n"
-        "; 0 = the AMD driver's own compiler (default)\n"
-        "; 1 = machine code made by the ACO compiler (the one the Linux version uses). When it cannot be used, 0 is\n"
-        ";     used instead and dlssnr-amd.log says why\n",
-        aco ? 1 : 0);
-}
-
 void configure_network(const std::string& folder) {
     static std::once_flag once;
     std::call_once(once, [&] {
         const std::string ini = folder.empty() ? std::string("dlssnr-amd.ini") : folder + "\\dlssnr-amd.ini";
-        bool aco = false;
+        bool aco = true;   // no ACO Mode in the file: on (NetworkConfig::aco)
         if (FILE* file = std::fopen(ini.c_str(), "r")) {
             std::string name;
             char line[512];
@@ -1092,11 +1186,8 @@ bool PreprocessFile::poll(const std::string& path, PreprocessConfig& out) {
         tried_ = true;
         // No file: write one with the defaults, off, so there is something to edit.
         if (FILE* f = std::fopen(path.c_str(), "w")) {
-#if NR_INT4
-            write_int4mixed(f, true, "Ctrl+F11", false, true);
-#endif
+            write_network(f, NetworkConfig{});
             write_preprocess(f, PreprocessConfig{});
-            write_network(f, false);
             write_renodx(f, RenoDXConfig{});
             write_log(f, true, true);
             std::fclose(f);
@@ -1149,39 +1240,131 @@ Preprocess PreprocessSwitch::frame(const PreprocessConfig& file) {
     return p;
 }
 
-#if NR_INT4
-int Int4Switch::frame(const std::string& ini) {
-    if (off_) return 0;
+// The network switch's cue: one note for CC_SMALL_FP8, two going down for CC_SILVER_AARDWOLD, two going up for
+// CC_SILVER_AARDWOLD_INT4_MIXED (the int4 mixed cue as before).
+void play_network_cue(int n) {
+    if (n == nr::kSilverAardwoldInt4) play_cue(true);
+    else if (n == nr::kSilverAardwold) play_cue(false);
+    else play_note(880.0f);
+}
+
+// What runs instead of a network that cannot: the same model's other network first (int4 mixed -> CC_SILVER_AARDWOLD),
+// else the other model.
+int NetworkSwitch::fallback(int n) const {
+    static const int order[3][2] = {{nr::kSilverAardwold, nr::kSilverAardwoldInt4},
+                                    {nr::kSmallFp8, nr::kSilverAardwoldInt4},
+                                    {nr::kSilverAardwold, nr::kSmallFp8}};
+    for (int c : order[n]) if (available(c)) return c;
+    return n;
+}
+
+int NetworkSwitch::next_available(int from) const {
+    for (int k = 1; k <= nr::kNetworkChoices; ++k) {
+        const int c = (from + k) % nr::kNetworkChoices;
+        if (available(c)) return c;
+    }
+    return from;
+}
+
+void NetworkSwitch::unavailable(int n, const std::string& why) {
+    if (n < 0 || n >= nr::kNetworkChoices || reason_[n] == why) return;
+    reason_[n] = why;
+    if (!why.empty()) {
+        log("[nr] %s is not available in this run: %s", nr::network_codename(n), why.c_str());
+        if (want_ == n) {
+            want_ = fallback(n);
+            log("[nr] running %s instead", nr::network_codename(want_));
+        }
+    }
+}
+
+// Model in the file, everything else as it was (the line rewritten in place, or added to [Network]).
+void NetworkSwitch::write(int n) {
+    if (ini_.empty()) return;
+    std::string text;
+    if (FILE* f = std::fopen(ini_.c_str(), "rb")) {
+        char buf[4096]; size_t got;
+        while ((got = std::fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, got);
+        std::fclose(f);
+    }
+    const std::string value = nr::network_codename(n);
+    std::string out, section;
+    bool done = false;
+    size_t at = 0;
+    while (at < text.size()) {
+        size_t eol = text.find('\n', at);
+        std::string line = text.substr(at, eol == std::string::npos ? std::string::npos : eol - at + 1);
+        at = eol == std::string::npos ? text.size() : eol + 1;
+        std::string t = trim(line.substr(0, line.find_first_of(";#")));
+        if (!t.empty() && t.front() == '[') {
+            if (!done && lower(section) == "network") { out += "Model = " + value + "\n"; done = true; }
+            const auto e = t.find(']');
+            section = trim(t.substr(1, e == std::string::npos ? std::string::npos : e - 1));
+        } else if (!done && lower(section) == "network") {
+            const auto eq = t.find('=');
+            if (eq != std::string::npos && lower(trim(t.substr(0, eq))) == "model") {
+                out += "Model = " + value + (line.size() && line.back() == '\n' ? "\n" : "");
+                done = true;
+                continue;
+            }
+        }
+        out += line;
+    }
+    if (!done) out += (lower(section) == "network" ? "" : "\n[Network]\n") + std::string("Model = ") + value + "\n";
+    if (FILE* f = std::fopen(ini_.c_str(), "wb")) {
+        std::fwrite(out.data(), 1, out.size(), f);
+        std::fclose(f);
+    }
+    stamp_ = stamp_of(ini_);
+    file_.model = n;
+}
+
+void NetworkSwitch::set(int n) {
+    if (n < 0 || n >= nr::kNetworkChoices || !available(n)) return;
+    write(n);
+    if (want_ == n) return;
+    want_ = n;
+    log("[nr] network %s (menu)", nr::network_codename(n));
+    if (file_.sound) play_network_cue(n);
+}
+
+int NetworkSwitch::frame(const std::string& ini) {
+    ini_ = ini;
     const uint64_t now = GetTickCount64();
     // the ini is parsed again only when its write time changed (one attribute query a second, not a read)
     uint64_t stamp = 0;
     if (want_ < 0 || (now - checked_ms_ >= 1000 && (checked_ms_ = now, stamp = stamp_of(ini)) != stamp_)) {
         checked_ms_ = now;
         stamp_ = want_ < 0 ? stamp_of(ini) : stamp;
-        const nr::Int4Ini file = nr::ini_int4(ini);
-        keep_both_ = file.keep_both; sound_ = file.sound;
+        Config c;
+        bool legacy = false;
+        parse(ini, c, legacy);
+        const bool changed = c.network.model != file_.model;
+        file_ = c.network;
         if (want_ < 0) {
-            char e[16] = {};
-            const unsigned long n = GetEnvironmentVariableA("DLSSNR_INT4", e, sizeof e);
-            file_on_ = file.enabled != 0;   // no Enabled: on (nr_ini_int4.hpp)
-            want_ = (n && n < sizeof e) ? (std::string(e) == "1" ? 1 : 0) : (file_on_ ? 1 : 0);
-            log("[nr] int4 mixed %s at start%s", want_ ? "on" : "off",
-                file.hotkey.empty() ? "" : (", Hotkey " + file.hotkey + " switches it").c_str());
-            if (!want_ && file.hotkey.empty()) { off_ = true; return 0; }
-        } else if ((file.enabled != 0) != file_on_) {
-            // Enabled changed in the file while the game runs: switch as the hotkey does
-            file_on_ = file.enabled != 0;
-            if (want_ != (file_on_ ? 1 : 0)) {
-                want_ = file_on_ ? 1 : 0;
-                log("[nr] int4 mixed %s (dlssnr-amd.ini)", want_ ? "on" : "off");
-                if (sound_) play_cue(want_ != 0);
+            char e[48] = {};
+            const unsigned long n = GetEnvironmentVariableA("DLSSNR_MODEL", e, sizeof e);
+            const int env = n && n < sizeof e ? nr::network_choice(e) : -1;
+            want_ = env >= 0 ? env : file_.model;
+            if (!available(want_)) want_ = fallback(want_);
+            log("[nr] network %s at start (%s)%s", nr::network_codename(want_), env >= 0 ? "DLSSNR_MODEL" : "dlssnr-amd.ini",
+                file_.hotkey.empty() ? "" : (", Hotkey " + file_.hotkey + " cycles through the networks").c_str());
+        } else if (changed && file_.model != want_) {
+            // Model changed in the file while the game runs (NR Control, or edited): switch as the hotkey does
+            if (available(file_.model)) {
+                want_ = file_.model;
+                log("[nr] network %s (dlssnr-amd.ini)", nr::network_codename(want_));
+                if (file_.sound) play_network_cue(want_);
+            } else {
+                log("[nr] dlssnr-amd.ini asks for %s, not available in this run: %s", nr::network_codename(file_.model),
+                    reason_[file_.model].c_str());
             }
         }
-        if (file.hotkey != key_text_) {
-            key_text_ = file.hotkey;
+        if (file_.hotkey != key_text_) {
+            key_text_ = file_.hotkey;
             vk_ = 0;
             if (!key_text_.empty() && !parse_hotkey(key_text_, vk_, mods_)) {
-                log("[nr] int4 mixed: Hotkey \"%s\" not understood; no hotkey", key_text_.c_str());
+                log("[nr] network Hotkey \"%s\" not understood; no hotkey", key_text_.c_str());
                 vk_ = 0;
             }
         }
@@ -1191,31 +1374,18 @@ int Int4Switch::frame(const std::string& ini) {
                           ((mods_ & MOD_SHIFT) != 0) == key_down(VK_SHIFT) &&
                           ((mods_ & MOD_ALT) != 0) == key_down(VK_MENU);
         if (down && !down_ && focused()) {
-            want_ = want_ ? 0 : 1;
-            log("[nr] int4 mixed %s (hotkey)", want_ ? "on" : "off");
-            if (sound_) play_cue(want_ != 0);
+            const int n = next_available(want_);
+            if (n != want_) {
+                want_ = n;
+                write(n);
+                log("[nr] network %s (hotkey)", nr::network_codename(n));
+                if (file_.sound) play_network_cue(n);
+            }
         }
         down_ = down;
     }
     return want_;
 }
-#endif
-
-#if NR_INT4
-void Int4Switch::set(bool on) {
-    if (off_ || want_ < 0) return;
-    file_on_ = on;
-    if (want_ == (on ? 1 : 0)) return;
-    want_ = on ? 1 : 0;
-    log("[nr] int4 mixed %s (add-on menu)", on ? "on" : "off");
-}
-
-void Int4Switch::unavailable() {
-    if (off_) return;
-    want_ = 0; off_ = true;
-    log("[nr] int4 mixed is not available in this run (see above); the hotkey is off");
-}
-#endif
 
 double PreprocessSwitch::since_switch() const {
     return switched_ms_ ? double(GetTickCount64() - switched_ms_) / 1000.0 : 1e9;
@@ -1324,14 +1494,15 @@ void Config::save(const std::string& path) {
         "WhitePoint=%.3f\n"
         "; Frames without motion vectors (DLSS5_MV not bound): the network's noise seed changes every frame, as in\n"
         "; NVIDIA's original. With no previous frame to average the noise, a still picture shimmers slightly. false (default): a fixed seed\n"
-        "NoiseEveryFrame=%s\n",
-        history, white_point, flag(k.noise_every_frame));
+        "NoiseEveryFrame=%s\n"
+        "; Where the ReShade routes' motion vectors come from: vort (in this package) or lumenite (LumeniteFX Kernel by\n"
+        "; Afzaal, installed from its author's GitHub with install.bat (LumeniteFX: y); when it is missing or cannot be used,\n"
+        "; vort runs and dlssnr-amd.log says why)\n"
+        "MotionVectors=%s\n",
+        history, white_point, flag(k.noise_every_frame), motion_vectors == 1 ? "lumenite" : "vort");
     std::fputs("\n", f);
-#if NR_INT4
-    write_int4mixed(f, int4, int4_hotkey, int4_keep_both, int4_sound);
-#endif
+    write_network(f, network);
     write_preprocess(f, preprocess);
-    write_network(f, aco);
     write_renodx(f, renodx);
     write_log(f, log_enabled, log_clear);
     std::fclose(f);

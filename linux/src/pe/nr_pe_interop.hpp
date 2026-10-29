@@ -148,6 +148,14 @@ DeviceHandles device_handles(ID3D12Device* device);
 // The VkCommandBuffer the game's command list is recording into.
 VkCommandBuffer command_buffer(ID3D12GraphicsCommandList* list);
 
+// The same command buffer for raw Vulkan commands with the list's D3D12 state kept: vkd3d-proton's
+// BeginVkCommandBufferInterop (ID3D12DXVKInteropDevice1), which forgets what vkd3d bound in the command buffer
+// and re-emits the list's own pipeline, root signature, root arguments and descriptor heaps at its next draw or
+// dispatch. Null where this vkd3d-proton has no ID3D12DXVKInteropDevice1. end_interop_recording after the
+// commands.
+VkCommandBuffer begin_interop_recording(ID3D12Device* device, ID3D12GraphicsCommandList* list);
+void end_interop_recording(ID3D12Device* device, ID3D12GraphicsCommandList* list);
+
 // The VkImage behind a D3D12 texture, and the layout vkd3d believes it is in
 // for a given D3D12 resource state. The layout matters: we barrier from it and
 // must put it back, or the game's next use sees the wrong layout.
@@ -204,6 +212,10 @@ ResourceHandle d3d11_image(IUnknown* texture, IUnknown* device);
 // vkd3d_queue's mutex (libs/vkd3d/device_vkd3d_ext.c, read, not assumed) and
 // DXVK's LockSubmissionQueue does the same - so the lock is not optional and
 // there is no "our own private queue" to escape to.
+// The Vulkan entry points (nr_vk_load, once) and the VRAM ledger's wrap of our allocations, for a caller that has no
+// D3D object to hand over (the .asi on a Vulkan game).
+void vulkan_entry_points();
+
 struct QueueAccess {
     VkQueue queue{};
     uint32_t family{};

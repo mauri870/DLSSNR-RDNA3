@@ -1,6 +1,6 @@
 #version 460
 // Preserve caller alpha. Float output keeps NR RGB; 8-bit output uses the same
-// explicit rounding as the reference frame writer before the driver's format-converting blit.
+// round-half-up of the FP32 product as the network post, before format conversion.
 layout(local_size_x=8, local_size_y=8) in;
 layout(set=0,binding=0,rgba32f) uniform image2D result;
 layout(set=0,binding=1) uniform sampler2D original;
@@ -11,8 +11,7 @@ void main() {
     vec3 rgb=imageLoad(result,xy).rgb;
     if(pc.encode_u8!=0u) {
         precise vec3 scaled=clamp(rgb,vec3(0),vec3(1))*255.0;
-        precise vec3 shifted=scaled+0.5;
-        rgb=floor(shifted)/255.0;
+        rgb=(floor(scaled)+step(vec3(0.5),fract(scaled)))/255.0;
     }
     imageStore(result,xy,vec4(rgb,texelFetch(original,xy,0).a));
 }

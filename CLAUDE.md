@@ -27,9 +27,12 @@ Notes for contributors and coding assistants. README.md covers what the project 
   exception: it trades precision for speed by design and is installed only when asked for.
 - **RenoDX's shaders stay RenoDX's.** `linux/shaders/renodx/` is RenoDX's code under its MIT licence; changes
   there are speed changes that leave every output bit as it was, each listed in the README in that folder.
-- **Windows int4 mixed is ACO Mode only.** Its shaders are the Linux ones (`linux/build/build_network.py
-  rdna4 --int4`) and its machine code is in `windows/data/aco/int4/`, found by the SPIR-V's hash: a change
-  to the Linux int4 shaders needs new records there.
+- **Windows ACO Mode has a record for every network SPIR-V.** ACO Mode (the Windows default) runs the Linux
+  network shaders (`linux/build/build_network.py rdna4`, int4 mixed's with `--int4`) as machine code from
+  `windows/data/aco/records` and `windows/data/aco/int4/records`, found by the SPIR-V's hash. A new or changed
+  Linux network shader needs new records in both (a missing one turns ACO Mode off for the run), and a new
+  pipeline whose name has no native Windows shader needs a template alias in `shell-aliases.txt`.
+  Windows int4 mixed runs with ACO Mode only.
 - **No D3D device or swap chain inside the game's process** on Windows (NR Control): OptiScaler's hooks
   take them for the game's. `nr_present_probe.exe` finds DXGI's methods in a process of its own.
 - **Weight packing.** A new kernel that reads weights must be added to the host's weight packing

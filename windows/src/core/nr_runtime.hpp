@@ -2,12 +2,32 @@
 #include <utility>
 #include <vector>
 #include <vulkan/vulkan.h>
+#include "nr_native_plan.hpp"
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
 
 namespace nr {
+
+struct RuntimeCore;   // Runtime::share_for
+struct ImageHeapRef;  // Runtime::image_heap_wanted
+struct ActArenaRef;   // Runtime::act_arena
+uint64_t act_arena_bytes(const ActArenaRef&);
+const void* act_arena_id(const ActArenaRef&);
+// A plan's working extent and the tallest frame (model) height it runs.
+void plan_extent(const RuntimeCore& plan, uint32_t* work_w, uint32_t* work_h, uint32_t* source_h);
+// The working extent a frame of width x height runs at with `model` and Model Resolution `scale` (the native plan's
+// padding), and the tallest frame height with the same one at that width: a plan lowered there runs every height of
+// it (RuntimeConfig::share). Up to ~10 ms: not on a render thread.
+void working_extent(NetworkModel model, float scale, uint32_t width, uint32_t height, uint32_t* work_w, uint32_t* work_h);
+uint32_t plan_height(NetworkModel model, float scale, uint32_t width, uint32_t height);
+// The network memory a core runs in (Runtime::network_id of the runtimes built from it), and dropping its image heap
+// (the images of runtimes built inside frames; those in it keep their part until they go): a network kept by a core
+// alone - its weights and arenas, no runtime - holds no images.
+const void* core_network(const RuntimeCore& core);
+void release_image_heap(const RuntimeCore& core);
+std::shared_ptr<ActArenaRef> core_act_arena(const RuntimeCore& core);
 
 // One later pass's own model controls. Absent fields inherit pass 1's, except
 // the tone, which the original's own hosts default to 0 on every pass after the
@@ -118,6 +138,22 @@ struct HostDevice {
     // network only).
     bool buffer_device_address = false;
 };
+// [Network] Residency offload: a network held by a core alone (no runtime, no frame of it in flight) moves its weights
+// to RAM and releases its device memory (its weight buffer, its hold on the activation arena); reload_network brings
+// them back before a runtime is built from the core, into `act` when it has the room (else a new arena with `slack`).
+// The first recording then reloads the plan's tail and noise fields and zeroes the arena (retarget). Both submit (the
+// host's queue lock): not on a render thread. False when there is nothing to do or it failed (the log says why).
+bool offload_network(const HostDevice& host, const RuntimeCore& core);
+// offload_network's halves: the read-back (any thread; nothing of the network changes) and the release (on the thread
+// that records, once no frame of it is in flight).
+bool download_network_weights(const HostDevice& host, const RuntimeCore& core, std::vector<uint8_t>& out);
+void release_network(const RuntimeCore& core, std::vector<uint8_t>&& weights);
+// Whether a core's network runs a frame of width x height (its working extent, the frame no taller than it was built
+// for), as Runtime::share_for decides it.
+bool core_runs(const RuntimeCore& core, uint32_t width, uint32_t height, float scale, bool native_compose);
+bool reload_network(const HostDevice& host, const RuntimeCore& core, const std::shared_ptr<ActArenaRef>& act, double slack);
+bool network_offloaded(const RuntimeCore& core);
+uint64_t network_ram_bytes(const RuntimeCore& core);
 
 struct RuntimeConfig {
     std::string root;
@@ -142,6 +178,12 @@ struct RuntimeConfig {
     // the cost tracks scale^2 while the game's own resolution is untouched.
     // The "Model Resolution" of the NVIDIA-side mods.
     float model_scale = 1.0f;
+    // The network: the 310.8 model (dlssnr.bin) or the 310.9 small model
+    // (dlssnr-small.bin). Same shaders; the plan and the weights differ.
+    // -1 = as DLSSNR_MODEL / dlssnr-amd.ini [Network] Model say (small or original;
+    // neither: small), 0 = the original model, 1 = the small model. The small model
+    // needs an installed tree with dlssnr-small.bin; without it, the original model.
+    int network = -1;
 #if NR_INT4
     // The int4 mixed network: -1 = as DLSSNR_INT4 / dlssnr-amd.ini [Int4Mixed] Enabled say (start), 0 = the original
     // network, 1 = int4 mixed when installed and the device has VK_KHR_pipeline_binary ([Int4Mixed] Hotkey switches).
@@ -167,6 +209,12 @@ struct RuntimeConfig {
     // pass, so `colour` and `model_scale` have no effect. What a host that does
     // its own resolve afterwards (OptiScaler) must be given.
     bool native_compose = false;
+    // The game's motion vectors read with point sampling at the colour's coordinate, as NVIDIA's DLL binds them
+    // (MIN_MAG_MIP_POINT, the colour's own sampler; launch capture 2026-10-18). Bilinear blends two surfaces'
+    // vectors at every silhouette when the vectors are at a lower resolution than the colour (after-SR edge band
+    // 30.3 -> 43.9 dB vs NVIDIA with point). The NGX route sets it; the ReShade add-on's vectors (VORT, Lumenite)
+    // are our own input and keep bilinear.
+    bool motion_point = false;
     // Able to run Controls::preprocess. Costs the frame-format input copy and
     // the post block's direct store (the input has to be a float image the
     // preprocess can rewrite), whether or not a frame asks for it; off, the
@@ -176,6 +224,28 @@ struct RuntimeConfig {
     // (its linear-HDR encode, or linear_input's own): the preprocess undoes the
     // knee first, so its curve is the only one. False for an SDR frame.
     bool preprocess_unknee = false;
+    // The resize path: Runtime::share_for of a runtime at another source extent. Its network - lowered at the same
+    // working extent (the native plan's padding), its arenas - is taken over, and only this runtime's images and
+    // descriptor sets are made; null, or not matching (the log says so), builds one. Byte for byte the network a
+    // build at this extent makes.
+    std::shared_ptr<const RuntimeCore> share;
+    // The lowering only, for Runtime::plan: no device memory, no images, nothing to record with.
+    bool plan_only = false;
+    // Built inside a recording, on the thread that records (with `share`: a frame at a new size runs the same frame):
+    // nothing is submitted - the images' first layout transitions are recorded by the first recording - and anything
+    // that would have to submit throws (Model Resolution below 100%), for the caller to build in the background.
+    bool deferred = false;
+    // The network memory's room, by area against this extent's own need (>= 1): plans of bigger working extents run
+    // in it (Runtime::with_slot_of) up to that.
+    double capacity = 1.0;
+    // A whole build: another network's activation arena (Runtime::act_arena) to run in instead of allocating one, when
+    // it has the room. The arena holds one frame's values only; a runtime records a zero fill before it runs in an
+    // arena another one ran in last, so networks taking turns in it are exact, each turn costing a fill (the caller
+    // keeps networks that run every frame apart). The build does not touch a taken arena (it may be in use); like two
+    // runtimes of one network, its users record on one queue. `act_slack` (>= 1): the room a newly allocated one gets
+    // beyond this build's need, for other networks to fit.
+    std::shared_ptr<ActArenaRef> act_arena;
+    double act_slack = 1.0;
 };
 
 // SDR encoded RGB, source-sized and upright. Accepts RGBA32F and 8-bit RGBA/BGRA
@@ -337,6 +407,11 @@ struct EngineResult {
 // `folder`. See nr_input_check.hpp.
 void set_input_check(bool on, const std::string& folder, int pictures = 4);
 
+std::shared_ptr<ImageHeapRef> allocate_image_heap(const HostDevice& host, uint64_t region_bytes);
+// Whether a runtime built inside a frame from `core` at width x height takes its images from the heap of the memory
+// it runs in (else memory of its own).
+bool image_heap_fits(const RuntimeCore& core, uint32_t width, uint32_t height);
+
 class Runtime {
 public:
     // Caller enables the same device features/extensions as nrvk::Context::create.
@@ -402,6 +477,46 @@ public:
     // The extent the network actually runs at (RuntimeConfig::model_scale applied).
     uint32_t model_width() const;
     uint32_t model_height() const;
+    // The model this runtime runs (RuntimeConfig::network resolved).
+    NetworkModel network() const;
+    // What a runtime at width x height (the frame's extent, as RuntimeConfig::width/height) with this one's
+    // configuration otherwise can take over from this one (RuntimeConfig::share): null when its working extent
+    // differs, or the frame is taller than this one's network was built for.
+    std::shared_ptr<const RuntimeCore> share_for(uint32_t width, uint32_t height) const;
+    // The network this runtime runs on (its arenas): the same for runtimes built from one another's (share_for).
+    const void* network_id() const;
+    // Its activation arena (shared with other networks when built with RuntimeConfig::act_arena), and its identity.
+    std::shared_ptr<ActArenaRef> act_arena() const;
+    const void* act_id() const;
+    // Why it runs another model or network than RuntimeConfig asked for (the small model's file missing, int4 mixed
+    // without what it needs); empty when it runs what was asked.
+    const std::string& network_note() const;
+    // [Network] Motion Without Depth as this runtime read it at construction (true: the depth is not read).
+    bool motion_without_depth() const;
+    // A runtime built inside a recording (RuntimeConfig::deferred) whose images another one has taken over since:
+    // never recorded again; drop it.
+    bool stale() const;
+    // The image heap the runtimes built inside frames in this runtime's network memory take turns in: the region size
+    // still wanted (0: it has one big enough, or nothing to size it from). allocate_image_heap makes one (any thread:
+    // it is a long allocation), adopt_image_heap hands it over on the thread that records.
+    uint64_t image_heap_wanted() const;
+    void adopt_image_heap(const std::shared_ptr<ImageHeapRef>& heap);
+    // Built inside a frame without the heap: its images took memory of their own.
+    bool owns_image_memory() const;
+    // The resize path's option ([Network] Resize History = 1, off by default: NVIDIA starts a feature's history afresh
+    // at a new size): the history `feature` holds in `from` (a runtime at the size before), scaled bilinearly into the
+    // one this runtime's next recording of the feature reads, which then consumes it as its own - the noise counter
+    // goes on too. Recorded into `cmd` before that recording. False, nothing recorded: one model pass only, and
+    // `from` must hold a history for the feature.
+    bool carry_history(VkCommandBuffer cmd, const Runtime& from, uint64_t feature);
+    // A runtime built with RuntimeConfig::plan_only: its lowering, for another runtime's network memory
+    // (with_slot_of). Any runtime: its own lowering.
+    std::shared_ptr<const RuntimeCore> plan() const;
+    // `plan` running in this runtime's network memory (RuntimeConfig::share): null when the memory is too small for it,
+    // or its weights or build arguments differ. The memory is made ready for it in the recording (zeroed arena, the
+    // plan's records and noise field), whenever another plan used it last.
+    std::shared_ptr<const RuntimeCore> with_slot_of(const std::shared_ptr<const RuntimeCore>& plan) const;
+
 #if NR_INT4
     // Whether this runtime runs the int4 mixed network (asked for and everything it needs present).
     bool int4_mixed() const;
@@ -413,6 +528,9 @@ public:
     // Change the white point (RuntimeConfig::white_point) between frames. No-op
     // unless the runtime was built with linear_input.
     void set_white_point(float);
+    // Natural and Cinematic graded after the post block as NVIDIA's DLL does (true, the default), or not (false: the
+    // picture these styles had before the grade was ported). Per frame; nothing is rebuilt.
+    void set_style_grade(bool);
 
     // **What the pass costs on the GPU**, from a timestamp pair around the work
     // this runtime records - everything between the first barrier and the last,

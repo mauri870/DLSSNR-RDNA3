@@ -812,7 +812,9 @@ void ProcessJob(Job work) noexcept {
         const std::filesystem::path base = directory.empty() ? std::filesystem::path(stem) : directory / stem;
         CodedImage pre_image, post_image;
         bool pre_nonzero = false, post_nonzero = false, pre_unwritten = false, post_unwritten = false;
-        const bool read_ok = ReadbackToCoded(pair, pair.pre, &pre_image, &pre_nonzero, &pre_unwritten) &&
+        Pair pre_pair = pair;
+        if (pair.pre_format) { pre_pair.format = pair.pre_format; pre_pair.row_pitch = pair.pre_row_pitch; }
+        const bool read_ok = ReadbackToCoded(pre_pair, pair.pre, &pre_image, &pre_nonzero, &pre_unwritten) &&
                              ReadbackToCoded(pair, pair.post, &post_image, &post_nonzero, &post_unwritten);
         if (pair.release) pair.release(pair.owner);
         if (pre_unwritten || post_unwritten) {

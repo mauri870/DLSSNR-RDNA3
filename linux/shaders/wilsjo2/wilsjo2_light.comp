@@ -1,0 +1,18 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// [Preprocess] on a wilsjo2 layer (ours): the frame's light into u0 (RGBA32F), from the frame itself (t0) as the encode
+// (wilsjo2_encode.comp) reads it - Preprocess works on this, not on the proxy the encode makes. The proxy is no source
+// for it: its highlight curve divides by the peak channel (not invertible), it is stored in the frame's format (an
+// R11G11B10 frame: 6-bit mantissas), and a float frame the game does not flag HDR is passed through as light, not
+// encoded. Constants as the encode's (its white point, Passthrough); Padding[0]: 1 an SDR frame in display encoding
+// (its light is the sRGB decode), 0 a frame of light (passed through as it is, or over the white point when HDR).
+#include "wilsjo2_common.glsl"
+
+void main() {
+    const uvec2 p = gl_GlobalInvocationID.xy;
+    if (outside(p)) return;
+    const vec4 S = texelFetch(t0, ivec2(p), 0);
+    const vec3 F = max(S.rgb, vec3(0.0));   // as the encode keeps it
+    const vec3 L = cb.Passthrough != 0u ? (cb.Padding[0] != 0u ? srgb_decode(F) : F) : F / white_point();
+    imageStore(u0, ivec2(p), vec4(L, S.a));
+}

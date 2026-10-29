@@ -56,8 +56,10 @@ source "linux/build/arch/$gpu.sh"
 "$cxx" "${common[@]}" -c linux/src/core/nr_renodx.cpp -o "$out/nr_renodx.o"
 "$cxx" "${common[@]}" -c linux/src/pe/nr_pe_log.cpp -o "$out/log.o"
 "$cxx" "${common[@]}" -c linux/src/pe/nr_pe_interop.cpp -o "$out/interop.o"
+"$cxx" "${common[@]}" -c linux/src/pe/nr_vram_ledger.cpp -o "$out/vram_ledger.o"
 "$cxx" "${common[@]}" -I"$minhook/include" -c linux/src/pe/nr_pe_vkdevice.cpp -o "$out/vkdevice.o"
 "$cxx" "${common[@]}" -c linux/src/pe/nr_pe_session.cpp -o "$out/session.o"
+"$cxx" "${common[@]}" -c linux/src/core/nr_wilsjo2.cpp -o "$out/nr_wilsjo2.o"   # the session's wilsjo2 flow (ReShade layers)
 "$cxx" "${common[@]}" -c linux/src/pe/nr_pe_config.cpp -o "$out/config.o"
 "$cxx" "${common[@]}" -c linux/src/pe/nr_dlssnr_model.cpp -o "$out/model.o"
 "$cxx" "${common[@]}" -c linux/src/pe/nr_pe_renodx_route.cpp -o "$out/renodx_route.o"
@@ -80,13 +82,15 @@ ldflags=(-ld3d12 -ldxgi -lole32 -static -static-libgcc -static-libstdc++)
 # Vulkan is resolved at run time rather than imported, exactly as in build_package.sh: a static
 # import of vulkan-1.dll forces winevulkan up before the game's graphics stack, which has killed a
 # real game. This link is expected to fail; its failure is the input to the next step.
-shared_objs=("$out/model.o" "$out/session.o" "$out/config.o" "$out/interop.o" "$out/log.o" "$out/vkdevice.o"
-             "$out/nr_runtime.o" "$out/nr_native_plan.o" "$out/nr_renodx.o" "$out/renodx_route.o" "$out/control.o" "$out/screenshot.o" "$out"/mh_*.o)
+shared_objs=("$out/model.o" "$out/session.o" "$out/config.o" "$out/interop.o" "$out/vram_ledger.o" "$out/log.o" "$out/vkdevice.o"
+             "$out/nr_runtime.o" "$out/nr_native_plan.o" "$out/nr_renodx.o" "$out/nr_wilsjo2.o" "$out/renodx_route.o" "$out/control.o" "$out/screenshot.o" "$out"/mh_*.o)
 forwarder_objs=("$out/forwarder.o" "${shared_objs[@]}")
 core_objs=("$out/ngx_core.o" "$out/optifix.o" "${shared_objs[@]}")
 # Both links contribute undefined vk* names; the probe link takes every object either DLL uses so one
 # generated thunk file serves both.
-undefined=$({ "$cxx" -shared -o /dev/null "${forwarder_objs[@]}" "$out/ngx_core.o" "$out/optifix.o" "${ldflags[@]}" 2>&1 || true; } |
+extra_vk_objs=()
+[[ ${NR_ASI_VK_OBJECTS:-0} == 1 ]] && extra_vk_objs=("$out/menu.o" "$out/im_imgui_impl_vulkan.o")
+undefined=$({ "$cxx" -shared -o /dev/null "${extra_vk_objs[@]}" "${forwarder_objs[@]}" "$out/ngx_core.o" "$out/optifix.o" "${ldflags[@]}" 2>&1 || true; } |
     grep -o "undefined reference to \`_*vk[A-Za-z0-9_@]*'" | sed "s/.*\`//; s/'//" | sort -u)
 count=$(echo "$undefined" | grep -c . || true)
 plain() { echo "$1" | sed 's/^_//; s/@[0-9]*$//'; }
@@ -119,15 +123,51 @@ plain() { echo "$1" | sed 's/^_//; s/@[0-9]*$//'; }
     echo '#include <windows.h>'
     echo 'long nr_vk_unresolved(void) { return -3; }   // VK_ERROR_INITIALIZATION_FAILED'
     for sym in $undefined; do printf 'extern void* nr_vk_p_%s;\n' "$(plain "$sym")"; done
-    echo 'void nr_vk_load(void) {'
-    echo '    HMODULE m = GetModuleHandleW(L"vulkan-1.dll");'
-    echo '    if (!m) m = LoadLibraryW(L"vulkan-1.dll");'
-    echo '    if (!m) return;'
-    for sym in $undefined; do
-        base=$(plain "$sym")
-        printf '    { void* p = (void*)GetProcAddress(m, "%s"); if (p) nr_vk_p_%s = p; else OutputDebugStringA("nr_vk_load: no export %s"); }\n' "$base" "$base" "$base"
-    done
-    echo '}'
+    printf 'static const char* const nr_vk_names[] = {'
+    for sym in $undefined; do printf '"%s", ' "$(plain "$sym")"; done
+    echo '};'
+    printf 'static void** const nr_vk_slots[] = {'
+    for sym in $undefined; do printf '&nr_vk_p_%s, ' "$(plain "$sym")"; done
+    echo '};'
+    cat <<'C'
+#define NR_VK_COUNT (sizeof nr_vk_names / sizeof nr_vk_names[0])
+static HMODULE nr_vk_from;
+const char* nr_vk_source = "none";      /* the DLL the entry points came from, for the log */
+int nr_vk_missing;                       /* entry points that DLL does not export (they return an error, or do nothing) */
+const char* nr_vk_first_missing = "";
+static int nr_vk_complete(HMODULE m) {
+    for (unsigned i = 0; i < NR_VK_COUNT; ++i) if (!GetProcAddress(m, nr_vk_names[i])) return 0;
+    return 1;
+}
+/* Safe to call again: it changes nothing unless the DLL to take the entry points from has changed.
+   vkd3d-proton and DXVK call Wine's winevulkan.dll directly, never vulkan-1.dll, so the instance, device and command
+   buffers they hand over are winevulkan's own objects. Proton's vulkan-1.dll only forwards to winevulkan.dll, which
+   makes the two the same; with a native Khronos vulkan-1.dll (Proton's nativevulkanloader option, which Steam sets
+   for some games) the loader takes those objects for its own and the first call crashes. So winevulkan.dll when it
+   is in the process and exports every entry point; the winevulkan.dll forwarder of this package's Vulkan routes
+   exports only a few and leaves those routes on vulkan-1.dll, the loader the game's device was made through. */
+void nr_vk_load(void) {
+    HMODULE m = GetModuleHandleW(L"winevulkan.dll");
+    int wine = m && nr_vk_complete(m);
+    if (!wine) {
+        m = GetModuleHandleW(L"vulkan-1.dll");
+        if (!m) m = LoadLibraryW(L"vulkan-1.dll");
+    }
+    if (!m || m == nr_vk_from) return;
+    nr_vk_from = m;
+    nr_vk_source = wine ? "winevulkan.dll" : "vulkan-1.dll";
+    nr_vk_missing = 0;
+    nr_vk_first_missing = "";
+    for (unsigned i = 0; i < NR_VK_COUNT; ++i) {
+        void* p = (void*)GetProcAddress(m, nr_vk_names[i]);
+        if (!p) {
+            p = (void*)nr_vk_unresolved;
+            if (!nr_vk_missing++) nr_vk_first_missing = nr_vk_names[i];
+        }
+        *nr_vk_slots[i] = p;
+    }
+}
+C
 } > "$out/vulkan_lazy.c"
 
 "$cc" -c "$out/vulkan_lazy.s" -o "$out/vulkan_lazy_s.o"

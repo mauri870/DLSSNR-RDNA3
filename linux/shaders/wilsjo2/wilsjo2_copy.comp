@@ -1,0 +1,40 @@
+#version 460
+// Modes 12 / 13 (ours): an exact copy of a region of an image into u0, for the .asi's Vulkan route where a transfer copy
+// (vkCmdCopyImage) cannot serve - a game image made without transfer use, or a view of it at another mip level or
+// array layer or with its channels reordered (t0 is then the game's own view, read as the game's shaders read it).
+// COPY_LOAD (mode 13): the source is read as a storage image (u1, without a format), for an image with storage use
+// only. Each texel is stored as it was read: the destination holds the source's format or a wider one.
+// Source / Target: the regions' origins (x | y << 16); Width x Height texels.
+#extension GL_EXT_samplerless_texture_functions : require
+#ifdef COPY_LOAD
+#extension GL_EXT_shader_image_load_formatted : require
+#endif
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D t0;
+layout(set = 0, binding = 4) uniform writeonly image2D u0;
+#ifdef COPY_LOAD
+layout(set = 0, binding = 5) uniform readonly image2D u1;
+#endif
+
+layout(push_constant, std430) uniform Constants {
+    uint Mode;                  //  0
+    float WhitePoint;           //  4
+    uint Width;                 //  8
+    uint Height;                // 12
+    layout(offset = 44) uint Source;
+    uint Target;                // 48
+} cb;
+
+void main() {
+    const uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= cb.Width || p.y >= cb.Height) return;
+    const ivec2 s = ivec2(p + uvec2(cb.Source & 0xffffu, cb.Source >> 16));
+    const ivec2 d = ivec2(p + uvec2(cb.Target & 0xffffu, cb.Target >> 16));
+#ifdef COPY_LOAD
+    const vec4 v = imageLoad(u1, s);
+#else
+    const vec4 v = texelFetch(t0, s, 0);
+#endif
+    imageStore(u0, d, v);
+}

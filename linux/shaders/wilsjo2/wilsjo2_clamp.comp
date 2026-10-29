@@ -1,0 +1,12 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Mode 8, the clamp between passes: the previous pass's answer (t0) into the next pass's input (u0), its
+// colour made finite (a non-finite component 0.5) and kept in [0, 1], its alpha as it is; at the model's extent.
+#include "wilsjo2_common.glsl"
+
+void main() {
+    const uvec2 p = gl_GlobalInvocationID.xy;
+    if (outside(p)) return;
+    const vec4 answer = texelFetch(t0, ivec2(p), 0);
+    imageStore(u0, ivec2(p), vec4(saturate3(sanitize3(answer.rgb, vec3(0.5))), answer.a));
+}

@@ -45,6 +45,8 @@ struct Pair {
     uint32_t width = 0, height = 0;
     uint32_t row_pitch = 0;          // bytes a row in both images
     VkFormat format = VK_FORMAT_UNDEFINED;
+    VkFormat pre_format = VK_FORMAT_UNDEFINED; // optional differing model-input format
+    uint32_t pre_row_pitch = 0;
     uint8_t hdr_mode = 0;            // 0 SDR (display codes), 1 linear HDR (scRGB), 2 PQ HDR
     float linear_unit_nits = 80.0f;  // hdr_mode 1: nits of 1.0
     const void* pre = nullptr;

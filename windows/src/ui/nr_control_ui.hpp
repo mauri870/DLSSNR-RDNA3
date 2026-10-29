@@ -8,6 +8,7 @@
 // combo at once. Returns whether anything was committed this frame.
 #include "imgui.h"
 #include "nr_renodx_keys.hpp"
+#include "pe/nr_engine_panel.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -168,6 +169,28 @@ bool draw_renodx(A& a, Route route, bool running, const std::function<void()>& s
     if (!running)
         ImGui::TextDisabled("RenoDX style is off in this run: check it above and restart the game.");
     return changed;
+}
+
+// The engine-data panel: what the colours mean, then one line (nr::pe::panel::split).
+inline void engine_legend() {
+    float c[4];
+    const char* const parts[][2] = {{"+", "from the game"}, {"~", "filled in (not from the game)"}, {"-", "missing (nothing fills it in)"}};
+    for (int i = 0; i < 3; ++i) {
+        nr::pe::panel::state_colour(parts[i][0][0], c);
+        if (i) { ImGui::SameLine(); ImGui::TextDisabled("/"); ImGui::SameLine(); }
+        ImGui::TextColored(ImVec4(c[0], c[1], c[2], c[3]), "%s", parts[i][1]);
+    }
+}
+inline void engine_line(const std::string& l) {
+    const nr::pe::panel::Drawn d = nr::pe::panel::split(l);
+    const ImVec4 c(d.rgba[0], d.rgba[1], d.rgba[2], d.rgba[3]);
+    if (d.whole) ImGui::PushStyleColor(ImGuiCol_Text, c);
+    if (!d.label.empty()) {
+        ImGui::TextColored(c, "%s", d.label.c_str());
+        ImGui::SameLine(0.f, 0.f);
+    }
+    ImGui::TextWrapped("%s", d.rest.c_str());
+    if (d.whole) ImGui::PopStyleColor();
 }
 
 }  // namespace nr::control_ui

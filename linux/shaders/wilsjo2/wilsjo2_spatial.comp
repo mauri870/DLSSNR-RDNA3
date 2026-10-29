@@ -1,0 +1,133 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Peripheral compression: the frame packed for the network with a centre band at full density and the
+// periphery compressed, and the network's pair unpacked back. Modes (the spatial constant block of):
+//   100  t0 = the native proxy -> u0 = the packed proxy (fp16), at the model extent; a compressed pixel averages five
+//        bilinear taps across its footprint
+//   101  t1 = the game's depth, t2 = its motion vectors -> u0 = the packed depth (R32F), u1 = the packed motion (RG32F),
+//        at the model extent: depth at the pixel's native position, motion as the packed difference
+//   102  t0 = the packed proxy, t1 = the network's answer -> u0 / u1 the two at the ordinary extent (fp16)
+// Every operation in 32-bit float; samples bilinear and clamped.
+// Built twice, as the original's two shaders: wilsjo2_spatial.spv (100, 102) and, with WILSJO2_GUIDES,
+// wilsjo2_spatial_guides.spv (101). One shader for all three rounds differently: the compiler fuses a product into
+// the following sum only where the product has one use, and the guides use the unpacked offset more than once.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D t0;
+layout(set = 0, binding = 1) uniform sampler2D t1;
+layout(set = 0, binding = 2) uniform sampler2D t2;
+layout(set = 0, binding = 3) uniform sampler2D t3;
+layout(set = 0, binding = 4) uniform writeonly image2D u0;
+layout(set = 0, binding = 5) uniform writeonly image2D u1;
+
+layout(push_constant, std430) uniform Spatial {
+    uint Mode;            //   0
+    float Unused;         //   4
+    uint Width, Height;   //   8: the dispatch extent
+    vec4 NativeSize;      //  16: W, H, model W, model H
+    vec4 Fracs;           //  32: not read
+    vec4 Minimums;        //  48: not read
+    uvec4 Options;        //  64: not read
+    vec4 BandCentre;      //  80: band centre x, y; work centre x, y
+    vec4 SideNeg;         //  96: half span x, y; centre fraction x, y (negative side)
+    vec4 SidePos;         // 112: the same, positive side
+    vec4 SideWorkNeg;     // 128: work fraction x, y; compression x, y (negative side)
+    vec4 SideWorkPos;     // 144: the same, positive side
+    vec4 EdgeSlope;       // 160: negative x, y; positive x, y
+    vec4 WorkScale;       // 176: scale x, y
+    vec4 DepthRect;       // 192
+    vec4 MotionRect;      // 208
+    vec2 MotionScale;     // 224
+} sp;
+
+float saturate1(float x) { return clamp(x, 0.0, 1.0); }
+
+float pack_radius(float r, float c, float w, float k, float e) {
+    r = abs(r);
+    if (w >= 1.0 || c >= 1.0 || r <= c) return r;
+    if (r > 1.0) return w + (r - 1.0) * e;
+    const float t = (r - c) / (1.0 - c);
+    return c + (w - c) * t / (k + (1.0 - k) * t);
+}
+float unpack_radius(float r, float c, float w, float k, float e) {
+    r = abs(r);
+    if (w >= 1.0 || c >= 1.0 || r <= c) return r;
+    if (r > w) return 1.0 + (r - w) / e;
+    const float y = (r - c) / (w - c);
+    const float t = k * y / (1.0 - (1.0 - k) * y);
+    return c + (1.0 - c) * t;
+}
+// One axis (a = 0 x, 1 y), in the operation order the original's compiled shader runs (fast maths there folds the
+// centres out of every difference, divides by 0.3 as a multiply by its reciprocal, and scales as (span * scale) *
+// radius): the offsets from the band / work centre, which the differences use without the centre added.
+float pack_off(float d, int a) {   // d = x - band centre
+    const bool pos = d >= 0.0;
+    const float span = pos ? sp.SidePos[a] : sp.SideNeg[a];
+    const float c = pos ? sp.SidePos[2 + a] : sp.SideNeg[2 + a];
+    const float w = pos ? sp.SideWorkPos[a] : sp.SideWorkNeg[a];
+    const float k = pos ? sp.SideWorkPos[2 + a] : sp.SideWorkNeg[2 + a];
+    const float e = pos ? sp.EdgeSlope[2 + a] : sp.EdgeSlope[a];   // a fixed index each (a per-pixel one is read once a wave)
+    const float radius = pack_radius(abs(d) / span, c, w, k, e);
+    return (((pos ? 1.0 : -1.0) * sp.WorkScale[a]) * span) * radius;
+}
+float unpack_off(float d, int a) {   // d = u - work centre
+    const bool pos = d >= 0.0;
+    const float span = pos ? sp.SidePos[a] : sp.SideNeg[a];
+    const float c = pos ? sp.SidePos[2 + a] : sp.SideNeg[2 + a];
+    const float w = pos ? sp.SideWorkPos[a] : sp.SideWorkNeg[a];
+    const float k = pos ? sp.SideWorkPos[2 + a] : sp.SideWorkNeg[2 + a];
+    const float e = pos ? sp.EdgeSlope[2 + a] : sp.EdgeSlope[a];   // a fixed index each (a per-pixel one is read once a wave)
+    const float radius = unpack_radius(abs(d) / (sp.WorkScale[a] * span), c, w, k, e);
+    return (span * (pos ? 1.0 : -1.0)) * radius;
+}
+vec2 unpack_offset(vec2 u) { return vec2(unpack_off(u.x - sp.BandCentre.z, 0), unpack_off(u.y - sp.BandCentre.w, 1)); }
+vec2 pack_offset(vec2 d) { return vec2(pack_off(d.x, 0), pack_off(d.y, 1)); }
+
+void main() {
+    const uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= sp.Width || p.y >= sp.Height) return;
+    const vec2 pixel = vec2(float(p.x) + 0.5, float(p.y) + 0.5);
+    const vec2 native = sp.NativeSize.xy;
+#ifdef WILSJO2_GUIDES
+    if (sp.Mode != 101u) return;
+    const vec2 off = unpack_offset(pixel);   // n - band centre
+    const vec2 nuv = (off + sp.BandCentre.xy) / native;
+    const ivec2 dp = clamp(ivec2(sp.DepthRect.zw * nuv + sp.DepthRect.xy), ivec2(sp.DepthRect.xy),
+                           ivec2(sp.DepthRect.zw + sp.DepthRect.xy) - 1);
+    const ivec2 mp = clamp(ivec2(sp.MotionRect.zw * nuv + sp.MotionRect.xy), ivec2(sp.MotionRect.xy),
+                           ivec2(sp.MotionRect.zw + sp.MotionRect.xy) - 1);
+    const float depth = texelFetch(t1, dp, 0).x;
+    const vec2 mv = texelFetch(t2, mp, 0).xy * sp.MotionScale;
+    imageStore(u0, ivec2(p), vec4(depth));
+    const vec2 packed = pack_offset(off + mv) - pack_offset(off);
+    imageStore(u1, ivec2(p), vec4(packed, packed.x, packed.x));
+#else
+    if (sp.Mode == 100u) {
+        const vec2 n = unpack_offset(pixel) + sp.BandCentre.xy;
+        const vec2 nuv = n / native;
+        // the footprint from the two neighbours' offsets (their centres cancel)
+        const vec2 fp = max(abs(unpack_offset(pixel + 0.5) - unpack_offset(pixel - 0.5)), vec2(1.0));
+        const float spread = 0.375 * saturate1((max(fp.x, fp.y) - 1.0) * 3.33333325);
+        vec4 c;
+        if (spread > 0.0) {
+            const vec2 d = spread * fp;   // in native pixels; the taps at (n -+ d) / (W, H)
+            const vec2 lo = (n - d) / native, hi = (d + n) / native;
+            c = textureLod(t0, nuv, 0.0) + textureLod(t0, lo, 0.0);
+            c = c + textureLod(t0, vec2(hi.x, lo.y), 0.0);
+            c = c + textureLod(t0, vec2(lo.x, hi.y), 0.0);
+            c = c + textureLod(t0, hi, 0.0);
+            c = c * 0.2;
+        } else {
+            c = textureLod(t0, nuv, 0.0);
+        }
+        imageStore(u0, ivec2(p), c);
+    } else if (sp.Mode == 102u) {
+        const vec2 n = (native * pixel) / vec2(float(sp.Width), float(sp.Height));
+        const vec2 puv = (vec2(pack_off(n.x - sp.BandCentre.x, 0), pack_off(n.y - sp.BandCentre.y, 1)) + sp.BandCentre.zw) /
+                         sp.NativeSize.zw;
+        imageStore(u0, ivec2(p), textureLod(t0, puv, 0.0));
+        imageStore(u1, ivec2(p), textureLod(t1, puv, 0.0));
+    }
+#endif
+}

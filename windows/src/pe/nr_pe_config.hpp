@@ -1,6 +1,7 @@
 #pragma once
 #include "nr_runtime.hpp"
 #include "nr_renodx.hpp"
+#include "nr_ini_network.hpp"
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -31,10 +32,26 @@ struct PreprocessConfig {
 bool parse_preprocess_key(PreprocessConfig& p, const std::string& key, const std::string& value);
 // The section, with its comments, as the file holds it.
 void write_preprocess(FILE* f, const PreprocessConfig& p);
-#if NR_INT4
-// [Int4Mixed], with its comments.
-void write_int4mixed(FILE* f, bool enabled, const std::string& hotkey, bool keep_both, bool sound);
-#endif
+// [Network], with its comments: which network runs (nr_ini_network.hpp NetworkChoice, by the DLL's codenames), the
+// hotkey that cycles through them, the switch's cue, how networks stay in memory (Residency: 0 auto, 1 resident,
+// 2 offload to RAM, 3 minimal), where the pre block reads the motion vectors, the history at a new frame size, the
+// Style grade, the OSD and which compiler made the network's machine code (ACO Mode).
+struct NetworkConfig {
+    int model = nr::kSmallFp8;
+    std::string hotkey = "Ctrl+F11";
+    bool sound = true;
+    int residency = 0;
+    bool motion_without_depth = true;
+    bool resize_history = false;
+    int osd = 1;   // OSD: 0 off, 1 after a switch, 2 always
+    bool style_grade = true;   // Style Grade: Natural / Cinematic graded as NVIDIA's DLL (false: the older picture)
+    // ACO Mode: the network's machine code made by ACO (nr_pipeline_binary.hpp; false: the driver's compiler), read once
+    // per process by configure_network
+    bool aco = true;
+};
+void write_network(FILE* f, const NetworkConfig& n);
+const char* residency_name(int r);   // auto, resident, offload, minimal
+const char* osd_name(int o);         // off, switch, always
 // [RenoDX] in dlssnr-amd.ini, every route: the RenoDX-style processing around the network (nr_renodx.hpp).
 // Off by default. The keys other than Enabled are RenoDX's own, with its defaults and ranges (a value
 // outside its range falls back to the default, as RenoDX does).
@@ -85,9 +102,6 @@ class RenoDXFile {
 };
 // [Log], with its comments (read by nr_pe_log.cpp; every route's file carries it).
 void write_log(FILE* f, bool enabled, bool clear);
-// [Network], with its comments: ACO Mode, the network's machine code (nr_pipeline_binary.hpp). Read once per
-// process by configure_network; every route's file carries it.
-void write_network(FILE* f, bool aco);
 // [Network] ACO Mode of dlssnr-amd.ini in `folder`, handed to nr::binary before the first device is made: on
 // (and the bundle dlssnr-amd/aco present) the network runs ACO's machine code. Logs what it decided.
 void configure_network(const std::string& folder);
@@ -123,35 +137,36 @@ class PreprocessSwitch {
     Preprocess last_{};
 };
 
-#if NR_INT4
-// [Int4Mixed] in game, every route: which network the next build should be. Starts from DLSSNR_INT4 when set, else
-// from the file's Enabled; the Hotkey flips it for this run (never written back), and so does a change of Enabled in
-// the file (its write time is checked about once a second, the file re-read when it changed: Enabled, Hotkey,
-// KeepBoth). With Enabled = 0 and no Hotkey at start, this switch stays disabled for the run.
-class Int4Switch {
+// [Network] Model in game, every route: which network the next build should be (nr::NetworkChoice). Starts from
+// DLSSNR_MODEL when set, else the file's Model; the Hotkey cycles through the networks available in this run and
+// writes the choice back to the file, as a host's UI does (set); a change of Model in the file switches too (its
+// write time is checked about once a second). A network that cannot run in this run is skipped, with the reason
+// a UI shows beside it (unavailable).
+class NetworkSwitch {
   public:
-    // 0 the default network, 1 int4 mixed. `ini`: the game's dlssnr-amd.ini.
+    // The network wanted now. `ini`: the game's dlssnr-amd.ini.
     int frame(const std::string& ini);
-    // KeepBoth: keep the other network resident after a switch (else it is freed once the new one is in).
-    bool keep_both() const { return keep_both_; }
-    // The int4 mixed network could not be built in this run (the runtime logged why): the default network from now on, no hotkey.
-    void unavailable();
-    // From a host's UI: as the hotkey, and the caller writes Enabled = on to the file (so re-reading it is no switch).
-    void set(bool on);
-    bool is_off() const { return off_; }
+    // From a host's UI (or the hotkey): switch to `n`, and write Model to the file.
+    void set(int n);
+    // `n` cannot run in this run, and why (in a UI's words); an empty reason makes it available again.
+    void unavailable(int n, const std::string& why);
+    const std::string& reason(int n) const { return reason_[n]; }
+    bool available(int n) const { return reason_[n].empty(); }
+    const NetworkConfig& file() const { return file_; }   // [Network] as last read
   private:
+    void write(int n);
+    int next_available(int from) const;
+    int fallback(int n) const;
+    std::string ini_;
     int want_ = -1;
-    bool keep_both_ = false, sound_ = true;
+    NetworkConfig file_{};
+    std::string reason_[nr::kNetworkChoices];
     std::string key_text_;
     int vk_ = 0, mods_ = 0;
     bool down_ = false;
-    bool file_on_ = true;   // the file's Enabled as last read
     uint64_t checked_ms_ = 0, stamp_ = 0;
-    // Enabled = 0 and no Hotkey at start: stop polling the file and keys for this run.
-    bool off_ = false;
 };
 
-#endif
 // The ReShade add-on's settings, dlssnr-amd.ini next to it. Section [DlssNr]
 // with OptiScaler DLSS-NR's key names (ranges as the file's comments say), plus
 // ClassicScaler, History and WhitePoint, which are this project's.
@@ -162,17 +177,14 @@ struct Config {
     float model_scale = 1.0f;     // WorkingScale, 0.25..1
     float history = 1.0f;         // previous-frame blend in the post block, 0..1
     float white_point = 1.0f;     // linear-light input only
-#if NR_INT4
-    bool int4 = true;             // [Int4Mixed] Enabled: the int4 mixed network at start (no Enabled: on, nr_ini_int4.hpp)
-    std::string int4_hotkey = "Ctrl+F11";   // [Int4Mixed] Hotkey: switch int4 mixed / the default network in game; empty: none
-    bool int4_keep_both = false;            // [Int4Mixed] KeepBoth
-    bool int4_sound = true;                 // [Int4Mixed] Sound
-#endif
+    // The ReShade routes' motion-vector source: 0 VORT (shipped), 1 LumeniteFX Kernel (install.bat (LumeniteFX: y) installs it
+    // from its author's GitHub; it is not in the package). The add-on applies it to ReShade (nr_reshade_addon.cpp).
+    int motion_vectors = 0;
+    NetworkConfig network{};                 // [Network]
     PreprocessConfig preprocess{};   // [Preprocess]; controls.preprocess is the frame's, see PreprocessSwitch
     RenoDXConfig renodx{};           // [RenoDX]
     bool log_enabled = true;         // [Log] Enabled, read by the log itself at start (nr_pe_log.cpp)
     bool log_clear = true;           // [Log] ClearOnStart
-    bool aco = false;                // [Network] ACO Mode, read by configure_network at start (kept on save)
 
     int pass_limit() const { return unlock_passes ? kMaxPasses : 2; }
     // Fill controls.per_pass from `pass`; call after any change.

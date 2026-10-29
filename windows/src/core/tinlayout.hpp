@@ -200,6 +200,14 @@ inline std::vector<uint8_t> view_from_canonical_e4m3(const uint8_t* src, size_t 
 inline std::vector<uint8_t> tile_blocked(const uint8_t* src, size_t rows, size_t K) {
     std::vector<uint8_t> out(rows * K, 0);
     const size_t ktiles = K / 16;
+    // Whole 16-byte rows of a fragment at a time: the same bytes as the loop below (which a K that is not a
+    // multiple of 16 still takes), at memory speed - a network build packs ~115 MB this way, twice.
+    if (K % 16 == 0) {
+        for (size_t r = 0; r < rows; ++r)
+            for (size_t kt = 0; kt < ktiles; ++kt)
+                std::memcpy(&out[((r / 16) * ktiles + kt) * 256 + (r % 16) * 16], src + r * K + kt * 16, 16);
+        return out;
+    }
     for (size_t r = 0; r < rows; ++r)
         for (size_t k = 0; k < K; ++k)
             out[((r / 16) * ktiles + k / 16) * 256 + (r % 16) * 16 + (k % 16)] = src[r * K + k];

@@ -1,11 +1,10 @@
-// run_frame <root> <in.rgba8> <width> <height> <out.rgba8> [timed passes [model scale]]
+// run_frame <root> <in.rgba8> <width> <height> <out.rgba8> [timed passes]
 //
 // One network pass through nr::Runtime on the first discrete GPU, the way a game calls it: an
 // 8-bit RGBA frame in, the defaults of nr::Controls, an 8-bit frame out. <root> holds
 // dlssnr-amd/{shaders,dlssnr.bin} (the installed layout). The saved output is the second pass,
 // on a re-uploaded input, so the cold first pass (pipeline compilation) is never compared.
-// With timed passes, prints the mean wall time of a submitted pass over them. The model scale
-// (default 1) is RuntimeConfig::model_scale: the network runs at that fraction of the frame.
+// With timed passes, prints the mean wall time of a submitted pass over them.
 // RUN_FRAME_FORMAT=fp16 hands the runtime the frame as R16G16B16A16_SFLOAT with sampled and storage
 // usage, the way an engine does: the network then reads the caller's image in place and writes its answer
 // straight into it (the OptiScaler route's path), which the 8-bit default never takes. The saved output is
@@ -49,7 +48,6 @@ int main(int argc, char** argv) try {
     if (argc < 6) { std::fprintf(stderr, "usage: run_frame <root> <in.rgba8> <w> <h> <out.rgba8> [timed passes]\n"); return 2; }
     const uint32_t width = uint32_t(atoi(argv[3])), height = uint32_t(atoi(argv[4]));
     const int timed = argc > 6 ? atoi(argv[6]) : 0;
-    const float scale = argc > 7 ? float(atof(argv[7])) : 1.0f;
     std::ifstream file(argv[2], std::ios::binary);
     const std::vector<uint8_t> input((std::istreambuf_iterator<char>(file)), {});
     if (input.size() != size_t(width) * height * 4) { std::fprintf(stderr, "input is not %ux%u RGBA8\n", width, height); return 2; }
@@ -76,7 +74,6 @@ int main(int argc, char** argv) try {
     nr::RuntimeConfig config;
     config.root = argv[1]; config.width = width; config.height = height;
     config.colour_format = format;
-    config.model_scale = scale;
     nr::TemporalConfig temporal;
     temporal.enable = engine;
     temporal.shaders = std::string(argv[1]) + "/dlssnr-amd/shaders/temporal";

@@ -2055,7 +2055,7 @@ layout(push_constant) uniform Push {
     uint ups_weight_off;
 #endif
 #ifdef NR_FUSED_IMAGE_OUTPUT
-    uint image_w_off;       // NR_POST_ALPHA: bit 31 restore alpha, bit 30 8-bit rounding
+    uint image_w_off;       // NR_POST_ALPHA: bit 31 restore alpha, bit 30 8-bit rounding; NR_STYLE_GRADE: bits 28-29 the Style
     float image_intensity;
 #endif
 #ifdef NR_FUSED_IMAGE_INPUT
@@ -2645,16 +2645,26 @@ float nr_fast_exp(float x) {
 // (native compose: the answer is written once, not written, read and written
 // again). Flags in image_w_off's top bits, set by the runtime: bit 31 takes the
 // source's alpha instead of 1, bit 30 applies the alpha pass's 8-bit rounding.
+// NR_STYLE_GRADE (the *_grade pipelines, used for Natural and Cinematic only): bits 28-29 carry the Style whose
+// grade the DLL applies after the post block (nr_style_grade.glsl). Standard keeps the pipeline without it.
 #ifndef NR_POST_ALPHA
 #define NR_POST_ALPHA 0
 #endif
-#if NR_POST_ALPHA
+#ifndef NR_STYLE_GRADE
+#define NR_STYLE_GRADE 0
+#endif
+#if NR_STYLE_GRADE
+#define NR_IMG_WOFF (pc.image_w_off & 0x0FFFFFFFu)
+#elif NR_POST_ALPHA
 #define NR_IMG_WOFF (pc.image_w_off & 0x3FFFFFFFu)
 #else
 #define NR_IMG_WOFF pc.image_w_off
 #endif
 #ifdef NR_FUSED_IMAGE_INPUT
 #include "image_input.glsl"
+#endif
+#if NR_STYLE_GRADE
+#include "nr_style_grade.glsl"
 #endif
 
 #ifndef NR_BIAS_SEED
@@ -3561,6 +3571,14 @@ void main() {
         const float amp=clamp(pow(max(ratio,1e-6),pc.image_intensity),1.0/guard,guard);
         rgb=clamp(rgb*(amp/max(ratio,1e-6)),vec3(0.0),vec3(1.0));
     }
+#if NR_STYLE_GRADE
+    // Natural and Cinematic: the DLL grades the composed answer and blends it in from the source at the
+    // Intensity again (cg2r_post_process_kernel, include/nr_style_grade.glsl). Standard does not run it.
+    {
+        const uint nr_style=(pc.image_w_off>>28u)&3u;
+        if(nr_style!=0u) rgb=nr_style_grade(nr_style,base,rgb,pc.image_intensity);
+    }
+#endif
 #if NR_DIAG_POSTSTORE == 3
     if (rgb.x == pc.image_intensity * 1234.5)   // diagnostic: never true at runtime
 #endif

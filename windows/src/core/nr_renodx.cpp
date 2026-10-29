@@ -456,6 +456,11 @@ struct Stage::Impl {
     Image work_p, prep_keep;
     VkBuffer prep_state{};
     VkDeviceMemory prep_state_memory{};
+    // The engine-data panel's divisor: the scale texel copied here every 32nd recording (host-visible, read by facts()
+    // a few frames later; a torn or stale value is only a display).
+    VkBuffer probe{};
+    VkDeviceMemory probe_memory{};
+    float* probe_mapped{};
     VkBuffer unread{};             // a buffer for the look programs' trace slot, which the stage never reads
     VkDeviceMemory unread_memory{};
     bool prep_state_fresh = false, prep_was_on = false;
@@ -485,6 +490,7 @@ struct Stage::Impl {
     Frame6 f6;
     uint32_t feed = kFeedV1;       // this frame's
     uint32_t logged_feed = ~0u;
+    Stage::Facts facts;            // the last frame's, for facts()
     PrepPush prep_push{};          // this frame's Preprocess
     bool prep_on = false, ratio_resolve = false;
 
@@ -1036,6 +1042,8 @@ Stage::Stage(const HostDevice& host, const StageConfig& cfg) : impl_(std::make_u
 Stage::~Stage() {
     Impl& m = *impl_;
     if (m.prof.pool) vkDestroyQueryPool(m.device, m.prof.pool, nullptr);
+    if (m.probe_memory) { vkUnmapMemory(m.device, m.probe_memory); vkFreeMemory(m.device, m.probe_memory, nullptr); }
+    if (m.probe) vkDestroyBuffer(m.device, m.probe, nullptr);
     for (auto& b : m.borrows) {
         if (b.in) vkDestroyImageView(m.device, b.in, nullptr);
         if (b.out) vkDestroyImageView(m.device, b.out, nullptr);
@@ -1104,6 +1112,14 @@ void Stage::set(const Settings& s) {
 }
 
 uint8_t Stage::hdr_mode() const { return impl_->hdr; }
+Stage::Facts Stage::facts() const {
+    Facts f = impl_->facts;
+    if (impl_->probe_mapped && f.hdr_mode && !f.absolute) {
+        const float d = impl_->probe_mapped[0];
+        if (d > 0.f && d < 1e9f) f.divisor = d;
+    }
+    return f;
+}
 
 void working_resolution(const Settings& s, uint32_t rw, uint32_t rh, uint32_t gw, uint32_t gh, uint32_t* nw,
                         uint32_t* nh) {
@@ -1213,6 +1229,10 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
     m.prep_was_on = m.prep_on;
     m.prep_last = pp;
     const bool prep_exposure = m.prep_on && pp.exposure != 0;
+    m.facts = Stage::Facts{};
+    m.facts.hdr_mode = m.hdr;
+    m.facts.absolute = m.units.absolute;
+    m.facts.prep_exposure = prep_exposure;
     // Preprocess's exposure replaces RenoDX's divisor; a frame of absolute units then takes the N/P resolve too,
     // so that Preprocess's change comes out of it as it does on relative frames.
     m.ratio_resolve = m.prep_on && m.hdr && !frame_display_codec(s, m.hdr, m.units);
@@ -1324,6 +1344,8 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
                     break;
             }
             m.feed = select_feed(s, m.hdr, m.units, readable, fr.auto_exposure || !fr.create_flags_known);
+            m.facts.feed = m.feed == kFeedV1 ? 0 : m.feed == kFeedTexture ? 1 : 2;
+            m.facts.exposure_texture = !fr.exposure.image ? 0 : readable ? 1 : 2;
             if (m.feed != m.logged_feed) {   // SelectFeed's line, once per decision
                 m.logged_feed = m.feed;
                 nr::logf("[nr] RenoDX stage: NR feed %s (NRFeedMode=%u; exposure texture %s, auto exposure %s, "
@@ -1629,6 +1651,42 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
     Impl::memory_barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
     m.mark(cmd, "copy-out");
+    // the engine-data panel's divisor (Facts::divisor): the scale texel, every 32nd frame
+    if (m.hdr && !m.units.absolute && m.scale.handle && (m.recordings & 31u) == 1u) {
+        if (!m.probe) {
+            VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            bi.size = 256; bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            if (vkCreateBuffer(m.device, &bi, nullptr, &m.probe) == VK_SUCCESS) {
+                VkMemoryRequirements req{}; vkGetBufferMemoryRequirements(m.device, m.probe, &req);
+                const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+                uint32_t type = m.mem.memoryTypeCount;
+                for (uint32_t i = 0; i < m.mem.memoryTypeCount; ++i)
+                    if ((req.memoryTypeBits & (1u << i)) && (m.mem.memoryTypes[i].propertyFlags & want) == want) { type = i; break; }
+                VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; ai.allocationSize = req.size; ai.memoryTypeIndex = type;
+                void* p = nullptr;
+                if (type == m.mem.memoryTypeCount || vkAllocateMemory(m.device, &ai, nullptr, &m.probe_memory) != VK_SUCCESS ||
+                    vkBindBufferMemory(m.device, m.probe, m.probe_memory, 0) != VK_SUCCESS ||
+                    vkMapMemory(m.device, m.probe_memory, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS) {
+                    if (m.probe_memory) vkFreeMemory(m.device, m.probe_memory, nullptr);
+                    vkDestroyBuffer(m.device, m.probe, nullptr);
+                    m.probe = VK_NULL_HANDLE; m.probe_memory = VK_NULL_HANDLE;
+                } else {
+                    m.probe_mapped = static_cast<float*>(p);
+                    m.probe_mapped[0] = 0.f;
+                }
+            }
+        }
+        if (m.probe) {
+            Impl::memory_barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            VkBufferImageCopy c{};
+            c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            c.imageExtent = {1, 1, 1};
+            vkCmdCopyImageToBuffer(cmd, m.scale.handle, VK_IMAGE_LAYOUT_GENERAL, m.probe, 1, &c);
+            Impl::memory_barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+        }
+    }
     m.prof_end();
     return ran;
 }

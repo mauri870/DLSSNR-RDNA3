@@ -231,7 +231,10 @@ void main() {
     const float norm = pass_through ? 1.0 : max(pc.white, 1e-4);
     vec3 proxy = pass_through ? proxy_s : srgb_to_linear(proxy_s);
     vec3 model = pass_through ? model_s : srgb_to_linear(model_s);
-    const vec3 original = original_s.rgb / norm;
+    // Linear light: negative channels (scRGB's out-of-gamut colours, near-black noise) are taken as zero, as
+    // RenoDX's resolve does - a slightly negative luminance in the ratios below made bright coloured dots. The
+    // display-encoded pass-through frame is left as it is.
+    const vec3 original = (pass_through ? original_s.rgb : max(original_s.rgb, vec3(0.0))) / norm;
     const float original_luma = dot(original, kLuma);
     float proxy_luma = dot(proxy, kLuma);
 

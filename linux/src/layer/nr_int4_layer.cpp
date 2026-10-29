@@ -52,14 +52,12 @@ VKAPI_ATTR void VKAPI_CALL DestroyInstance(VkInstance i, const VkAllocationCallb
     reinterpret_cast<PFN_vkDestroyInstance>(gipa(i, "vkDestroyInstance"))(i, a);
 }
 
+// The layer is in the launch options exactly when the game should be able to run CC_SILVER_AARDWOLD_INT4_MIXED
+// (install.sh prints that launch line apart, 0.0.7): it always readies the device for it then, whichever network
+// dlssnr-amd.ini starts with - the networks are switched in game. DLSSNR_INT4=0 leaves the device as it is.
 bool int4_wanted() {
-    if (const char* e = std::getenv("DLSSNR_INT4")) return std::string(e) == "1";
-    Dl_info info{};
-    if (!dladdr(reinterpret_cast<void*>(&int4_wanted), &info) || !info.dli_fname) return false;
-    // <game>/dlssnr-amd/int4/layer/libVkLayer_dlssnr_int4.so
-    const auto game = std::filesystem::path(info.dli_fname).parent_path().parent_path().parent_path().parent_path();
-    const nr::Int4Ini ini = nr::ini_int4((game / "dlssnr-amd.ini").string());
-    return ini.enabled != 0 || !ini.hotkey.empty();   // no Enabled: on (nr_ini_int4.hpp)
+    const char* e = std::getenv("DLSSNR_INT4");
+    return !(e && std::string(e) == "0");
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo* ci, const VkAllocationCallbacks* a, VkDevice* out) {

@@ -2,25 +2,42 @@
 #
 #   install.bat                      a window asks for the game's exe, then for the route
 #   install.bat <game exe or its folder> [optiscaler|reshade-feeder|reshade-feeder-dx9|reshade-feeder-vulkan|remove|logs]
-#               [-Dll <nvngx_dlssnr.dll or its zip>] [-Network default|aco|aco-int4-mixed] [-RenoDX on|off]
+#               [-Dll <nvngx_dlssnr.dll or its zip>] [-Model <network>] [-AcoMode 1|0] [-RenoDX on|off]
 #
-# Network (chosen at install, written to [Network] ACO Mode and [Int4Mixed] Enabled in dlssnr-amd.ini): default = 0 / 0,
-# aco = 1 / 0, aco-int4-mixed = 1 / 1 (int4 mixed runs with ACO's machine code only). int4 mixed is always installed
-# (its weights are made at install); the choice can be changed in the ini later.
+# All three networks are installed and can be switched in game at any time (the drop-down in NR Control or on
+# ReShade's Add-ons page, or Ctrl+F11 to cycle). The choice only sets the one a game starts with ([Network] Model):
+#   -Model CC_SMALL_FP8                   the default network of NVIDIA's 310.9.16, the fastest (default)
+#   -Model CC_SILVER_AARDWOLD             the network of 310.8.0 (also preset 1 of 310.9.16)
+#   -Model CC_SILVER_AARDWOLD_INT4_MIXED  CC_SILVER_AARDWOLD with part of the work in int4 and other lower precisions;
+#                                         faster, the picture differs somewhat; runs with ACO Mode = 1 only
+# Without it, the installer asks once; Enter = CC_SMALL_FP8. The earlier choices still work: -Model new = CC_SMALL_FP8,
+# -Model old = CC_SILVER_AARDWOLD, -Network aco-int4-mixed = CC_SILVER_AARDWOLD_INT4_MIXED with ACO Mode 1,
+# -Network aco = ACO Mode 1, -Network default = ACO Mode 0.
+#
+# ACO Mode ([Network] ACO Mode in dlssnr-amd.ini, -AcoMode, 1 by default): the network's machine code made in advance
+# by the ACO compiler and loaded by the AMD driver; 0 = the AMD driver's own compiler. Not asked; NR Control has it.
+#
+# LumeniteFX (ReShade routes only, -Lumenite on|off [-LumeniteZip <zip>]; asked at install, Enter = off): motion vectors
+# from LumeniteFX Kernel (by Afzaal (Kaidō), https://github.com/umar-afzaal/LumeniteFX, AGNYA licence). It is not in this
+# package: the installer downloads the version this package was tested with (f80e98d) from its author's GitHub and keeps
+# it in this package's lumenite\, so later installs do not download again; or -LumeniteZip gives a LumeniteFX zip you
+# downloaded (Code > Download ZIP on its GitHub page). The files are copied unchanged. On ReShade's Add-ons page (Motion
+# vectors) you can switch back to VORT.
 #
 # RenoDX style (asked at install, -RenoDX on|off; [RenoDX] Enabled in dlssnr-amd.ini): the picture before and after NR
 # is processed the way RenoDX's DLSS5 add-on does it, and every NR setting moves to [RenoDX] (on the OptiScaler route in
 # the NR Control menu, on the ReShade routes on the Add-ons page).
 #
-# The package carries no model: on the first install the user gives NVIDIA's nvngx_dlssnr.dll (310.8.0)
-# or a zip that contains it, and model-tools\dlssnr_extract_model.exe makes dlssnr.bin from it (it only
-# reads the weight data; the DLL is never loaded or run). The model is kept in the package's dlssnr-amd\,
-# so later installs from this package need no DLL.
+# The package carries no model: on the first install the user gives NVIDIA's nvngx_dlssnr.dll (310.9.16 or
+# 310.8.0) or a zip that contains it, and model-tools\dlssnr_extract_model.exe makes the model files from it:
+# from 310.9.16 dlssnr.bin (CC_SILVER_AARDWOLD, which 310.9.16 also holds) and dlssnr-small.bin (CC_SMALL_FP8), from
+# 310.8.0 dlssnr.bin only. It only reads the weight data; the DLL is never loaded or run. The models are kept in
+# the package's dlssnr-amd\, so later installs from this package need no DLL.
 #
 # Every file put into the game folder is listed in dlssnr-amd-install.txt; existing files it would
 # overwrite are first moved to dlssnr-amd-backup\, and uninstall deletes ours and puts them back.
-param([string]$Target = '', [string]$Route = '', [string]$Dll = '', [string]$Network = '', [string]$RenoDX = '',
-      [switch]$Pause)
+param([string]$Target = '', [string]$Route = '', [string]$Dll = '', [string]$Model = '', [string]$Network = '',
+      [string]$AcoMode = '', [string]$RenoDX = '', [string]$Lumenite = '', [string]$LumeniteZip = '', [switch]$Pause)
 
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
@@ -89,32 +106,24 @@ if ('optiscaler', 'reshade-feeder', 'reshade-feeder-dx9', 'reshade-feeder-vulkan
     Fail "Unknown route: $Route"
 }
 
-# ---- choose the network ----------------------------------------------------------------------
-$haveInt4 = Test-Path -LiteralPath (Join-Path $here 'dlssnr-amd\int4') -PathType Container
-if ($Route -ne 'remove' -and $Route -ne 'logs' -and -not $Network) {
-    Say ''
-    Say 'Choose the network (both settings can be changed in dlssnr-amd.ini later):'
-    Say '  1) default network, compiled by the AMD driver   ACO Mode = 0, Int4Mixed Enabled = 0 (default)'
-    Say '  2) default network, ACO machine code             ACO Mode = 1, Int4Mixed Enabled = 0'
-    $menu = @('default', 'aco')
-    if ($haveInt4) {
-        Say '  3) int4 mixed, ACO machine code                  ACO Mode = 1, Int4Mixed Enabled = 1'
-        $menu += 'aco-int4-mixed'
-        Say 'int4 mixed: part of the network runs in int4 and other lower precisions; faster, the picture differs somewhat.'
-        Say 'It runs with ACO machine code only. Ctrl+F11 in game switches between int4 mixed and the default network.'
-    }
-    Say 'ACO machine code: the network as machine code made in advance by the Linux driver''s compiler (ACO), shipped in'
-    Say 'the package and loaded by the AMD driver as it is; faster than the AMD driver''s own compile. Tested on one driver'
-    Say 'version only (AMD Software 26.9.2); if it causes problems on another driver, set ACO Mode back to 0.'
-    $pick = Read-Host "1-$($menu.Count) (Enter = 1)"
-    if ($pick -eq '') { $pick = '1' }
-    $n = 0
-    if ([int]::TryParse($pick, [ref]$n) -and $n -ge 1 -and $n -le $menu.Count) { $Network = $menu[$n - 1] }
-    if (-not $Network) { Fail 'Invalid choice.' }
+# ---- the network a game starts with (asked after the model files are known) and ACO Mode -----------------------
+$Networks = @('CC_SMALL_FP8', 'CC_SILVER_AARDWOLD', 'CC_SILVER_AARDWOLD_INT4_MIXED')
+switch ($Model) { 'new' { $Model = 'CC_SMALL_FP8' } 'old' { $Model = 'CC_SILVER_AARDWOLD' } }
+if ($Model -and $Networks -notcontains $Model) {
+    Fail "Unknown network: $Model (CC_SMALL_FP8, CC_SILVER_AARDWOLD or CC_SILVER_AARDWOLD_INT4_MIXED)"
 }
-if (-not $Network) { $Network = 'default' }
-if ('default', 'aco', 'aco-int4-mixed' -notcontains $Network) { Fail "Unknown network: $Network" }
-if ($Network -eq 'aco-int4-mixed' -and -not $haveInt4) { Fail 'This package has no int4 mixed.' }
+if ($Network -and 'default', 'aco', 'aco-int4-mixed' -notcontains $Network) { Fail "Unknown network choice: $Network" }
+if ($Network -eq 'aco-int4-mixed') {
+    if ($Model -and $Model -ne 'CC_SILVER_AARDWOLD_INT4_MIXED') { Fail "-Network aco-int4-mixed and -Model $Model cannot be used together." }
+    $Model = 'CC_SILVER_AARDWOLD_INT4_MIXED'
+}
+if (-not $AcoMode -and $Network) { $AcoMode = if ($Network -eq 'default') { '0' } else { '1' } }
+if (-not $AcoMode) { $AcoMode = '1' }
+if ('0', '1' -notcontains $AcoMode) { Fail "Unknown ACO Mode: $AcoMode (1 or 0)" }
+if ($Model -eq 'CC_SILVER_AARDWOLD_INT4_MIXED' -and $AcoMode -eq '0') {
+    Fail 'CC_SILVER_AARDWOLD_INT4_MIXED runs with ACO Mode = 1 only; -AcoMode 0 cannot start with it.'
+}
+$haveInt4 = Test-Path -LiteralPath (Join-Path $here 'dlssnr-amd\int4') -PathType Container
 
 # ---- RenoDX style ----------------------------------------------------------------------------
 if ($Route -ne 'remove' -and $Route -ne 'logs' -and -not $RenoDX) {
@@ -132,6 +141,23 @@ if ($Route -ne 'remove' -and $Route -ne 'logs' -and -not $RenoDX) {
 if (-not $RenoDX) { $RenoDX = 'off' }
 if ('on', 'off' -notcontains $RenoDX) { Fail "Unknown RenoDX choice: $RenoDX (on or off)" }
 
+# ---- LumeniteFX (ReShade routes) -------------------------------------------------------------
+if ($LumeniteZip -and -not $Lumenite) { $Lumenite = 'on' }
+if ($Route -like 'reshade-feeder*' -and -not $Lumenite) {
+    Say ''
+    Say 'LumeniteFX (optional): motion vectors from LumeniteFX Kernel (by Afzaal (Kaidō), https://github.com/umar-afzaal/LumeniteFX).'
+    Say '  LumeniteFX is not in this package; with y it is downloaded from its author''s GitHub (needs the internet) and installed unchanged.'
+    Say '  y: install and use LumeniteFX. On ReShade''s Add-ons page (Motion vectors) you can switch back to VORT.'
+    Say '  N: do not install it; the VORT in this package, as before.'
+    $pick = Read-Host 'Install LumeniteFX? [y/N]'
+    $Lumenite = if ($pick -eq 'y' -or $pick -eq 'Y') { 'on' } else { 'off' }
+}
+if (-not $Lumenite) { $Lumenite = 'off' }
+if ('on', 'off' -notcontains $Lumenite) { Fail "Unknown LumeniteFX choice: $Lumenite (on or off)" }
+if ($Lumenite -eq 'on' -and $Route -eq 'optiscaler') {
+    Fail 'LumeniteFX is for the ReShade routes only (the OptiScaler route uses the game''s own motion vectors).'
+}
+
 # ---- games under Program Files need administrator rights -------------------------------------
 if ($Route -ne 'logs') {
     $probe = Join-Path $game ('dlssnr-amd-write-test-' + [guid]::NewGuid().ToString('N'))
@@ -140,7 +166,12 @@ if ($Route -ne 'logs') {
         $me = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
         if ($me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { Fail "Cannot write to $game" }
         Say 'This folder needs administrator rights, asking for them...'
-        $elevated = "-NoProfile -ExecutionPolicy Bypass -STA -File `"$PSCommandPath`" -Target `"$game`" -Route $Route -Network $Network -RenoDX $RenoDX -Pause"
+        # the chosen exe, not its folder: from a folder the first exe would be taken again (another bitness)
+        $again = if ($exe) { $exe } else { $game }
+        $elevated = "-NoProfile -ExecutionPolicy Bypass -STA -File `"$PSCommandPath`" -Target `"$again`" -Route $Route -AcoMode $AcoMode -RenoDX $RenoDX -Pause"
+        if ($Model) { $elevated += " -Model $Model" }
+        $elevated += " -Lumenite $Lumenite"
+        if ($LumeniteZip) { $elevated += " -LumeniteZip `"$LumeniteZip`"" }
         if ($Dll) { $elevated += " -Dll `"$Dll`"" }
         $p = Start-Process powershell -Verb RunAs -ArgumentList $elevated -PassThru -Wait
         exit $p.ExitCode
@@ -257,23 +288,117 @@ if ($Route -eq 'logs') {
 
 if ($Route -eq 'remove') { Remove-Installed; Finish 0 }
 
+# ---- LumeniteFX Kernel (the ReShade routes' optional motion vectors) -------------------------------------------------
+# Nothing of LumeniteFX is in this package (its AGNYA licence allows propagation only through its author's links), and
+# nothing of it is changed: the files are copied as they are in the zip - Shaders/lumenite_Kernel.fx, the
+# Shaders/include/*.fxh it uses, Textures/*, and its licence and notice; its other effects are left out, since ReShade
+# compiles every effect it finds. The check is of the interface, not of the version: lumenite_Kernel.fx with technique
+# Lumenite_Kernel, every file it includes, and the flow textures DLSS5_Feed.fx reads declared as DLSS5_Feed.fx declares
+# them. The add-on checks the rest in the game.
+$LumeniteCommit = 'f80e98d716ad72e12af6f7baa727bcfeb4be5094'   # the version this package was tested with
+function Strip-Comments([string]$text) {
+    $text = [regex]::Replace($text, '/\*.*?\*/', ' ', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+    return [regex]::Replace($text, '//[^\n]*', '')
+}
+function Normal-Text([string]$text) { return [regex]::Replace($text, '\s+', '') }
+# A zip's comment (GitHub writes the commit there), from its end-of-central-directory record.
+function Get-ZipComment([string]$path) {
+    $bytes = [System.IO.File]::ReadAllBytes($path)
+    for ($i = $bytes.Length - 22; $i -ge [Math]::Max(0, $bytes.Length - 65557); $i--) {
+        if ($bytes[$i] -eq 0x50 -and $bytes[$i + 1] -eq 0x4B -and $bytes[$i + 2] -eq 0x05 -and $bytes[$i + 3] -eq 0x06) {
+            $n = [BitConverter]::ToUInt16($bytes, $i + 20)
+            if ($i + 22 + $n -le $bytes.Length) { return [System.Text.Encoding]::ASCII.GetString($bytes, $i + 22, $n).Trim() }
+        }
+    }
+    return ''
+}
+# The zip's files below the repository's top folder: @{ 'Shaders/lumenite_Kernel.fx' = <entry>; ... }. Throws with the
+# reason when the zip cannot be used.
+function Read-Lumenite([string]$zipPath, [string]$feedPath) {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    try { $zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath) }
+    catch { throw "$zipPath is not a zip that can be opened: $($_.Exception.Message)" }
+    $found = @{}
+    foreach ($e in $zip.Entries) {
+        if ($e.FullName.EndsWith('/') -or $e.FullName.EndsWith('\')) { continue }
+        $name = $e.FullName.Replace('\', '/')
+        $m = [regex]::Match($name, '(?:^|/)((?:Shaders|Textures)/.+|LICENSE\.md|NOTICE)$')
+        if ($m.Success -and -not $name.Substring(0, $m.Groups[1].Index).TrimEnd('/').Contains('/') -and
+            -not $found.ContainsKey($m.Groups[1].Value)) { $found[$m.Groups[1].Value] = $e }
+    }
+    $read = { param($entry) $s = New-Object System.IO.StreamReader($entry.Open(), [System.Text.Encoding]::UTF8); try { $s.ReadToEnd() } finally { $s.Close() } }
+    try {
+        if (-not $found.ContainsKey('Shaders/lumenite_Kernel.fx')) { throw 'the zip has no Shaders/lumenite_Kernel.fx (not a LumeniteFX zip?)' }
+        $kernel = Strip-Comments (& $read $found['Shaders/lumenite_Kernel.fx'])
+        if ($kernel -cnotmatch '\btechnique\s+Lumenite_Kernel\b') {
+            throw 'lumenite_Kernel.fx has no technique Lumenite_Kernel (this LumeniteFX version does not work with this package)'
+        }
+        foreach ($inc in [regex]::Matches($kernel, '#\s*include\s+"([^"]+)"')) {
+            $name = $inc.Groups[1].Value.TrimStart('.', '/')
+            if ('ReShade.fxh', 'ReShadeUI.fxh' -contains $name) { continue }   # ReShade's own headers, in the package
+            if (-not $found.ContainsKey("Shaders/$name")) { throw "$name, included by lumenite_Kernel.fx, is not in the zip" }
+        }
+        # The textures DLSS5_Feed.fx re-declares for provider 3 (LumeniteFX Kernel) must be declared the same way.
+        $feed = [System.IO.File]::ReadAllText($feedPath)
+        $part = [regex]::Match($feed, '#elif\s+DLSS5_MV_PROVIDER\s*==\s*3\b(.*?)#elif', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+        if (-not $part.Success) { throw "$feedPath has no DLSS5_MV_PROVIDER == 3 part" }
+        $wanted = @([regex]::Matches((Strip-Comments $part.Groups[1].Value), 'texture2D\s+\w+\s*\{[^}]*\}\s*;') | ForEach-Object { $_.Value })
+        if ($wanted.Count -eq 0 -or -not $part.Groups[1].Value.Contains('namespace Kernel')) { throw "the LumeniteFX part of $feedPath is not as expected" }
+        if ($kernel -cnotmatch '\bnamespace\s+Kernel\b') {
+            throw 'lumenite_Kernel.fx has no namespace Kernel (this LumeniteFX version does not work with this package)'
+        }
+        $flat = Normal-Text $kernel
+        foreach ($decl in $wanted) {
+            if (-not $flat.Contains((Normal-Text $decl))) {
+                throw "$(($decl -split '\s+')[1]) in lumenite_Kernel.fx differs from what DLSS5_Feed.fx reads (this LumeniteFX version does not work with this package)"
+            }
+        }
+    } catch { $zip.Dispose(); throw }
+    return @{ zip = $zip; found = $found }
+}
+# Into <dest> (a reshade-shaders folder): what lumenite_Kernel.fx needs, unchanged.
+function Install-Lumenite($lum, [string]$dest) {
+    $picked = @{ 'Shaders/lumenite_Kernel.fx' = 'Shaders\lumenite_Kernel.fx' }
+    foreach ($name in $lum.found.Keys) {
+        $parts = $name.Split('/')
+        if ($name.StartsWith('Shaders/include/') -and $name.EndsWith('.fxh') -and $parts.Count -eq 3) { $picked[$name] = "Shaders\include\$($parts[2])" }
+        elseif ($name.StartsWith('Textures/') -and $parts.Count -eq 2) { $picked[$name] = "Textures\$($parts[1])" }
+    }
+    if ($lum.found.ContainsKey('LICENSE.md')) { $picked['LICENSE.md'] = 'Shaders\LumeniteFX-LICENSE.md' }
+    if ($lum.found.ContainsKey('NOTICE')) { $picked['NOTICE'] = 'Shaders\LumeniteFX-NOTICE.txt' }
+    try {
+        foreach ($name in $picked.Keys) {
+            $out = Join-Path $dest $picked[$name]
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $out) | Out-Null
+            $in = $lum.found[$name].Open()
+            try { $f = [System.IO.File]::Create($out); try { $in.CopyTo($f) } finally { $f.Close() } } finally { $in.Close() }
+        }
+    } finally { $lum.zip.Dispose() }
+    return $picked.Count
+}
+
 # ---- install ---------------------------------------------------------------------------------
 $bits = Get-ExeBits $exe
 if ($bits -eq 32) { Fail "This is a 32-bit game ($exe); this package supports 64-bit games only." }
 # ---- model -----------------------------------------------------------------------------------
-# The package's dlssnr-amd\dlssnr.bin, or one extracted now from the user's nvngx_dlssnr.dll. Its SHA256
-# has to be the tested model's.
+# The package's models, or ones extracted now from the user's nvngx_dlssnr.dll; checked by SHA256.
+# dlssnr.bin = CC_SILVER_AARDWOLD (310.8.0, also preset 1 of 310.9.16), dlssnr-small.bin = CC_SMALL_FP8 (310.9.16's default).
 $ModelSha = '2B41C888CF4155B8958C665BA64018AB0BD25C85FC71A2B6DB86D0D04D1F7FBD'
-$model = Join-Path $here 'dlssnr-amd\dlssnr.bin'
-$modelFrom = $model
-if (-not (Test-Path -LiteralPath $model)) {
+$SmallSha = '7E966E2639DBEC6596AA0BAC3B8761137D2C40CA8CB4ACA30DF7CA10043C6E33'
+function Test-Sha([string]$path, [string]$sha) {
+    (Test-Path -LiteralPath $path -PathType Leaf) -and (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -eq $sha
+}
+$modelPath = Join-Path $here 'dlssnr-amd\dlssnr.bin'
+$smallPath = Join-Path $here 'dlssnr-amd\dlssnr-small.bin'
+$modelFrom = $modelPath; $smallFrom = $smallPath
+if (($Dll -and -not ((Test-Sha $modelPath $ModelSha) -and (Test-Sha $smallPath $SmallSha))) -or -not (Test-Path -LiteralPath $modelPath)) {
     if (-not $Dll) {
         Say ''
-        Say 'The package has no model. The first install needs NVIDIA''s nvngx_dlssnr.dll (version 310.8.0), or a zip that contains it.'
-        Say 'Only its weight data is read; it is never loaded or run. The model is kept in this package, so later installs do not ask again.'
+        Say 'The package has no model. The first install needs NVIDIA''s nvngx_dlssnr.dll (310.9.16 - both models - or 310.8.0), or a zip that contains it.'
+        Say 'Only its weight data is read; it is never loaded or run. The models are kept in this package, so later installs do not ask again.'
         Add-Type -AssemblyName System.Windows.Forms
         $dialog = New-Object System.Windows.Forms.OpenFileDialog
-        $dialog.Title = 'Choose nvngx_dlssnr.dll (310.8.0) or a zip that contains it'
+        $dialog.Title = 'Choose nvngx_dlssnr.dll (310.9.16 or 310.8.0) or a zip that contains it'
         $dialog.Filter = 'nvngx_dlssnr.dll or zip (*.dll;*.zip)|*.dll;*.zip'
         if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { Fail 'No nvngx_dlssnr.dll chosen; cannot install.' }
         $Dll = $dialog.FileName
@@ -292,26 +417,77 @@ if (-not (Test-Path -LiteralPath $model)) {
             $src = $found[0].FullName
         }
         Say 'Extracting the model ...'
-        $tmpModel = Join-Path $work 'dlssnr.bin'
-        & (Join-Path $here 'model-tools\dlssnr_extract_model.exe') $src $tmpModel
+        $out = Join-Path $work 'out'
+        New-Item -ItemType Directory -Path $out | Out-Null
+        & (Join-Path $here 'model-tools\dlssnr_extract_model.exe') $src $out
+        $tmpModel = Join-Path $out 'dlssnr.bin'; $tmpSmall = Join-Path $out 'dlssnr-small.bin'
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $tmpModel)) { Fail 'Extracting the model failed (see above).' }
+        if (-not (Test-Sha $tmpModel $ModelSha)) { Fail 'The extracted model has the wrong checksum; nothing was installed.' }
+        $pairs = @(,@($tmpModel, $modelPath))
+        if (Test-Path -LiteralPath $tmpSmall) {
+            if (-not (Test-Sha $tmpSmall $SmallSha)) { Fail 'The extracted CC_SMALL_FP8 model has the wrong checksum; nothing was installed.' }
+            $pairs += ,@($tmpSmall, $smallPath)
+        }
         try {
-            Copy-Item -LiteralPath $tmpModel -Destination $model -Force
-            Say "The model is kept in $model; later installs from this package need no DLL."
+            foreach ($p in $pairs) { Copy-Item -LiteralPath $p[0] -Destination $p[1] -Force }
+            Say "The model is kept in $(Join-Path $here 'dlssnr-amd'); later installs from this package need no DLL."
         } catch {
-            # The package folder is not writable: install from the temporary copy; the next install asks again.
+            # The package folder is not writable: install from temporary copies; the next install asks again.
+            foreach ($p in $pairs) { Remove-Item -LiteralPath $p[1] -Force -ErrorAction SilentlyContinue }
             $modelFrom = Join-Path $env:TEMP 'dlssnr-amd-model.bin'
             Copy-Item -LiteralPath $tmpModel -Destination $modelFrom -Force
+            if (Test-Path -LiteralPath $tmpSmall) {
+                $smallFrom = Join-Path $env:TEMP 'dlssnr-amd-model-small.bin'
+                Copy-Item -LiteralPath $tmpSmall -Destination $smallFrom -Force
+            }
             Say 'Note: the model could not be kept in the package folder (not writable?); the next install needs the DLL again.'
         }
     } finally {
         Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
-if ((Get-FileHash -LiteralPath $modelFrom -Algorithm SHA256).Hash -ne $ModelSha) {
+if (-not (Test-Sha $modelFrom $ModelSha)) {
     Fail "$modelFrom is damaged or not this version's model. Delete it and install again with nvngx_dlssnr.dll."
 }
-# int4 mixed's weights: made from this model with the package's data, checked against the tested result.
+if ((Test-Path -LiteralPath $smallPath) -and -not (Test-Sha $smallPath $SmallSha)) {
+    Fail "$smallPath is damaged or not this version's model. Delete it or install again with nvngx_dlssnr.dll."
+}
+$haveSmall = Test-Sha $smallFrom $SmallSha
+if (-not $haveSmall) {
+    Say 'Note: the package has no model for CC_SMALL_FP8 (dlssnr-small.bin, in the 310.9.16 nvngx_dlssnr.dll); it is greyed out in game.'
+    Say 'To add it, install again with -Dll pointing at the 310.9.16 nvngx_dlssnr.dll or its zip.'
+}
+# The network a game starts with: all three are installed, this only sets [Network] Model in dlssnr-amd.ini.
+if (-not $Model) {
+    $default = if ($haveSmall) { 1 } else { 2 }
+    Say ''
+    Say 'All three networks are installed and can be switched in game at any time (the drop-down in NR Control or on'
+    Say 'ReShade''s Add-ons page, or Ctrl+F11 to cycle). Choose only the one a game starts with:'
+    if ($haveSmall) { Say '  1) CC_SMALL_FP8                    the default network of 310.9.16, the fastest (default)' }
+    else { Say '  1) CC_SMALL_FP8                    not available: needs the 310.9.16 nvngx_dlssnr.dll (install again with -Dll)' }
+    Say '  2) CC_SILVER_AARDWOLD              the network of 310.8.0 (also preset 1 of 310.9.16)'
+    if ($haveInt4 -and $AcoMode -eq '1') { Say '  3) CC_SILVER_AARDWOLD_INT4_MIXED   2) with part of the work in int4; faster, the picture differs somewhat' }
+    elseif ($haveInt4) { Say '  3) CC_SILVER_AARDWOLD_INT4_MIXED   not available: runs with ACO Mode = 1 only' }
+    else { Say '  3) CC_SILVER_AARDWOLD_INT4_MIXED   not available: this package has no int4 mixed' }
+    Say 'Later: [Network] Model in dlssnr-amd.ini.'
+    $pick = Read-Host "Start with which one? [1/2/3, Enter = $default]"
+    if ($pick -eq '') { $pick = "$default" }
+    switch ($pick) {
+        '1' { $Model = 'CC_SMALL_FP8' } '2' { $Model = 'CC_SILVER_AARDWOLD' } '3' { $Model = 'CC_SILVER_AARDWOLD_INT4_MIXED' }
+        default { Say "Invalid choice, using $default."; $Model = $Networks[$default - 1] }
+    }
+}
+if ($Model -eq 'CC_SMALL_FP8' -and -not $haveSmall) {
+    Say 'CC_SMALL_FP8 is not available (no model for it); games start with CC_SILVER_AARDWOLD.'; $Model = 'CC_SILVER_AARDWOLD'
+}
+if ($Model -eq 'CC_SILVER_AARDWOLD_INT4_MIXED' -and -not $haveInt4) {
+    Say 'This package has no int4 mixed; games start with CC_SILVER_AARDWOLD.'; $Model = 'CC_SILVER_AARDWOLD'
+}
+if ($Model -eq 'CC_SILVER_AARDWOLD_INT4_MIXED' -and $AcoMode -eq '0') {
+    Say 'CC_SILVER_AARDWOLD_INT4_MIXED runs with ACO Mode = 1 only; games start with CC_SILVER_AARDWOLD.'; $Model = 'CC_SILVER_AARDWOLD'
+}
+# int4 mixed's weights: made from this model with the package's data, checked against the tested result. If that
+# fails, the other two networks are installed and int4 mixed is greyed out in game (with the reason).
 $int4ModelFrom = $null
 $int4Data = Join-Path $here 'dlssnr-amd\int4'
 if ($haveInt4) {
@@ -322,19 +498,55 @@ if ($haveInt4) {
     }
     $int4Sha = ((Get-Content -LiteralPath $hashFile -Raw).Trim() -split '\s+')[0]
     $int4ModelFrom = Join-Path ([System.IO.Path]::GetTempPath()) ("dlssnr-int4-$([guid]::NewGuid().ToString('N')).bin")
-    Say 'Making the int4 mixed weights from the model ...'
+    Say 'Making the CC_SILVER_AARDWOLD_INT4_MIXED weights from the model ...'
     & $generator $modelFrom $int4Data $int4ModelFrom
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $int4ModelFrom) -or
         (Get-FileHash -LiteralPath $int4ModelFrom -Algorithm SHA256).Hash -ne $int4Sha) {
         Remove-Item -LiteralPath $int4ModelFrom -Force -ErrorAction SilentlyContinue
-        Fail 'Making or checking the int4 mixed weights failed; the game folder was not changed.'
+        $int4ModelFrom = $null
+        Say 'Note: making or checking the int4 mixed weights failed; it is not available in game. The other two networks are installed.'
+        if ($Model -eq 'CC_SILVER_AARDWOLD_INT4_MIXED') { Say 'Games start with CC_SILVER_AARDWOLD.'; $Model = 'CC_SILVER_AARDWOLD' }
+    }
+}
+# LumeniteFX is fetched and its interface checked before anything is installed: if anything is wrong, nothing is.
+$lumeniteFx = $null
+if ($Lumenite -eq 'on') {
+    $feedFx = Join-Path $here 'reshade\reshade-shaders\Shaders\DLSS5_Feed.fx'
+    if ($LumeniteZip) {
+        $LumeniteZip = $LumeniteZip.Trim('"')
+        if (-not (Test-Path -LiteralPath $LumeniteZip -PathType Leaf)) { Fail "Not found: $LumeniteZip" }
+        $lumeniteSrc = (Resolve-Path -LiteralPath $LumeniteZip).Path
+    } else {
+        $lumeniteSrc = Join-Path $here "lumenite\LumeniteFX-$LumeniteCommit.zip"
+        if (-not (Test-Path -LiteralPath $lumeniteSrc -PathType Leaf)) {
+            $url = "https://github.com/umar-afzaal/LumeniteFX/archive/$LumeniteCommit.zip"
+            Say "Downloading LumeniteFX from its author's GitHub ($url) ..."
+            $part = "$lumeniteSrc.part"
+            try {
+                New-Item -ItemType Directory -Force -Path (Split-Path -Parent $lumeniteSrc) | Out-Null
+                [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+                Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $part
+                Move-Item -LiteralPath $part -Destination $lumeniteSrc -Force
+            } catch {
+                Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
+                Say 'The download failed; nothing was installed. On https://github.com/umar-afzaal/LumeniteFX, Code > Download ZIP'
+                Fail 'downloads it; then install with -LumeniteZip <the downloaded zip>.'
+            }
+        }
+    }
+    try { $lumeniteFx = Read-Lumenite $lumeniteSrc $feedFx }
+    catch { Say $_.Exception.Message; Fail 'This LumeniteFX cannot be used (the reason is above); nothing was installed.' }
+    $got = Get-ZipComment $lumeniteSrc
+    if ($got -and $got -ne $LumeniteCommit) {
+        Say "Note: this LumeniteFX is commit $($got.Substring(0, [Math]::Min(7, $got.Length))), not $($LumeniteCommit.Substring(0, 7)) this package was tested with. Its interface checks passed; installing it."
     }
 }
 if (Test-Path -LiteralPath $manifest) { Say 'Found a previous installation, removing it first.'; Remove-Installed }
 
 Set-Content -LiteralPath $manifest -Value "F $ManifestName" -Encoding UTF8
 Put-Tree (Join-Path $here 'dlssnr-amd') 'dlssnr-amd'
-if ($modelFrom -ne $model) { Copy-Item -LiteralPath $modelFrom -Destination (Join-Path $game 'dlssnr-amd\dlssnr.bin') -Force }
+if ($modelFrom -ne $modelPath) { Copy-Item -LiteralPath $modelFrom -Destination (Join-Path $game 'dlssnr-amd\dlssnr.bin') -Force }
+if ($haveSmall -and $smallFrom -ne $smallPath) { Copy-Item -LiteralPath $smallFrom -Destination (Join-Path $game 'dlssnr-amd\dlssnr-small.bin') -Force }
 if ($int4ModelFrom) {
     try { Put-File $int4ModelFrom 'dlssnr-amd\dlssnr-int4.bin' }
     finally { Remove-Item -LiteralPath $int4ModelFrom -Force -ErrorAction SilentlyContinue }
@@ -418,34 +630,59 @@ if ($Route -eq 'optiscaler') {
         Copy-Item -LiteralPath (Join-Path $here 'reshade\ReShadePreset-d3d9.ini') -Destination (Join-Path $game 'ReShadePreset.ini') -Force
     }
 }
+if ($lumeniteFx) {
+    # into reshade-shaders\ (the whole folder is recorded and removed with the rest); ReShadePreset.ini switched to
+    # LumeniteFX: DLSS5_MV_PROVIDER=3, Lumenite_Kernel on (VORT off), sorted before DLSS5_Feed
+    $n = Install-Lumenite $lumeniteFx (Join-Path $game 'reshade-shaders')
+    Say "LumeniteFX: $n files installed into $(Join-Path $game 'reshade-shaders')"
+    $preset = Join-Path $game 'ReShadePreset.ini'
+    $lines = [System.IO.File]::ReadAllLines($preset)
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -like 'PreprocessorDefinitions=*') { $lines[$i] = $lines[$i].Replace('DLSS5_MV_PROVIDER=2', 'DLSS5_MV_PROVIDER=3') }
+        elseif ($lines[$i] -like 'Techniques=*') { $lines[$i] = $lines[$i].Replace('vort_MotionEffects@vort_Motion.fx', 'Lumenite_Kernel@lumenite_Kernel.fx') }
+        elseif ($lines[$i] -like 'TechniqueSorting=*') { $lines[$i] = 'TechniqueSorting=Lumenite_Kernel@lumenite_Kernel.fx,' + $lines[$i].Substring(17) }
+    }
+    [System.IO.File]::WriteAllText($preset, (($lines -join "`r`n") + "`r`n"))
+    $text = [System.IO.File]::ReadAllText($preset)
+    if ($text -cnotmatch '(?m)^PreprocessorDefinitions=.*DLSS5_MV_PROVIDER=3' -or $text -cnotmatch '(?m)^Techniques=Lumenite_Kernel@lumenite_Kernel\.fx,DLSS5_Feed@DLSS5_Feed\.fx') {
+        Fail "ReShadePreset.ini could not be switched to LumeniteFX ($preset)."
+    }
+}
 
 # dlssnr-amd.ini is written at install with every setting and its description (a reinstall writes the defaults
 # again). Uninstall deletes it.
-if ($Route -eq 'optiscaler' -and $RenoDX -eq 'on') { $iniSrc = "ini\$Network\dlssnr-amd-optiscaler-renodx.ini" }
-elseif ($Route -eq 'optiscaler') { $iniSrc = "ini\$Network\dlssnr-amd-optiscaler.ini" }
-else { $iniSrc = "ini\$Network\dlssnr-amd-addon.ini" }
+if ($Route -eq 'optiscaler' -and $RenoDX -eq 'on') { $iniSrc = 'ini\dlssnr-amd-optiscaler-renodx.ini' }
+elseif ($Route -eq 'optiscaler') { $iniSrc = 'ini\dlssnr-amd-optiscaler.ini' }
+else { $iniSrc = 'ini\dlssnr-amd-addon.ini' }
 $iniDst = Join-Path $game 'dlssnr-amd.ini'
-Copy-Item -LiteralPath (Join-Path $here $iniSrc) -Destination $iniDst -Force
-if ($Route -ne 'optiscaler' -and $RenoDX -eq 'on') {
-    # RenoDX style: Enabled = 1 in the [RenoDX] section
-    $lines = [System.IO.File]::ReadAllLines($iniDst, [System.Text.Encoding]::UTF8)
-    $inRenoDX = $false
-    for ($i = 0; $i -lt $lines.Count; $i++) {
-        if ($lines[$i] -match '^\[') { $inRenoDX = $lines[$i] -eq '[RenoDX]' }
-        elseif ($inRenoDX -and $lines[$i] -eq 'Enabled = 0') { $lines[$i] = 'Enabled = 1' }
-    }
-    [System.IO.File]::WriteAllText($iniDst, (($lines -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+# The RenoDX style ([RenoDX] Enabled = 1 on the ReShade routes; the OptiScaler route has a file of its own), the
+# network a game starts with and ACO Mode ([Network] Model, ACO Mode).
+$lines = [System.IO.File]::ReadAllLines((Join-Path $here $iniSrc), [System.Text.Encoding]::UTF8)
+$section = ''; $done = @{}
+for ($i = 0; $i -lt $lines.Count; $i++) {
+    if ($lines[$i] -match '^\[([^\]]+)\]') { $section = $Matches[1]; continue }
+    if ($section -eq 'RenoDX' -and $Route -ne 'optiscaler' -and $RenoDX -eq 'on' -and $lines[$i] -eq 'Enabled = 0') {
+        $lines[$i] = 'Enabled = 1'; $done['renodx'] = 1
+    } elseif ($section -eq 'Network' -and $lines[$i] -match '^Model = ') { $lines[$i] = "Model = $Model"; $done['model'] = 1 }
+    elseif ($section -eq 'Network' -and $lines[$i] -match '^ACO Mode = ') { $lines[$i] = "ACO Mode = $AcoMode"; $done['aco'] = 1 }
+    elseif ($lumeniteFx -and $lines[$i] -ceq 'MotionVectors=vort') { $lines[$i] = 'MotionVectors=lumenite'; $done['lumenite'] = 1 }
 }
+if ($lumeniteFx -and -not $done['lumenite']) { Fail 'dlssnr-amd.ini: could not set MotionVectors=lumenite.' }
+if (-not $done['model'] -or -not $done['aco'] -or ($Route -ne 'optiscaler' -and $RenoDX -eq 'on' -and -not $done['renodx'])) {
+    Fail 'The package''s dlssnr-amd.ini is not as expected; unpack the package again.'
+}
+[System.IO.File]::WriteAllText($iniDst, (($lines -join "`r`n") + "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
 Record-Logs @('dlssnr-amd.ini')
 
 Say ''
 Say "Installed into: $game$(if ($RenoDX -eq 'on') { ' (RenoDX style)' })"
-$aco = if ($Network -eq 'aco' -or $Network -eq 'aco-int4-mixed') { 1 } else { 0 }
-Say "Network: ACO Mode = $aco ([Network] in dlssnr-amd.ini; a change takes effect after a game restart)"
-if ($int4ModelFrom) {
-    $i4 = if ($Network -eq 'aco-int4-mixed') { 1 } else { 0 }
-    Say "int4 mixed: Enabled = $i4 ([Int4Mixed] in dlssnr-amd.ini). Ctrl+F11 in game switches between int4 mixed and the default network."
-    if ($aco -eq 0) { Say 'Switching to int4 mixed with Ctrl+F11 needs ACO Mode = 1.' }
+Say "Networks installed: $(if ($haveSmall) { 'CC_SMALL_FP8, ' })CC_SILVER_AARDWOLD$(if ($int4ModelFrom) { ', CC_SILVER_AARDWOLD_INT4_MIXED' }); games start with $Model."
+Say "Switch the network in game at any time: the drop-down in $(if ($Route -eq 'optiscaler') { 'NR Control (End)' } else { 'ReShade''s Add-ons page' }), or Ctrl+F11 to cycle; settings: [Network] in dlssnr-amd.ini."
+if ($AcoMode -eq '1') {
+    Say 'ACO Mode = 1: the network runs machine code made in advance by the ACO compiler. If it causes problems with your'
+    Say "driver, set ACO Mode = 0 in $(if ($Route -eq 'optiscaler') { 'NR Control' } else { 'ReShade''s Add-ons page' }) or in dlssnr-amd.ini (the AMD driver's own compiler; CC_SILVER_AARDWOLD_INT4_MIXED needs 1)."
+} else {
+    Say 'ACO Mode = 0: the AMD driver compiles the network; CC_SILVER_AARDWOLD_INT4_MIXED is not available with it.'
 }
 if ($Route -eq 'optiscaler') {
     if ($RenoDX -eq 'on') {
@@ -455,7 +692,7 @@ if ($Route -eq 'optiscaler') {
         Say 'the NR settings are on the DLSS Neural Rendering page.'
     }
     Say 'If colours turn green or grainy after NR (007 First Light, for example), try [Preprocess] in dlssnr-amd.ini, or press Ctrl+F10 in the game.'
-    Say "End opens NR Control (this project's NR menu: int4 mixed, Preprocess$(if ($RenoDX -eq 'on') { ', and every NR setting of the RenoDX style' }))."
+    Say "End opens NR Control (this project's NR menu: networks, Preprocess$(if ($RenoDX -eq 'on') { ', and every NR setting of the RenoDX style' }))."
     if ($RenoDX -eq 'on') {
         Say 'The RenoDX style is on ([RenoDX] Enabled = 1 in dlssnr-amd.ini). With it on, every NR setting is in NR Control ([RenoDX]);'
         Say 'the OptiScaler menu only handles upscaling and frame generation, and its NR page has no effect. Turning the RenoDX style off'
@@ -464,6 +701,11 @@ if ($Route -eq 'optiscaler') {
     }
 } else {
     Say 'In the game, Home opens ReShade; the settings are on the Add-ons page, or edit dlssnr-amd.ini in the game folder.'
+    if ($lumeniteFx) {
+        Say 'Motion vectors: LumeniteFX Kernel (by Afzaal (Kaidō), https://github.com/umar-afzaal/LumeniteFX, AGNYA licence;'
+        Say '  not part of this project, installed unchanged from its author''s GitHub). Motion vectors on the Add-ons page switches back to VORT;'
+        Say '  when LumeniteFX cannot be used in game, VORT runs that time and dlssnr-amd.log says why.'
+    }
     if ($RenoDX -eq 'on') {
         Say 'The RenoDX style is on ([RenoDX] Enabled = 1 in dlssnr-amd.ini). With it on, every NR setting is in the RenoDX part of the'
         Say 'Add-ons page ([RenoDX]), and the NR settings of [DlssNr] have no effect. Turning it off (Enabled = 0, restart the game)'

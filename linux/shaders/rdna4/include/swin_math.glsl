@@ -5,6 +5,10 @@
 // followed by mul.f16x2. Algebraically expanding the polynomial changes its
 // rounding. These elementwise operations are independent of MMA accumulation.
 f16vec2 nr_swin_act2(f16vec2 x) {
+#if defined(NR_SACT) && NR_SACT == 1   // CC_SMALL_FP8_EXPERIMENTAL: ReLU (pipelines-experimental.json)
+    return max(x,f16vec2(0.0hf));
+#endif
+
     const f16vec2 t = clamp(x, f16vec2(-4.0hf), f16vec2(4.0hf));
     const f16vec2 u = fma(f16vec2(-0.055908203125hf), abs(t), f16vec2(0.447265625hf));
     return x * fma(t, u, f16vec2(0.89453125hf));

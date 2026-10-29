@@ -1,0 +1,21 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Mode 0, Encode: t0 = the frame, t3 = the 1x1 exposure (ExposureMode 1 / 3), u0 = the proxy the network is
+// shown, u1 = the kept original; both stored in the frame's own format.
+#include "wilsjo2_common.glsl"
+
+void main() {
+    const uvec2 p = gl_GlobalInvocationID.xy;
+    if (outside(p)) return;
+    const vec4 S = texelFetch(t0, ivec2(p), 0);
+    const vec3 F = max(S.rgb, vec3(0.0));
+    imageStore(u1, ivec2(p), vec4(F, S.a));
+    if (cb.Passthrough != 0u) {
+        imageStore(u0, ivec2(p), vec4(F, S.a));
+        return;
+    }
+    const vec3 n = F / white_point();
+    const vec3 d = encode_curve(n);
+    const float alpha = cb.ReversibleMode != 0u ? 1.0 : S.a;
+    imageStore(u0, ivec2(p), vec4(srgb_encode(d), alpha));
+}

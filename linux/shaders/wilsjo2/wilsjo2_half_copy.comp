@@ -1,0 +1,22 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// Mode 9 (ours), Passes (fast): t0 into a 16-bit float image (u0) at the model's extent, for the fast work. DebugView:
+// 0 as it is (the network's input), 1 into the fast work's bounded domain, 2 back from it. The fast work's arithmetic
+// (linux/shaders/renodx-fast) takes a display-encoded picture in [0, 1]; a float frame passed through as it is (no
+// HDR flag) can go above 1, and goes through the hybrid curve (identity to 0.75, the rest of [0, inf) into [0.75, 1))
+// there and back (wilsjo2_common.glsl hybrid_encode / hybrid_decode). Rounded to nearest even here, as the network
+// rounds its input (fswin_t.comp NR_HALF_RTE): with DebugView 0 the image holds exactly the values the network would
+// have taken from t0, and the store (which truncates a value it cannot hold) has nothing left to round.
+#extension GL_EXT_spirv_intrinsics : require
+spirv_execution_mode(extensions = ["SPV_KHR_float_controls"], capabilities = [4467], 4462, 16);
+#include "wilsjo2_common.glsl"
+
+void main() {
+    const uvec2 p = gl_GlobalInvocationID.xy;
+    if (outside(p)) return;
+    vec4 v = texelFetch(t0, ivec2(p), 0);
+    if (cb.DebugView == 1u) v.rgb = hybrid_encode(v.rgb);
+    else if (cb.DebugView == 2u) v.rgb = hybrid_decode(v.rgb);
+    imageStore(u0, ivec2(p), vec4(f16vec4(v)));
+}

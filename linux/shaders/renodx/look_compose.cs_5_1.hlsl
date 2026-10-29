@@ -46,7 +46,9 @@ float4 LoadHistory(uint2 pixel, out float history_i, out float history_m) {
 
 // The 3x3 clip's neighbour values, computed once per pixel for the group's 16x16 tile and its 1-pixel border
 // (DLSSNR-AMD addition: the same BandValues of the same clamped pixels the loop below read, which it used to
-// recompute for each of the 9 windows a pixel is in).
+// recompute for each of the 9 windows a pixel is in). DLSSNR-AMD: a thread's own entry is its own
+// pixel's values (computed once, for the tile and for the pixel: the same BandValues of the same clamped pixel), the
+// 68 border entries by the first 68 threads.
 groupshared float4 g_value[18][18];
 groupshared float g_m[18][18];
 groupshared float g_i[18][18];
@@ -55,10 +57,19 @@ groupshared float g_i[18][18];
 void main(uint3 dispatch_id : SV_DispatchThreadID, uint3 group_thread : SV_GroupThreadID, uint3 group : SV_GroupID) {
   const int2 pixel = int2(dispatch_id.xy);
   const bool clip = (Flags & kFlagTemporal) != 0u && (Flags & kFlagHistoryValid) != 0u;
+  Edit x;
+  float peak;
+  float trough;
+  float aM;
+  float4 current = BandValues(clamp(pixel, 0, int2(NrSize) - 1), x, peak, trough, aM);
   if (clip) {   // uniform: every thread of the group gets here
-    const int2 origin = int2(group.xy) * 16 - 1;
-    for (uint k = group_thread.y * 16u + group_thread.x; k < 18u * 18u; k += 256u) {
-      const int2 at = int2(k % 18u, k / 18u);
+    g_value[group_thread.y + 1u][group_thread.x + 1u] = current;
+    g_m[group_thread.y + 1u][group_thread.x + 1u] = aM;
+    g_i[group_thread.y + 1u][group_thread.x + 1u] = x.I;
+    const uint k = group_thread.y * 16u + group_thread.x;
+    if (k < 68u) {   // the ring: rows 0 and 17 (18 each), then columns 0 and 17 of rows 1..16
+      const int2 at = k < 18u ? int2(k, 0) : k < 36u ? int2(k - 18u, 17) : k < 52u ? int2(0, k - 35u) : int2(17, k - 51u);
+      const int2 origin = int2(group.xy) * 16 - 1;
       const int2 neighbour = clamp(origin + at, 0, int2(NrSize) - 1);
       Edit around;
       float unused_peak;
@@ -71,11 +82,6 @@ void main(uint3 dispatch_id : SV_DispatchThreadID, uint3 group_thread : SV_Group
     GroupMemoryBarrierWithGroupSync();
   }
   if (any(dispatch_id.xy >= NrSize)) return;
-  Edit x;
-  float peak;
-  float trough;
-  float aM;
-  float4 current = BandValues(pixel, x, peak, trough, aM);
   float3 c = x.c;
 
   if ((Flags & kFlagTemporal) != 0u) {

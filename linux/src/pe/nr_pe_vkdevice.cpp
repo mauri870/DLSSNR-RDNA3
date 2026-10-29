@@ -5,7 +5,11 @@
 #include <windows.h>
 #include <MinHook.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cstdio>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -168,6 +172,45 @@ void note_handles(VkInstance instance, VkPhysicalDevice physical, VkDevice devic
     if (physical) seen.physical = physical;
     if (device) seen.device = device;
 }
+
+void note_device(VkInstance instance, VkPhysicalDevice physical, VkDevice device, const std::vector<uint32_t>& families) {
+    std::lock_guard<std::mutex> guard(lock);
+    if (instance) seen.instance = instance;
+    seen.physical = physical;
+    seen.device = device;
+    requested_families = families;
+}
+
+void forget_device(VkDevice device) {
+    if (!device) return;
+    std::lock_guard<std::mutex> guard(lock);
+    queues.erase(std::remove_if(queues.begin(), queues.end(), [device](const Queue& q) { return q.device == device; }),
+                 queues.end());
+    if (seen.device == device) { seen.device = VK_NULL_HANDLE; requested_families.clear(); }
+}
+
+namespace {
+std::atomic<bool> g_queue_locks{false};
+std::mutex g_queue_locks_map;
+std::map<VkQueue, std::unique_ptr<std::recursive_mutex>> g_queue_mutexes;
+std::recursive_mutex* queue_mutex(VkQueue queue) {
+    std::lock_guard<std::mutex> guard(g_queue_locks_map);
+    auto& m = g_queue_mutexes[queue];
+    if (!m) m = std::make_unique<std::recursive_mutex>();
+    return m.get();
+}
+}  // namespace
+
+void enable_queue_locks() { g_queue_locks = true; }
+bool queue_locks_enabled() { return g_queue_locks.load(); }
+void lock_queue(VkQueue queue) { if (g_queue_locks.load() && queue) queue_mutex(queue)->lock(); }
+void unlock_queue(VkQueue queue) { if (g_queue_locks.load() && queue) queue_mutex(queue)->unlock(); }
+bool lock_queue_held(VkQueue queue) {
+    if (!g_queue_locks.load() || !queue) return false;
+    queue_mutex(queue)->lock();
+    return true;
+}
+void unlock_queue_held(VkQueue queue, bool held) { if (held) queue_mutex(queue)->unlock(); }
 
 bool family_of(VkQueue queue, uint32_t* family) {
     std::lock_guard<std::mutex> guard(lock);

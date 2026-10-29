@@ -9,11 +9,12 @@
 #include <filesystem>
 #include <string>
 #include <mutex>
+#include "nr_ini_network.hpp"
 #if NR_INT4
 #include "nr_ini_int4.hpp"
+#endif
 #ifdef _WIN32
 extern "C" __declspec(dllimport) unsigned long __stdcall GetEnvironmentVariableA(const char*, char*, unsigned long);
-#endif
 #endif
 
 // Arena reuse: byte-identical to one value one slot at 16 extents, first and fourth
@@ -21,6 +22,9 @@ extern "C" __declspec(dllimport) unsigned long __stdcall GetEnvironmentVariableA
 constexpr bool kArenaReuseDefault = true;
 
 namespace nr {
+
+// What Runtime::act_arena / RuntimeConfig::act_arena pass around (GraphAct).
+struct ActArenaRef { std::shared_ptr<GraphAct> act; };
 namespace {
 std::mutex build_mutex;
 
@@ -237,15 +241,26 @@ constexpr unsigned kTemporalBase = 4;
 constexpr int kTemporalRadius[kTemporalLevels] = {2, 3, 3, 4};
 constexpr float kTemporalReject = 0.50f;
 // The post block's history weight is sigmoid(net) * clamp(s, 0, 1), where s is
-// the model's own f16 weight block70.layer0.blend_scale (0x39EB, the post
-// kernel's +104 pointer; the DLL looks it up next to the layer's weights at
-// 0x180075ce0). The model is pinned to 310.8.0 by its SHA-256, so it is a
-// constant here. TemporalConfig::history_strength scales it.
+// the model's own f16 weight <post block>.layer0.blend_scale (the post kernel's
+// +104 pointer; the DLL looks it up next to the layer's weights). Both models
+// are pinned by their SHA-256, so these are constants: 310.8.0 block70 0x39EB,
+// the 310.9 small model's block30 0x3A23. TemporalConfig::history_strength scales it.
 constexpr float kPostBlendScale = 0.73974609375f;
+constexpr float kPostBlendScaleSmall = 0.76708984375f;
 // The pre block's push, PushFSwin + PushPreImage (nr_graph.cpp).
 constexpr uint32_t kPrePushBytes = sizeof(PushFSwin) + sizeof(PushPreImage);
 constexpr uint32_t kPreSeedAt = sizeof(PushFSwin) + offsetof(PushPreImage, seed);
 constexpr uint32_t kPreNoiseFieldAt = sizeof(PushFSwin) + offsetof(PushPreImage, noise_off);
+
+// The model extent. At scale 1 it is the frame's own, unaligned, as every
+// game has run so far; below 1 it is rounded to a multiple of 8 (the
+// network's tile) and never above the frame.
+uint32_t model_extent(uint32_t v, float scale) {
+    if (scale == 1.0f) return v;
+    uint32_t m = uint32_t(std::lround(double(v) * scale));
+    m = (m + 4) / 8 * 8;
+    return std::min(std::max(m, 8u), v);
+}
 
 struct Temporal {
     struct LumaPush { uint32_t dst_w, dst_h, src_w, src_h, mode; };
@@ -263,6 +278,7 @@ struct Temporal {
     nrvk::Context::Image flow[kTemporalLevels]{};
     nrvk::Context::Image flow0_sampled{};   // the same image, sampled alias
     VkSampler motion_sampler{};             // owned here; the alias does not own its image
+    VkSampler motion_point_sampler{};       // RuntimeConfig::motion_point: the game's vectors sampled in place
     nrvk::Context::Image history{};
     // One pass: two history images in turn. The post variant writes the model's
     // image straight into the one the next frame reads (pre/post read
@@ -293,6 +309,8 @@ struct Temporal {
     nrvk::Kernel luma_kernel[2][kTemporalLevels];
     nrvk::Kernel flow_kernel[2][kTemporalLevels];
     nrvk::Kernel pre, post;
+    // post / post_pp with the Style grade (temporal_post_*_grade.spv), when the folder has them.
+    nrvk::Kernel post_grade, post_grade_pp[2];
     const nrvk::Kernel* original_pre{};
     const nrvk::Kernel* original_post{};
     float history_strength{1.0f};
@@ -316,20 +334,25 @@ struct Temporal {
         ctx.destroy(depth);
         if (pre.device) pre.destroy();
         if (post.device) post.destroy();
+        if (post_grade.device) post_grade.destroy();
         for (unsigned c = 0; c < 2; ++c) {
             if (pre_pp[c].device) pre_pp[c].destroy();
             if (post_pp[c].device) post_pp[c].destroy();
+            if (post_grade_pp[c].device) post_grade_pp[c].destroy();
         }
         if (history_b.handle) ctx.destroy(history_b);
         if (hpass.handle) ctx.destroy(hpass);
         // flow0_sampled aliases flow[0]; only its sampler is ours to free.
         if (motion_sampler) vkDestroySampler(ctx.device, motion_sampler, nullptr);
+        if (motion_point_sampler) vkDestroySampler(ctx.device, motion_point_sampler, nullptr);
         ctx.destroy(history);
         ctx.destroy(params);
     }
 };
 
 struct Runtime::Impl {
+    NetworkModel network = NetworkModel::Original;
+    float post_blend_scale = kPostBlendScale;   // this network's blend_scale
     NrSession session;
     nrvk::Kernel alpha, mask_pre, mask_resolve;
     // The linear-light path: the proxy is made in place on tex_in and the
@@ -366,6 +389,18 @@ struct Runtime::Impl {
     // pass writes the full-resolution answer; both are absent otherwise.
     uint32_t mw{}, mh{};
     bool scaled{};
+    // Why this runtime runs another network than it was asked for ("" when it runs the one asked for).
+    std::string network_note;
+    // The resize path: this runtime's images in a network memory's heap (nrvk::ImageHeap), when built inside a
+    // recording; stale once another runtime took the same region (Runtime::stale).
+    std::shared_ptr<nrvk::ImageHeap> heap;
+    uint32_t heap_region{};
+    uint64_t heap_gen{};
+    // The resize path (Runtime::share_for): the build's arguments without the source extent, its working extent
+    // (the native plan's padded one) and Model Resolution.
+    std::vector<std::string> share_arguments;
+    uint32_t work_w{}, work_h{};
+    float model_scale{1.0f};
     bool native_compose{};   // RuntimeConfig::native_compose
     // The post block restores the frame's alpha (and the 8-bit rounding) in its
     // own store, so the alpha pass is skipped: native compose, one pass, no
@@ -446,8 +481,9 @@ struct Runtime::Impl {
         return &f;
     }
     // Classic with a scaler other than bilinear: the model's answer enlarged to the frame by
-    // runtime_upscale.comp.
-    nrvk::Context::Image up_result{}, up_shown{};
+    // runtime_upscale.comp. The two passes also declare an `up_shown` binding that neither reads or
+    // writes; up_result is bound there too, rather than a frame-sized RGBA32F image of its own (4K: 127 MiB).
+    nrvk::Context::Image up_result{};
     nrvk::Kernel upscale_pass, upscale_prep;
     // Multi-pass: what the first pass was shown, kept for the transfer pass
     // because later passes overwrite tex_in; and one history per pass.
@@ -541,6 +577,9 @@ struct Runtime::Impl {
     static constexpr uint64_t kRetireAfter = 64;
     std::vector<std::pair<nrvk::Context::Image, uint64_t>> retiring;
     uint64_t recordings{};
+    // A runtime built inside a recording (RuntimeConfig::deferred): its images' first layout transitions as the first
+    // recording made them, kept to make again when a recording is dropped (drop_history).
+    std::vector<VkImageMemoryBarrier> first_transitions;
     // **The tone control is a frame edit and belongs to one pass.** NVIDIA's own
     // description of `LocalToneStrength` is "low-frequency details such as
     // broader lighting and colour response", and it enters the network as five
@@ -572,6 +611,14 @@ struct Runtime::Impl {
     const nrvk::Kernel* plain_pre{};
     const nrvk::Kernel* plain_post{};
     const nrvk::Kernel* original_pre{};
+    // The post block with the Style grade (g_fswinimagepost32_grade.spv, NR_STYLE_GRADE): dispatched in place of
+    // the graph's fswinimagepost32 for a pass whose Style is Natural or Cinematic, so Standard runs the pipeline
+    // without the grade's code. `graph_post` is the graph's own; no grade when the shader folder has none.
+    const nrvk::Kernel* graph_post{};
+    nrvk::Kernel post_grade;
+    bool style_grade{};
+    // [Network] Style Grade (Runtime::set_style_grade): false = the post block without the grade, as 0.0.6 ran it
+    bool style_grade_on{true};
     nrvk::Context::Image encoded;
     // An 8-bit frame: the answer is rounded as frame_image.py does before the
     // format-converting blit (alpha pass or the post block's store).
@@ -637,6 +684,7 @@ struct Runtime::Impl {
     std::vector<DepthSrc> depth_ring;
     bool depth_src_failed{}, depth_src_logged{};
     bool depth_unread{};   // this recording's depth/stencil buffer could not be read
+    bool motion_without_depth{};   // [Network] Motion Without Depth: the pre block ignores the depth, as the DLL
     VkDescriptorSet depth_source(VkImage image, VkFormat format) {
         if (depth_src_failed || !depth_copy.device) return VK_NULL_HANDLE;
         auto& t = temporal;
@@ -730,7 +778,10 @@ struct Runtime::Impl {
             nrvk::Context::Image cim = s.tex_in, dim = t.depth, mim = t.flow0_sampled;
             if (colour) { cim.handle = colour; cim.view = d.cview; cim.layout = VK_IMAGE_LAYOUT_GENERAL; }
             if (depth) { dim.handle = depth; dim.view = d.dview; dim.layout = VK_IMAGE_LAYOUT_GENERAL; }
-            if (motion) { mim.handle = motion; mim.view = d.mview; mim.layout = VK_IMAGE_LAYOUT_GENERAL; }
+            if (motion) {
+                mim.handle = motion; mim.view = d.mview; mim.layout = VK_IMAGE_LAYOUT_GENERAL;
+                if (t.motion_point_sampler) mim.sampler = t.motion_point_sampler;   // RuntimeConfig::motion_point
+            }
             nrvk::Context::Image surf0 = s.surf0;
             // the answer straight into the caller's image (same format as our own
             // answer image, storage usage): the post samples its own pixel's centre with
@@ -1004,7 +1055,6 @@ struct Runtime::Impl {
             if (f.pool) vkDestroyDescriptorPool(s.ctx.device, f.pool, nullptr);
         }
         if (up_result.handle) session.ctx.destroy(up_result);
-        if (up_shown.handle) session.ctx.destroy(up_shown);
         if (upscale_pass.device) upscale_pass.destroy();
         if (upscale_prep.device) upscale_prep.destroy();
         if (full_out.handle) session.ctx.destroy(full_out);
@@ -1020,6 +1070,7 @@ struct Runtime::Impl {
         for (auto& f : features) if (f.second.history.handle) session.ctx.destroy(f.second.history);
         for (auto& r : retiring) if (r.first.handle) session.ctx.destroy(r.first);
         if (mask_pre.device) mask_pre.destroy();
+        if (post_grade.device) post_grade.destroy();
         if (mask_resolve.device) mask_resolve.destroy();
         if (timing) { vkDestroyQueryPool(s.ctx.device, timing, nullptr); timing = VK_NULL_HANDLE; }
         if (check.buf.handle) s.ctx.destroy(check.buf);
@@ -1035,7 +1086,9 @@ struct Runtime::Impl {
         for (auto& entry : s.kern) if (entry.second.device) entry.second.destroy();
         s.ctx.destroy(s.tex_in); s.ctx.destroy(s.surf0); s.ctx.destroy(s.surf1);
         s.ctx.destroy(encoded);
-        s.ctx.destroy(s.act); s.ctx.destroy(s.wgt);
+        // The arenas go with the last runtime that uses them (NrSession::arenas, the resize path).
+        s.share.reset(); s.core.reset(); s.arenas.reset();
+        s.act = {}; s.wgt = {};
         // Do not destroy the host's instance, device or queue.
     }
 
@@ -1098,8 +1151,14 @@ struct Runtime::Impl {
             // into this blend, as each OptiScaler DLSS-NR pass is its own DLL
             // feature with its own Intensity.
             p.intensity = std::clamp(r.intensity, 0.0f, 2.0f);
-            p.w_off = (p.w_off & 0x3FFFFFFFu) |
-                      (post_alpha ? 0x80000000u | (round_u8 ? 0x40000000u : 0u) : 0u);
+            // Bits 28-29: the Style. For Natural and Cinematic the DLL grades the composed answer after the post
+            // block (cg2r_post_process_kernel); the *_grade post pipelines do the same
+            // (windows/shaders/rdna4/include/nr_style_grade.glsl). Non-zero bits select that pipeline at dispatch;
+            // they stay 0 without it. Controls are checked to 0..2 before they get here; the DLL clamps to its
+            // style count, 3.
+            p.w_off = (p.w_off & 0x0FFFFFFFu) |
+                      (post_alpha ? 0x80000000u | (round_u8 ? 0x40000000u : 0u) : 0u) |
+                      (style_grade && style_grade_on ? uint32_t(std::clamp(r.style, 0, 2)) << 28 : 0u);
             std::memcpy(blob.data() + offset, &p, sizeof p);
         } else if (kern.rfind("imgout", 0) == 0) {
             PushImgOut p{}; std::memcpy(&p, blob.data(), sizeof p);
@@ -1122,6 +1181,17 @@ struct Runtime::Impl {
             }
         }
     }
+};
+
+// What RuntimeConfig::share carries: a full build's lowered network (GraphCore in nr_graph.cpp) and what the build
+// that takes it must match - the same arguments but for the source extent, the same model and working extent, and a
+// source no taller than the one the network was built for.
+struct RuntimeCore {
+    std::shared_ptr<const GraphCore> graph;
+    std::shared_ptr<GraphArenas> slot;   // the network memory it runs in (null: the graph's own build's)
+    std::vector<std::string> arguments;
+    NetworkModel network{};
+    uint32_t work_w{}, work_h{}, source_w{}, source_h{};
 };
 
 Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config) : Runtime(host,config,ControlMaskConfig{}) {}
@@ -1169,19 +1239,56 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     // The model extent. At scale 1 it is the frame's own, unaligned, as every
     // game has run so far; below 1 it is rounded to a multiple of 8 (the
     // network's tile) and never above the frame.
-    auto model_extent = [&](uint32_t v) {
-        if (config.model_scale == 1.0f) return v;
-        uint32_t m = uint32_t(std::lround(double(v) * config.model_scale));
-        m = (m + 4) / 8 * 8;
-        return std::min(std::max(m, 8u), v);
-    };
-    const uint32_t mw = model_extent(config.width), mh = model_extent(config.height);
+    const uint32_t mw = model_extent(config.width, config.model_scale), mh = model_extent(config.height, config.model_scale);
     impl_->mw = mw; impl_->mh = mh; impl_->scaled = mw != config.width || mh != config.height;
+    // The model: the caller's choice over DLSSNR_MODEL over dlssnr-amd.ini [Network] Model; none of them: the
+    // small model. Its weights (dlssnr-small.bin, made by install.ps1 from the 310.9 DLL) are only in an installed
+    // tree; missing: the original model, and the log says why.
+    NetworkModel network = NetworkModel::Small;
+    {
+        std::string env;
+#ifdef _WIN32
+        { char b[16] = {}; const unsigned long n = GetEnvironmentVariableA("DLSSNR_MODEL", b, sizeof b); if (n && n < sizeof b) env = b; }
+#endif
+        if (env.empty()) if (const char* e = std::getenv("DLSSNR_MODEL")) env = e;
+        const int ev = env.empty() ? -1 : nr::network_value(env);
+        if (!env.empty() && ev < 0) nr::logf("[nr] DLSSNR_MODEL=%s is not small or original: ignored", env.c_str());
+        const int iv = config.network >= 0 || ev >= 0 ? -1 : nr::ini_network((data.parent_path() / "dlssnr-amd.ini").string());
+        const char* from = config.network >= 0 ? "caller" : ev >= 0 ? "DLSSNR_MODEL" : iv >= 0 ? "dlssnr-amd.ini" : "default";
+        const int v = config.network >= 0 ? config.network : ev >= 0 ? ev : iv;
+        if (v == 0) network = NetworkModel::Original;
+        std::error_code ec;
+        const char* missing = network != NetworkModel::Small ? nullptr
+            : !installed ? "not an installed tree"
+            : !std::filesystem::is_regular_file(data / "dlssnr-small.bin", ec) ? "dlssnr-amd/dlssnr-small.bin is missing (run install.ps1 with the 310.9.16 nvngx_dlssnr.dll)"
+            : nullptr;
+        if (missing) {
+            nr::logf("[nr] small model (%s) but %s: original model", from, missing);
+            impl_->network_note = missing;
+            network = NetworkModel::Original;
+        } else {
+            nr::logf("[nr] %s model (%s)", network == NetworkModel::Small ? "small" : "original", from);
+        }
+    }
+    impl_->network = network;
+    impl_->post_blend_scale = network == NetworkModel::Small ? kPostBlendScaleSmall : kPostBlendScale;
+    // [Network] Motion Without Depth = 1, the default: the pre block reads each pixel's own motion vector, as NVIDIA's
+    // DLLs (310.8, 310.9) do - their host never binds the depth, so the kernel's nearest-of-five depth pick never runs
+    // there (measured on an RTX 5090); it is also the closer and steadier one at moving edges (edge band vs NVIDIA,
+    // panning disc with jittered vectors: 43.6 dB, against 33.6 with the pick). 0: the depth picks where the vector
+    // is read when there is one.
+    {
+        std::string v = nr::ini_network_key((data.parent_path() / "dlssnr-amd.ini").string(), "motion without depth");
+        for (auto& ch : v) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+        impl_->motion_without_depth = !(v == "0" || v == "false" || v == "off" || v == "no");
+        if (!impl_->motion_without_depth)
+            nr::logf("[nr] motion vectors read where the depth picks (dlssnr-amd.ini [Network] Motion Without Depth = 0)");
+    }
     impl_->native_compose = config.native_compose;
     if (config.native_compose && impl_->scaled)
         throw std::runtime_error("native_compose needs model_scale 1: the DLL has no transfer pass to resample through");
     impl_->max_passes = config.max_passes;
-    const auto native = make_native_plan(mw, mh);
+    const auto native = make_native_plan(mw, mh, network);
     std::string plan_name = "compiled native descriptor";
     if (!config.plan.empty()) {
         const auto path = std::filesystem::canonical(config.plan);
@@ -1203,7 +1310,10 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     std::istringstream plan_stream(native.text);
     const auto prepared_plan = parse_plan(plan_stream);
     nr::PhaseTimer timer;
-    std::lock_guard<std::mutex> lock(build_mutex);
+    // One build at a time (the graph's layout globals); a runtime built inside a recording from a lowered network
+    // (RuntimeConfig::deferred) touches none of them and must not wait for a background build.
+    std::unique_lock<std::mutex> lock(build_mutex, std::defer_lock);
+    if (!config.deferred) lock.lock();
     auto& s = impl_->session;
     uint32_t count = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(host.physical, &count, nullptr);
@@ -1218,6 +1328,26 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         throw std::runtime_error("NR device unsupported: " + why);
     s.ctx.queue_lock = host.queue_lock; s.ctx.queue_unlock = host.queue_unlock;
     s.ctx.buffer_device_address = host.buffer_device_address;
+    s.ctx.defer_transitions = config.deferred;
+    s.ctx.registry_only = config.deferred;
+    // Built inside a recording in another runtime's network memory: the images from that memory's heap, in the region
+    // the runtime built there before this one did not use (nrvk::ImageHeap). Made, or made again bigger, here.
+    if (config.deferred && config.share && config.share->slot) {
+        // Never allocated here (a big allocation is a long stall on this thread): the heap is made in the background
+        // (Runtime::image_heap_wanted, allocate_image_heap); until it is there, or when it is too small for this size,
+        // the images take memory of their own.
+        GraphArenas& sl = *config.share->slot;
+        const VkDeviceSize want = VkDeviceSize(sl.bytes_per_px * double(config.width) * double(config.height));
+        if (sl.images && sl.images->region_cap < want)
+            sl.px_unfit = std::max(sl.px_unfit, double(config.width) * double(config.height));
+        if (sl.images && sl.bytes_per_px > 0 && sl.images->region_cap >= want) {
+            const uint32_t r = sl.next_region;
+            sl.next_region ^= 1u;
+            sl.images->gen[r] += 1; sl.images->cursor[r] = 0; sl.images->need[r] = 0;
+            impl_->heap = sl.images; impl_->heap_region = r; impl_->heap_gen = sl.images->gen[r];
+            s.ctx.heap = sl.images.get(); s.ctx.heap_region = r;
+        }
+    }
     s.ctx.require_matrix_config();
 #if NR_INT4
     // int4_mixed ([Int4Mixed] in dlssnr-amd.ini; DLSSNR_INT4 wins over the ini, the caller's choice - the in-game
@@ -1243,7 +1373,8 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     const std::filesystem::path i4root = data / "int4";
     if (int4_env == "1") {
         std::error_code ec;
-        const char* missing = !installed ? "not an installed tree"
+        const char* missing = network == NetworkModel::Small ? "the small model has no int4 network"
+            : !installed ? "not an installed tree"
             : !std::filesystem::is_directory(i4root / "shaders" / "temporal", ec) || !std::filesystem::is_directory(i4root / "vit", ec) ||
                       !std::filesystem::is_regular_file(i4root / "settings.txt", ec) ? "dlssnr-amd/int4/ is incomplete"
             : !std::filesystem::is_regular_file(data / "dlssnr-int4.bin", ec) ? "dlssnr-amd/dlssnr-int4.bin is missing (run install.ps1 again)"
@@ -1251,6 +1382,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
             : nullptr;
         if (missing) {
             nr::logf("[nr] int4_mixed requested (%s) but %s: default network", int4_from, missing);
+            impl_->network_note = missing;
         } else {
             if (!std::filesystem::is_directory(std::filesystem::path(aco) / "int4/records", ec))
                 throw std::runtime_error("the ACO INT4 records are missing");
@@ -1305,9 +1437,9 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     // The weights as one file (windows/build/pack_model.py); the names inside are
     // the relative paths the graph asks for under --unpacked.
     if (installed) {
-        const auto pack = data / "dlssnr.bin";
+        const auto pack = data / (network == NetworkModel::Small ? "dlssnr-small.bin" : "dlssnr.bin");
         if (!std::filesystem::is_regular_file(pack))
-            throw std::runtime_error("missing " + pack.string() + " (run install.sh again)");
+            throw std::runtime_error("missing " + pack.string() + " (run install.ps1 again)");
         arguments.push_back("--model-pack"); arguments.push_back(pack.string());
     }
     // One pass at the frame's own extent, not linear: every kernel only samples
@@ -1355,15 +1487,52 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
             arguments.push_back(std::to_string(unsigned(unorm)));
         }
     }
+    // The resize path (RuntimeConfig::share): the network of another source extent with this one's working extent,
+    // built with these same arguments but for the source extent, and this model.
+    {
+        // The colour format only sizes the input and answer images (the kernels sample one and store into the other
+        // without a format), so a network serves frames of another format too: a game that switches its colour
+        // buffer between R11G11B10 and RGBA16F at camera cuts (FF7 Rebirth) gets a runtime from the same network.
+        std::vector<std::string> same = arguments;
+        for (size_t i = 0; i + 1 < same.size(); ++i)
+            if (same[i] == "--source-width" || same[i] == "--source-height" || same[i] == "--tex-in-format" ||
+                same[i] == "--out0-format")
+                same[i + 1].clear();
+        if (config.share) {
+            const RuntimeCore& c = *config.share;
+            if (c.arguments == same && c.network == network && c.work_w == native.width && c.work_h == native.height &&
+                mh <= c.source_h) {
+                s.share = c.graph;
+                s.share_slot = c.slot;
+            }
+            else if (config.deferred)   // inside a recording: no whole build here (the caller builds in the background)
+                throw std::runtime_error("the network cannot be shared at this extent or format");
+            else
+                nr::logf("[nr] the %ux%u network cannot be shared at %ux%u; building one", c.source_w, c.source_h, mw, mh);
+        }
+        impl_->share_arguments = std::move(same);
+    }
+    impl_->work_w = native.width; impl_->work_h = native.height;
+    impl_->model_scale = config.model_scale;
     std::vector<char*> argv;
     for (auto& a : arguments) argv.push_back(a.data());
     timer.mark("device");
 #if NR_INT4
     const nr::BuildCfgScope cfg_scope(installed ? &int4_cfg : nullptr);   // what this build reads (nr_build_cfg.hpp)
 #endif
-    if (s.build(int(argv.size()), argv.data(), &prepared_plan) != 0 || !s.missing.empty())
+    s.plan_only = config.plan_only;
+    s.capacity = config.capacity;
+    s.given_act = config.act_arena ? config.act_arena->act : nullptr;
+    s.act_slack = config.act_slack;
+    const int built = s.build(int(argv.size()), argv.data(), &prepared_plan);
+    if (built != (config.plan_only ? 4 : 0) || !s.missing.empty())
         throw std::runtime_error("NR graph initialization failed");
     timer.mark("graph");
+    if (config.plan_only) {   // the lowering only (Runtime::plan); nothing else is made
+        impl_->width = config.width; impl_->height = config.height;
+        nr::logf("[nr] plan for %ux%u (working extent %ux%u) in %.2fs", mw, mh, native.width, native.height, timer.total());
+        return;
+    }
     impl_->width = config.width; impl_->height = config.height;
     // The runtime passes are the driver's compile in either case (the ACO bundle's are the same SPIR-V).
     const auto adapters = std::filesystem::canonical(config.adapter_shaders.empty()
@@ -1407,10 +1576,8 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
             impl_->full_out = s.ctx.image(config.width, config.height, VK_FORMAT_R32G32B32A32_SFLOAT, false);
             s.ctx.transition(impl_->full_out, VK_IMAGE_LAYOUT_GENERAL);
         }
-        for (auto* im : {&impl_->up_result, &impl_->up_shown}) {
-            *im = s.ctx.image(config.width, config.height, VK_FORMAT_R32G32B32A32_SFLOAT, false);
-            s.ctx.transition(*im, VK_IMAGE_LAYOUT_GENERAL);
-        }
+        impl_->up_result = s.ctx.image(config.width, config.height, VK_FORMAT_R32G32B32A32_SFLOAT, false);
+        s.ctx.transition(impl_->up_result, VK_IMAGE_LAYOUT_GENERAL);
         if (impl_->keep_native) {
             // Where the blit samples: a frame-sized probe holding each texel's column and row,
             // blitted down as the frame would be, read back into `taps` on the GPU. Frame and
@@ -1547,13 +1714,13 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         // Unscaled, the two enlargement bindings are never read; the model's answer stands in (an
         // RGBA32F image, as they are declared).
         nrvk::Context::Image* up_r = impl_->scaled ? &impl_->up_result : &s.surf0;
-        nrvk::Context::Image* up_s = impl_->scaled ? &impl_->up_shown : &s.surf0;
+        nrvk::Context::Image* up_s = up_r;   // up_shown: never accessed (see Impl::up_result)
         impl_->transfer_pass.create(s.ctx, (adapters / transfer_spv).string(), {}, sizeof(TransferPush),
                                {&s.surf0, shown, keep, answer, up_r, up_s});
         impl_->transfer_binds = {s.surf0, *shown, *keep, *answer, *up_r, *up_s};
         if (impl_->scaled)
             impl_->upscale_pass.create(s.ctx, (adapters / "runtime_upscale.spv").string(), {}, 20,
-                                       {&s.surf0, shown, &impl_->up_result, &impl_->up_shown});
+                                       {&s.surf0, shown, &impl_->up_result, &impl_->up_result});
     }
     if (config.preprocess && !mask_config.width) {
         impl_->prep = true;
@@ -1583,13 +1750,13 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
             nrvk::Context::Image* answer = impl_->store_native ? &keep_full_storage
                                            : impl_->scaled ? &impl_->full_out : &s.surf0;
             nrvk::Context::Image* up_r = impl_->scaled ? &impl_->up_result : answer;
-            nrvk::Context::Image* up_s = impl_->scaled ? &impl_->up_shown : answer;
+            nrvk::Context::Image* up_s = up_r;
             impl_->transfer_prep.create(s.ctx, (adapters / transfer_spv).string(), {},
                                         sizeof(TransferPush), {&s.surf0, &impl_->prep_keep, keep, answer, up_r, up_s});
             impl_->transfer_prep_binds = {s.surf0, impl_->prep_keep, *keep, *answer, *up_r, *up_s};
             if (impl_->scaled)
                 impl_->upscale_prep.create(s.ctx, (adapters / "runtime_upscale.spv").string(), {}, 20,
-                                           {&s.surf0, &impl_->prep_keep, &impl_->up_result, &impl_->up_shown});
+                                           {&s.surf0, &impl_->prep_keep, &impl_->up_result, &impl_->up_result});
         }
     }
     auto require_variant_profile = [&](const std::filesystem::path& directory) {
@@ -1633,6 +1800,18 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
             impl_->plain_pre = &s.kern.at(pn); impl_->plain_post = &s.kern.at("fswinimagepost32");
         }
     }
+    // The post block with the Style grade, built over the same bindings as the graph's; it is always bound with
+    // the set the plain pipeline would use (identically defined layouts), so only the pipeline differs.
+    std::filesystem::path grade_spv;
+    for (size_t i = 0; i + 1 < arguments.size(); ++i)
+        if (arguments[i] == "--spv-dir") grade_spv = std::filesystem::path(arguments[i + 1]) / "g_fswinimagepost32_grade.spv";
+    if (s.kern.count("fswinimagepost32") && std::filesystem::exists(grade_spv)) {
+        impl_->graph_post = &s.kern.at("fswinimagepost32");
+        impl_->post_grade.create(s.ctx, grade_spv.string(),
+                                 {s.act.handle, s.act.handle, s.wgt.handle, s.wgt.handle, s.wgt.handle},
+                                 impl_->graph_post->push_range, {&s.surf0, &s.surf1, &s.tex_in});
+        impl_->style_grade = true;
+    }
     if (temporal_config.enable) {
         auto& t = impl_->temporal;
         // The temporal pre/post blocks are network kernels: the ACO bundle's own SPIR-V when it is in use.
@@ -1663,8 +1842,16 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         for (unsigned p = 0; p < 2; ++p)
             for (unsigned k = 0; k < kTemporalLevels; ++k)
                 t.luma[p][k] = s.ctx.image(t.lw[k], t.lh[k], VK_FORMAT_R32_SFLOAT, false);
-        for (unsigned k = 0; k < kTemporalLevels; ++k)
-            t.flow[k] = s.ctx.image(t.lw[k], t.lh[k], VK_FORMAT_R32G32_SFLOAT, false);
+        // level 0 with the sampled usage too: flow0_sampled reads it through a sampler (the temporal pre and post
+        // kernels). The image itself stays a storage image to the kernels that write it (no sampler of its own).
+        for (unsigned k = 0; k < kTemporalLevels; ++k) {
+            t.flow[k] = s.ctx.image(t.lw[k], t.lh[k], VK_FORMAT_R32G32_SFLOAT, k == 0, k != 0);
+            if (k == 0) {   // in GENERAL like the others (a sampled image settles in SHADER_READ_ONLY_OPTIMAL)
+                vkDestroySampler(s.ctx.device, t.flow[k].sampler, nullptr);
+                t.flow[k].sampler = VK_NULL_HANDLE;
+                s.ctx.transition(t.flow[k], VK_IMAGE_LAYOUT_GENERAL);
+            }
+        }
         // The five-tap reconstruction's merged centre tap is only valid under
         // linear filtering, and the motion field wants the same. nrvk creates
         // NEAREST + MIRRORED_REPEAT because that is the shipping colour
@@ -1694,6 +1881,13 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         // sampled one. Same VkImage and view, two descriptors; the alias does
         // not own the image, so it must never be handed to ctx.destroy.
         t.motion_sampler = linear_sampler();
+        if (config.motion_point) {
+            VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+            si.magFilter = si.minFilter = VK_FILTER_NEAREST;
+            si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+            si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            NRVK_CHECK(vkCreateSampler(s.ctx.device, &si, nullptr, &t.motion_point_sampler));
+        }
         t.flow0_sampled = t.flow[0];
         t.flow0_sampled.sampler = t.motion_sampler;
         // Single channel and float: a depth buffer's value is all this reads, and
@@ -1773,14 +1967,23 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
                             : std::vector<nrvk::Context::Image*>{&s.tex_in, &t.flow0_sampled, &t.hist(c), &t.depth});
             // The post variant reads the same parameter buffer, the motion field and
             // the history the pre variant does: its blend is gated by the same term.
-            post.create(s.ctx, (shaders / (t.hp ? "temporal_post_fp32hp.spv" : t.h16 ? "temporal_post_fp32h16.spv" : "temporal_post_fp32.spv")).string(),
+            const std::string post_name = t.hp ? "temporal_post_fp32hp" : t.h16 ? "temporal_post_fp32h16" : "temporal_post_fp32";
+            const std::vector<nrvk::Context::Image*> post_images = t.hp
+                ? std::vector<nrvk::Context::Image*>{&s.surf0, t.pingpong ? &hist_store[c ^ 1u] : &s.surf1, &s.tex_in,
+                                                     &t.flow0_sampled, &t.hist(c), &t.hpass}
+                : std::vector<nrvk::Context::Image*>{&s.surf0, t.pingpong ? &hist_store[c ^ 1u] : &s.surf1, &s.tex_in,
+                                                     &t.flow0_sampled, &t.hist(c)};
+            post.create(s.ctx, (shaders / (post_name + ".spv")).string(),
                         {s.act.handle, s.act.handle, s.wgt.handle, s.wgt.handle, s.wgt.handle,
                          t.params.handle},
-                        sizeof(PushFSwin) + sizeof(PushUps) + sizeof(PushImageTail),
-                        t.hp ? std::vector<nrvk::Context::Image*>{&s.surf0, t.pingpong ? &hist_store[c ^ 1u] : &s.surf1, &s.tex_in,
-                                                                         &t.flow0_sampled, &t.hist(c), &t.hpass}
-                             : std::vector<nrvk::Context::Image*>{&s.surf0, t.pingpong ? &hist_store[c ^ 1u] : &s.surf1, &s.tex_in,
-                                                                         &t.flow0_sampled, &t.hist(c)});
+                        sizeof(PushFSwin) + sizeof(PushUps) + sizeof(PushImageTail), post_images);
+            // Its Style-grade twin (bound with post's sets at dispatch); without it no pass is graded.
+            if (impl_->style_grade && std::filesystem::exists(shaders / (post_name + "_grade.spv")))
+                (t.pingpong ? t.post_grade_pp[c] : t.post_grade).create(s.ctx, (shaders / (post_name + "_grade.spv")).string(),
+                        {s.act.handle, s.act.handle, s.wgt.handle, s.wgt.handle, s.wgt.handle,
+                         t.params.handle},
+                        sizeof(PushFSwin) + sizeof(PushUps) + sizeof(PushImageTail), post_images);
+            else impl_->style_grade = false;
         }
         t.history_strength = temporal_config.history_strength;
         t.enabled = true;
@@ -1832,17 +2035,332 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     timer.mark("adapters");
     // Built: from here on the caller serialises this runtime's submits itself.
     s.ctx.queue_lock = nullptr; s.ctx.queue_unlock = nullptr;
+    s.ctx.defer_transitions = false;   // its pending transitions stay for the first recording
+    s.ctx.registry_only = false;
+    // A whole network (its own memory): the image bytes a runtime of it takes per frame pixel, with the feature's
+    // history made at its first recording, and the biggest frame its memory runs - what an image heap for the
+    // runtimes built inside frames in this memory has to hold (Runtime::image_heap_wanted).
+    if (!config.share && s.arenas && !config.plan_only) {
+        const double px = double(config.width) * double(config.height);
+        const double hist = double(impl_->temporal.history.w) * impl_->temporal.history.h * 16;
+        s.arenas->bytes_per_px = (double(s.ctx.image_bytes) + hist) / px * 1.05;
+        s.arenas->max_px = px * std::max(1.0, config.capacity);   // the frames its arena has room for; px_unfit beyond
+    }
     nr::logf("[nr] runtime %ux%u built in %.2fs: %s", config.width, config.height, timer.total(),
              timer.text().c_str());
 }
 
 Runtime::~Runtime() = default;
 
+std::shared_ptr<const RuntimeCore> Runtime::share_for(uint32_t width, uint32_t height) const {
+    const auto& s = impl_->session;
+    if (!s.core || !width || !height) return nullptr;
+    const uint32_t mw = model_extent(width, impl_->model_scale), mh = model_extent(height, impl_->model_scale);
+    if (impl_->native_compose && (mw != width || mh != height)) return nullptr;
+    const auto native = make_native_plan(mw, mh, impl_->network);
+    if (native.width != impl_->work_w || native.height != impl_->work_h || mh > s.core->source_h) return nullptr;
+    auto c = std::make_shared<RuntimeCore>();
+    c->graph = s.core; c->slot = s.arenas; c->arguments = impl_->share_arguments; c->network = impl_->network;
+    c->work_w = impl_->work_w; c->work_h = impl_->work_h;
+    c->source_w = s.core->source_w; c->source_h = s.core->source_h;
+    return c;
+}
+
+void plan_extent(const RuntimeCore& plan, uint32_t* work_w, uint32_t* work_h, uint32_t* source_h) {
+    *work_w = plan.work_w; *work_h = plan.work_h; *source_h = plan.source_h;
+}
+
+void working_extent(NetworkModel model, float scale, uint32_t width, uint32_t height, uint32_t* work_w,
+                    uint32_t* work_h) {
+    const auto native = make_native_plan(model_extent(width, scale), model_extent(height, scale), model);
+    *work_w = native.width; *work_h = native.height;
+}
+
+uint32_t plan_height(NetworkModel model, float scale, uint32_t width, uint32_t height) {
+    uint32_t ww = 0, wh = 0, tw = 0, th = 0;
+    working_extent(model, scale, width, height, &ww, &wh);
+    uint32_t best = height;
+    // A working extent is at most a reduction step (128 rows) taller than the frame; frames up to it are tried.
+    for (uint32_t h = height + 1; h <= wh && h <= height + 256; ++h) {
+        working_extent(model, scale, width, h, &tw, &th);
+        if (tw == ww && th == wh) best = h;
+    }
+    return best;
+}
+
+std::shared_ptr<const RuntimeCore> Runtime::plan() const {
+    const auto& s = impl_->session;
+    if (!s.core) return nullptr;
+    auto c = std::make_shared<RuntimeCore>();
+    c->graph = s.core; c->arguments = impl_->share_arguments; c->network = impl_->network;
+    c->work_w = impl_->work_w; c->work_h = impl_->work_h;
+    c->source_w = s.core->source_w; c->source_h = s.core->source_h;
+    return c;
+}
+
+std::shared_ptr<const RuntimeCore> Runtime::with_slot_of(const std::shared_ptr<const RuntimeCore>& plan) const {
+    const auto& s = impl_->session;
+    if (!plan || !plan->graph || !s.arenas || plan->arguments != impl_->share_arguments || plan->network != impl_->network)
+        return nullptr;
+    const GraphCore& g = *plan->graph;
+    const GraphArenas& a = *s.arenas;
+    if (a.weights_hash != g.weights_hash || a.weights_end != g.weights_end || a.act->cap < g.act_total ||
+        a.wgt_cap < g.weights_end + g.tail.size())
+        return nullptr;
+    auto c = std::make_shared<RuntimeCore>(*plan);
+    c->slot = s.arenas;
+    return c;
+}
+
+const void* Runtime::network_id() const { return impl_->session.arenas.get(); }
+
+std::shared_ptr<ActArenaRef> Runtime::act_arena() const {
+    const auto& s = impl_->session;
+    if (!s.arenas || !s.arenas->act) return nullptr;
+    return std::make_shared<ActArenaRef>(ActArenaRef{s.arenas->act});
+}
+const void* Runtime::act_id() const {
+    const auto& s = impl_->session;
+    return s.arenas ? static_cast<const void*>(s.arenas->act.get()) : nullptr;
+}
+uint64_t act_arena_bytes(const ActArenaRef& a) { return a.act ? a.act->cap : 0; }
+const void* act_arena_id(const ActArenaRef& a) { return a.act.get(); }
+
+const std::string& Runtime::network_note() const { return impl_->network_note; }
+bool Runtime::motion_without_depth() const { return impl_->motion_without_depth; }
+
+// What Runtime::image_heap_wanted / allocate_image_heap / adopt_image_heap pass around.
+struct ImageHeapRef { std::shared_ptr<nrvk::ImageHeap> heap; };
+
+uint64_t Runtime::image_heap_wanted() const {
+    const auto& a = impl_->session.arenas;
+    if (!a || a->bytes_per_px <= 0 || a->max_px <= 0) return 0;
+    const VkDeviceSize region =
+        (VkDeviceSize(a->bytes_per_px * std::max(a->max_px, a->px_unfit * 1.1)) + 65535) / 65536 * 65536;
+    return a->images && a->images->region_cap >= region ? 0 : region;
+}
+
+std::shared_ptr<ImageHeapRef> allocate_image_heap(const HostDevice& host, uint64_t region) {
+    runtime_dispatch::Scope physical_scope(host.instance, host.physical_dispatch);
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};   // the memory type our images take
+    ii.imageType = VK_IMAGE_TYPE_2D; ii.format = VK_FORMAT_R32G32B32A32_SFLOAT; ii.extent = {8, 8, 1};
+    ii.mipLevels = ii.arrayLayers = 1; ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+               VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    VkImage probe{};
+    if (vkCreateImage(host.device, &ii, nullptr, &probe) != VK_SUCCESS) return nullptr;
+    VkMemoryRequirements req{}; vkGetImageMemoryRequirements(host.device, probe, &req);
+    vkDestroyImage(host.device, probe, nullptr);
+    VkPhysicalDeviceMemoryProperties mem{}; vkGetPhysicalDeviceMemoryProperties(host.physical, &mem);
+    uint32_t type = mem.memoryTypeCount;
+    for (uint32_t i = 0; i < mem.memoryTypeCount; ++i)
+        if ((req.memoryTypeBits & (1u << i)) && (mem.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+            type = i; break;
+        }
+    if (type == mem.memoryTypeCount) return nullptr;
+    auto heap = std::make_shared<nrvk::ImageHeap>();
+    heap->device = host.device; heap->type = type; heap->region_cap = region;
+    VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    alloc.allocationSize = region * 2; alloc.memoryTypeIndex = type;
+    if (vkAllocateMemory(host.device, &alloc, nullptr, &heap->memory) != VK_SUCCESS) return nullptr;
+    auto ref = std::make_shared<ImageHeapRef>();
+    ref->heap = std::move(heap);
+    return ref;
+}
+
+void Runtime::adopt_image_heap(const std::shared_ptr<ImageHeapRef>& ref) {
+    auto& a = impl_->session.arenas;
+    if (!a || !ref || !ref->heap) return;
+    if (a->images && a->images->region_cap >= ref->heap->region_cap) return;
+    a->images = ref->heap;   // the old one stays with the runtimes in it
+    nr::logf("[nr] image heap for the network's frame sizes: 2 x %.0f MiB", double(a->images->region_cap) / (1 << 20));
+}
+
+const void* core_network(const RuntimeCore& core) {
+    return core.slot ? static_cast<const void*>(core.slot.get())
+                     : core.graph ? static_cast<const void*>(core.graph->arenas.get()) : nullptr;
+}
+std::shared_ptr<ActArenaRef> core_act_arena(const RuntimeCore& core) {
+    GraphArenas* a = core.slot ? core.slot.get() : core.graph ? core.graph->arenas.get() : nullptr;
+    return a && a->act ? std::make_shared<ActArenaRef>(ActArenaRef{a->act}) : nullptr;
+}
+bool network_offloaded(const RuntimeCore& core) {
+    const GraphArenas* a = core.slot ? core.slot.get() : core.graph ? core.graph->arenas.get() : nullptr;
+    return a && !a->wgt.handle && !a->host_weights.empty();
+}
+uint64_t network_ram_bytes(const RuntimeCore& core) {
+    const GraphArenas* a = core.slot ? core.slot.get() : core.graph ? core.graph->arenas.get() : nullptr;
+    return a ? a->host_weights.size() : 0;
+}
+
+static bool adopt_for(nrvk::Context& ctx, const HostDevice& host) {
+    std::string why;
+    if (!ctx.adopt(host.instance, host.physical, host.device, host.queue, host.queue_family, &why)) {
+        nr::logf("[nr] the network's memory cannot be moved: %s", why.c_str());
+        return false;
+    }
+    ctx.queue_lock = host.queue_lock; ctx.queue_unlock = host.queue_unlock;
+    ctx.buffer_device_address = host.buffer_device_address;
+    return true;
+}
+
+// Offload in two halves: the read-back on a worker thread (nothing of the network changes), the release on the thread
+// that records (the render thread reads these arenas while it picks an activation arena for a build).
+bool download_network_weights(const HostDevice& host, const RuntimeCore& core, std::vector<uint8_t>& out) {
+    const GraphArenas* a = core.slot ? core.slot.get() : core.graph ? core.graph->arenas.get() : nullptr;
+    if (!a || !a->wgt.handle || !a->weights_end) return false;
+    nrvk::Context ctx;
+    if (!adopt_for(ctx, host)) return false;
+    try {
+        std::vector<uint8_t> w(a->weights_end);
+        ctx.download(const_cast<nrvk::Buffer&>(a->wgt), 0, w.data(), w.size());
+        out = std::move(w);
+    } catch (const std::exception& e) {
+        nr::logf("[nr] the network's weights could not be read back: %s", e.what());
+        return false;
+    }
+    return true;
+}
+
+void release_network(const RuntimeCore& core, std::vector<uint8_t>&& weights) {
+    GraphArenas* a = core.slot ? core.slot.get() : core.graph ? core.graph->arenas.get() : nullptr;
+    if (!a || !a->wgt.handle || weights.size() != a->weights_end) return;
+    a->host_weights = std::move(weights);
+    if (a->noise.device) a->noise.destroy();
+    a->noise = nrvk::Kernel{};
+    if (a->wgt.mapped) vkUnmapMemory(a->device, a->wgt.memory);
+    vkDestroyBuffer(a->device, a->wgt.handle, nullptr);
+    vkFreeMemory(a->device, a->wgt.memory, nullptr);
+    a->wgt = nrvk::Buffer{};
+    a->act_want = a->act_need ? a->act_need : a->act ? a->act->cap : a->act_want;
+    a->act.reset();
+    a->loaded = 0;
+}
+
+bool offload_network(const HostDevice& host, const RuntimeCore& core) {
+    std::vector<uint8_t> w;
+    if (!download_network_weights(host, core, w)) return false;
+    release_network(core, std::move(w));
+    return network_offloaded(core);
+}
+
+bool reload_network(const HostDevice& host, const RuntimeCore& core, const std::shared_ptr<ActArenaRef>& act, double slack) {
+    GraphArenas* a = core.slot ? core.slot.get() : core.graph ? core.graph->arenas.get() : nullptr;
+    if (!a || a->wgt.handle || a->host_weights.empty()) return false;
+    nrvk::Context ctx;
+    if (!adopt_for(ctx, host)) return false;
+    // everything made first, committed together: a failure leaves the network as it was (offloaded)
+    std::shared_ptr<GraphAct> arena = a->act;
+    if (!arena) {
+        if (act && act->act && act->act->device == a->device && act->act->cap >= a->act_want) {
+            arena = act->act;
+        } else {
+            auto g = std::make_shared<GraphAct>();
+            g->device = a->device; g->cap = size_t(double(a->act_want) * std::max(1.0, slack) + 255) / 256 * 256;
+            g->buf = ctx.buffer(g->cap, false, /*device_address=*/true);   // freed by ~GraphAct if what follows throws
+            arena = std::move(g);
+        }
+    }
+    nrvk::Buffer w = ctx.buffer(a->wgt_cap);
+    try {
+        ctx.upload(w, 0, a->host_weights.data(), a->host_weights.size());
+    } catch (...) {
+        ctx.destroy(w);
+        throw;
+    }
+    a->wgt = w;
+    a->act = std::move(arena);
+    a->loaded = 0;   // the tail and the noise fields: the first recording (retarget)
+    std::vector<uint8_t>().swap(a->host_weights);
+    return true;
+}
+
+bool core_runs(const RuntimeCore& c, uint32_t width, uint32_t height, float scale, bool native_compose) {
+    const uint32_t mw = model_extent(width, scale), mh = model_extent(height, scale);
+    if (native_compose && (mw != width || mh != height)) return false;
+    const auto native = make_native_plan(mw, mh, c.network);
+    return native.width == c.work_w && native.height == c.work_h && mh <= c.source_h;
+}
+
+void release_image_heap(const RuntimeCore& core) {
+    GraphArenas* a = core.slot ? core.slot.get() : core.graph ? core.graph->arenas.get() : nullptr;
+    if (a) a->images.reset();
+}
+
+bool image_heap_fits(const RuntimeCore& core, uint32_t width, uint32_t height) {
+    const GraphArenas* a = core.slot ? core.slot.get() : core.graph ? core.graph->arenas.get() : nullptr;
+    return a && a->images && a->bytes_per_px > 0 &&
+           a->images->region_cap >= VkDeviceSize(a->bytes_per_px * double(width) * double(height));
+}
+
+bool Runtime::owns_image_memory() const {
+    return impl_->session.share && !impl_->heap;
+}
+
+bool Runtime::carry_history(VkCommandBuffer cmd, const Runtime& from, uint64_t feature) {
+    auto& t = impl_->temporal;
+    auto& ft = from.impl_->temporal;
+    if (!cmd || !feature || !t.enabled || !ft.enabled || impl_->max_passes != 1 || from.impl_->max_passes != 1 ||
+        from.stale() || stale())
+        return false;
+    const auto fit = from.impl_->features.find(feature);
+    if (fit == from.impl_->features.end() || !fit->second.latch) return false;
+    // What the feature's next frame would have read there: the bound history, or its own image.
+    const nrvk::Context::Image& src = from.impl_->bound_feature == feature ? ft.hist(ft.hcur) : fit->second.history;
+    if (!src.handle) return false;
+    auto& s = impl_->session;
+    auto it = impl_->features.find(feature);
+    if (it == impl_->features.end()) {
+        Impl::FeatureState made{};
+        // sampled as well, as temporal.history is: the temporal kernels read a feature's history through a sampler
+        made.history = s.ctx.image(t.history.w, t.history.h, t.history.format, true, false);
+        it = impl_->features.emplace(feature, made).first;
+    }
+    Impl::FeatureState& fs = it->second;
+    // Into what this runtime's next recording of the feature reads: the bound history when it is bound, else its
+    // own image (record_all copies that in when it binds it).
+    const bool bound = impl_->bound_feature == feature;
+    nrvk::Context::Image& dst = bound ? t.hist(t.hcur) : fs.history;
+    const VkImageLayout dst_from = bound || fs.cleared ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier(cmd, src.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    barrier(cmd, dst.handle, dst_from, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_ACCESS_TRANSFER_WRITE_BIT);
+    VkImageBlit b{};
+    b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    b.srcOffsets[1] = {int32_t(src.w), int32_t(src.h), 1};
+    b.dstOffsets[1] = {int32_t(dst.w), int32_t(dst.h), 1};
+    const VkFilter filter = impl_->filters_linearly(src.format) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    vkCmdBlitImage(cmd, src.handle, VK_IMAGE_LAYOUT_GENERAL, dst.handle, VK_IMAGE_LAYOUT_GENERAL, 1, &b, filter);
+    barrier(cmd, dst.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    barrier(cmd, src.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0);
+    dst.layout = VK_IMAGE_LAYOUT_GENERAL;
+    if (!bound) fs.cleared = true;
+    // The feature goes on as it was: history consumed, the noise counter where it was.
+    fs.latch = true;
+    fs.seed = fit->second.seed;
+    fs.parity = fit->second.parity;
+    fs.prep_gen = impl_->prep_gen;
+    return true;
+}
+
+bool Runtime::stale() const {
+    const auto& h = impl_->heap;
+    return h && h->gen[impl_->heap_region] != impl_->heap_gen;
+}
+
 uint32_t Runtime::model_width() const { return impl_->mw; }
 uint32_t Runtime::model_height() const { return impl_->mh; }
+NetworkModel Runtime::network() const { return impl_->network; }
 #if NR_INT4
 bool Runtime::int4_mixed() const { return impl_->int4_mixed; }
 #endif
+
+void Runtime::set_style_grade(bool on) { impl_->style_grade_on = on; }
 
 void Runtime::set_white_point(float v) {
     if (impl_->linear) impl_->white_point = v > 1e-4f ? v : 1e-4f;
@@ -1873,6 +2391,15 @@ void Runtime::drop_history() {
     impl_->temporal.latch = false;
     for (auto& f : impl_->features) { f.second.latch = false; f.second.cleared = false; }
     impl_->bound_feature = 0;
+    // Nor did what it made ready (the bridge: a job runs only when the game runs its command list): a runtime built
+    // inside a recording records its images' first transitions again (from UNDEFINED: their content is not wanted,
+    // the history starts again anyway), and the network memory is zeroed and loaded for this plan again (retarget).
+    auto& s = impl_->session;
+    if (!impl_->first_transitions.empty()) s.ctx.pending = impl_->first_transitions;
+    if (s.arenas) {
+        s.arenas->loaded = 0;
+        if (s.arenas->act) s.arenas->act->loaded = 0;
+    }
 }
 
 void Runtime::forget_history() {
@@ -1950,6 +2477,7 @@ EngineResult Runtime::record_engine(VkCommandBuffer cmd, const EngineFrame& fram
 ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& frame, const Controls& c,
                              const ControlMaskFrame* mask, const TemporalFrame* temporal,
                              bool* history_consumed, const EngineFrame* engine) {
+    if (stale()) throw std::logic_error("a runtime whose images another one has taken over (Runtime::stale)");
     validate(c);
     if (!cmd || !frame.image || frame.format != impl_->colour_format ||
         frame.width != impl_->width || frame.height != impl_->height ||
@@ -1976,7 +2504,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     if (c.enabled && temporal && impl_->temporal.enabled && temporal->feature && !impl_->features.count(temporal->feature)) {
         const auto& th = impl_->temporal.history;
         Impl::FeatureState made{};
-        made.history = impl_->session.ctx.image(th.w, th.h, th.format, false, false);
+        made.history = impl_->session.ctx.image(th.w, th.h, th.format, true, false);
         impl_->features.emplace(temporal->feature, made);
     }
     ControlMaskResult result{};
@@ -2028,6 +2556,15 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         barrier(cmd,t.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,t.after,VK_PIPELINE_STAGE_TRANSFER_BIT,
                 VK_ACCESS_TRANSFER_READ_BIT,t.after_stage,t.after_access);
     }
+    // A runtime built inside a recording (RuntimeConfig::deferred): its images' first layout transitions, here.
+    if (!s.ctx.pending.empty()) {
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
+                             0, nullptr, uint32_t(s.ctx.pending.size()), s.ctx.pending.data());
+        if (impl_->first_transitions.empty()) impl_->first_transitions = s.ctx.pending;
+        s.ctx.pending.clear();
+    }
+    // The resize path: the network memory made ready for this runtime's plan when another one used it last.
+    s.retarget(cmd);
     impl_->controls(effective);
     impl_->check_read();
     if (engine && temporal)
@@ -2057,7 +2594,10 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     // the depth in place is a separate question. A depth that still needs its blit or
     // conversion (render-resolution guides after SR, a subrect, depth/stencil) goes through
     // t.depth as before, and the colour is sampled in place (and the answer stored) anyway.
-    const bool depth_in_place = colour_direct && engine->depth.image &&
+    // The game's depth, when the network reads it: with Motion Without Depth (the default, as NVIDIA's DLL) it is
+    // neither bound nor copied.
+    const bool game_depth = engine && engine->depth.image && !impl_->motion_without_depth;
+    const bool depth_in_place = colour_direct && game_depth &&
         engine->depth.format == VK_FORMAT_R32_SFLOAT && (engine->depth.usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
         engine->depth_x == 0 && engine->depth_y == 0 &&
         engine->depth.width == impl_->temporal.depth.w && engine->depth.height == impl_->temporal.depth.h;
@@ -2302,7 +2842,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
             // No settling transition: that is a submit and a fence wait, and
             // this is the render thread inside a recording. The barrier below
             // does it in the command buffer instead.
-            made.history = s.ctx.image(t.history.w, t.history.h, t.history.format, false, false);
+            made.history = s.ctx.image(t.history.w, t.history.h, t.history.format, true, false);
             it = impl_->features.emplace(temporal->feature, made).first;
         }
         fs = &it->second;
@@ -2363,12 +2903,12 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
             // image, so the consumer has a single descriptor whether or not the
             // game supplies depth this frame.
             impl_->depth_unread = false;
-            if (engine->depth.image && depth_direct) {
+            if (game_depth && depth_direct) {
                 // Sampled in place (Impl::DirectSrc); put back after the passes.
                 barrier(cmd, engine->depth.image, engine->depth.before, VK_IMAGE_LAYOUT_GENERAL,
                         engine->depth.before_stage, engine->depth.before_access,
                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
-            } else if (engine->depth.image && depth_stencil_aspects(engine->depth.format)) {
+            } else if (game_depth && depth_stencil_aspects(engine->depth.format)) {
                 // A depth/stencil buffer: sampled through a depth-aspect view
                 // (runtime_depth.comp), because a blit may not convert it.
                 const VkImageAspectFlags aspects = depth_stencil_aspects(engine->depth.format);
@@ -2395,7 +2935,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                 } else {
                     impl_->depth_unread = true;
                 }
-            } else if (engine->depth.image) {
+            } else if (game_depth) {
                 barrier(cmd, engine->depth.image, engine->depth.before,
                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, engine->depth.before_stage,
                         engine->depth.before_access, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -2447,7 +2987,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         }
         // The estimator writes normalized backward motion, so the consumer's
         // MVecScale pair is 1.0.
-        const bool have_depth = engine && engine->depth.image && !impl_->depth_unread;
+        const bool have_depth = engine && engine->depth.image && !impl_->depth_unread && !impl_->motion_without_depth;
         // [8..11]: where the frame's uv lands in the motion texture, uv * [8..9]
         // + [10..11] - the region's share of the allocation and its base, when
         // it is sampled in place; else 1 and 0 (the field covers the frame).
@@ -2458,7 +2998,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         const float params[12] = {gate ? 1.0f : 0.0f,
                                   engine ? engine->motion_scale_x : 1.0f,
                                   engine ? engine->motion_scale_y : 1.0f,
-                                  t.history_strength * kPostBlendScale,
+                                  t.history_strength * impl_->post_blend_scale,
                                   float(t.history.w), float(t.history.h),
                                   have_depth ? 1.0f : 0.0f,
                                   have_depth && engine->depth_inverted ? 1.0f : 0.0f,
@@ -2581,6 +3121,19 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
             if (pass > 0 && pass < impl_->pass_push.size() &&
                 i < impl_->pass_push[pass].size() && !impl_->pass_push[pass][i].empty())
                 push = impl_->pass_push[pass][i].data();
+            // A Style in the post block's push (bits 28-29, set only when the grade pipelines exist): its grade
+            // twin, over the set the plain one would bind.
+            if (impl_->style_grade && step.k == impl_->graph_post) {
+                uint32_t w_off = 0;
+                std::memcpy(&w_off, static_cast<const uint8_t*>(push) + sizeof(PushFSwin) + sizeof(PushUps), 4);
+                if (w_off & 0x30000000u) {
+                    if (!set) set = use->set;
+                    if (use == impl_->graph_post) use = &impl_->post_grade;
+                    else if (use == &t.post) use = &t.post_grade;
+                    else if (use == &t.post_pp[0] || use == &t.post_pp[1]) use = &t.post_grade_pp[use - t.post_pp];
+                    else throw std::runtime_error("Style grade: no grade pipeline for this post block");
+                }
+            }
             // This frame's noise seed, computed in the shader: the precomputed
             // field is seed 0's.
             uint8_t pre_push[kPrePushBytes];
@@ -2785,7 +3338,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                 engine->motion.after_stage, engine->motion.after_access);
     if (engine && temporal)
         impl_->incheck.end(s.ctx, cmd, tgt && (tgt->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ? *tgt : frame, *engine, impl_->temporal.flow[0], impl_->temporal.depth,
-                           depth_direct, engine->depth.image && !impl_->depth_unread,
+                           depth_direct, game_depth && !impl_->depth_unread,
                            history_consumed && *history_consumed, impl_->mw, impl_->mh, mv_direct);
     if (impl_->timing_ok) {
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, impl_->timing,

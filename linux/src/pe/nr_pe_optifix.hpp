@@ -15,6 +15,8 @@
 //    list (S.T.A.L.K.E.R. 2's first FSR context): see release_hold.
 // 5. IsHDR clear but AutoExposure set on a float colour (007 First Light, Helldivers 2): treated as
 //    linear HDR so OptiScaler encodes it: see fix_autoexposure_hdr.
+// 8. A frame-size change re-creates the D3D12 NR feature, so a game's dynamic resolution with NR before the upscaler
+//    skips NR on every size change: the feature is kept across sizes (fix_feature_resize).
 //
 // 1. The device-extension query:
 //

@@ -1,0 +1,55 @@
+#version 460
+// Passes (fast), after the network: one pass over the network's extent. The lightness edit dL = L(N) - L(P) (OKLab L)
+// once a pixel, in shared memory with a 2-pixel border; its fine part dL - binomial5x5(dL), with L(N), into Fine; and
+// the guided filter's 4 x 4 cell means of the edit against L(P) into OutA / OutB (src 0: the lightness edit, 1: the RGB
+// edit N - P). The arithmetic and the order of every sum are those of the separate steps it replaces.
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) uniform texture2D P;
+layout(set = 0, binding = 1) uniform texture2D N;
+layout(set = 0, binding = 4, rg16f) uniform writeonly image2D Fine;   // the fine part, L(N)
+layout(set = 0, binding = 5, rgba32f) uniform writeonly image2D OutA;
+layout(set = 0, binding = 6, rgba32f) uniform writeonly image2D OutB;
+layout(push_constant) uniform Push { uvec2 size, low; uint src; } pc;
+#include "st_math.glsl"
+shared float s_dl[20][20], s_ln[20][20], s_lp[20][20];
+shared vec3 s_v[16][16];
+void main() {
+    const ivec2 org = ivec2(gl_WorkGroupID.xy) * 16;
+    const ivec2 lid = ivec2(gl_LocalInvocationID.xy);
+    // the tile and its border, edge texels repeated
+    for (uint i = gl_LocalInvocationIndex; i < 400u; i += 256u) {
+        const ivec2 t = clamp(org - 2 + ivec2(i % 20u, i / 20u), ivec2(0), ivec2(pc.size) - 1);
+        const float ln = st_lab(texelFetch(N, t, 0).rgb).x, lp = st_lab(texelFetch(P, t, 0).rgb).x;
+        s_dl[i / 20u][i % 20u] = ln - lp; s_ln[i / 20u][i % 20u] = ln; s_lp[i / 20u][i % 20u] = lp;
+    }
+    const ivec2 px = org + lid;
+    const bool inside = all(lessThan(px, ivec2(pc.size)));
+    if (pc.src != 0u && inside) s_v[lid.y][lid.x] = texelFetch(N, px, 0).rgb - texelFetch(P, px, 0).rgb;
+    barrier();
+    if (inside) {
+        const float w[5] = float[5](1.0, 4.0, 6.0, 4.0, 1.0);
+        float s = 0.0;
+        for (int y = -2; y <= 2; ++y)
+            for (int x = -2; x <= 2; ++x) s += w[x + 2] * w[y + 2] * s_dl[lid.y + 2 + y][lid.x + 2 + x];
+        imageStore(Fine, px, vec4(s_dl[lid.y + 2][lid.x + 2] - s / 256.0, s_ln[lid.y + 2][lid.x + 2], 0.0, 0.0));
+    }
+    // 16 threads, one 4 x 4 cell each
+    if (lid.x < 4 && lid.y < 4) {
+        const uvec2 q = gl_WorkGroupID.xy * 4u + uvec2(lid);
+        if (all(lessThan(q, pc.low))) {
+            vec4 A = vec4(0.0), B = vec4(0.0); float c = 0.0;
+            for (uint y = 0u; y < 4u; ++y)
+                for (uint x = 0u; x < 4u; ++x) {
+                    const uvec2 p = q * 4u + uvec2(x, y);
+                    if (any(greaterThanEqual(p, pc.size))) continue;
+                    const uvec2 l = p - uvec2(org);
+                    const float I = s_lp[l.y + 2u][l.x + 2u];
+                    const vec3 v = pc.src == 0u ? vec3(s_dl[l.y + 2u][l.x + 2u], 0.0, 0.0) : s_v[l.y][l.x];
+                    A += vec4(I, I * I, v.r, v.g); B += vec4(v.b, I * v); c += 1.0;
+                }
+            imageStore(OutA, ivec2(q), A / max(c, 1.0)); imageStore(OutB, ivec2(q), B / max(c, 1.0));
+        }
+    }
+}

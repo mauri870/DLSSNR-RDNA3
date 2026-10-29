@@ -9,7 +9,9 @@
 // (ProcessInline: the stack loop, RunLookStage, the write-back). codec_gain.hpp is
 // included as it is. The shaders are RenoDX's, compiled for Vulkan as RenoDX compiles them.
 #include "nr_renodx.hpp"
+#include "nr_gpu_completion.hpp"
 #include "nr_log.hpp"
+#include "nr_vram_tag.hpp"
 #include "renodx/codec_gain.hpp"
 
 #include <algorithm>
@@ -131,6 +133,93 @@ struct V6Constants {
     uint32_t padding[2];
 };
 static_assert(sizeof(V6Constants) == 28 * 4);
+// The _prep builds' cbuffer (v6_common.hlsli under NR_PREP_RESOLVE): dwords 26 / 27 (V6Constants::padding) carry
+// [Preprocess]'s curve and its input scale, then its contrast and saturation.
+struct V6PrepConstants {
+    V6Constants v;
+    float contrast, saturation;
+    float floor;   // prep_floor()
+};
+static_assert(sizeof(V6PrepConstants) == 31 * 4);
+
+// PrepBackward(float3(1/1024)).y of linux/shaders/renodx-prep/prep_resolve.hlsli (prep_math.glsl's backward()
+// without the gain) on the CPU: the resolve's floor behind [Preprocess]'s curve, the same for every pixel.
+float prep_floor(uint32_t curve, float k, float contrast, float saturation) {
+    const float y = 1.0f / 1024.0f;
+    float v[3] = {y, y, y};
+    auto each = [&](float (*f)(float)) { for (float& c : v) c = f(c) / k; };
+    switch (curve) {
+        case 1: {   // neutral: below its start the identity (1/1024 always is)
+            for (float& c : v) c /= k;
+            break;
+        }
+        case 2: each([](float c) { c = std::min(c, 0.9999f); return c / (1.0f - c); }); break;
+        case 3: each([](float c) {
+            const float A = 0.15f, B = 0.50f, C = 0.10f, D = 0.20f, E = 0.02f, F = 0.30f;
+            auto h1 = [&](float x) { return ((x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F)) - E / F; };
+            const float t = std::min(c * h1(11.2f) + E / F, 0.999f);
+            const float qa = A * (1.0f - t), qb = C * B - B * t, qc = D * E - D * F * t;
+            return std::max((-qb + std::sqrt(std::max(qb * qb - 4.0f * qa * qc, 0.0f))) / (2.0f * qa), 0.0f);
+        }); break;
+        case 4: each([](float c) {   // gt's toe (1/1024 < m): Newton on t = x / m, as gt_inv1
+            const float m = 0.22f, cc = 1.33f;
+            float t = std::pow(std::max(c, 0.0f) / m, 1.0f / cc);
+            for (int i = 0; i < 4; ++i) {
+                const float s = t * t * (3.0f - 2.0f * t), ds = 6.0f * t * (1.0f - t), tc = std::pow(t, cc);
+                const float g = tc * (1.0f - s) + t * s - c / m;
+                const float dg = cc * std::pow(std::max(t, 1e-20f), cc - 1.0f) * (1.0f - s) - tc * ds + s + t * ds;
+                t = std::clamp(t - g / std::max(dg, 1e-6f), 0.0f, 1.0f);
+            }
+            return m * t;
+        }); break;
+        case 5: each([](float c) {
+            c = std::min(c, 0.9999f);
+            const float qa = 2.51f - 2.43f * c, qb = 0.03f - 0.59f * c, qc = -0.14f * c;
+            return std::max((-qb + std::sqrt(std::max(qb * qb - 4.0f * qa * qc, 0.0f))) / (2.0f * qa), 0.0f);
+        }); break;
+        case 6: {   // agx: inverse(AGX_OUT) = AGX_IN, the sigmoid's inverse, exp2, inverse(AGX_IN) = AGX_OUT
+            static const float in[3][3] = {{0.842479062253094f, 0.0423282422610123f, 0.0423756549057051f},
+                                           {0.0784335999999992f, 0.878468636469772f, 0.0784336f},
+                                           {0.0792237451477643f, 0.0791661274605434f, 0.879142973793104f}};
+            static const float out[3][3] = {{1.19687900512017f, -0.0528968517574562f, -0.0529716355144438f},
+                                            {-0.0980208811401368f, 1.15190312990417f, -0.0980434501171241f},
+                                            {-0.0990297440797205f, -0.0989611768448433f, 1.15107367264116f}};
+            auto sig = [](float x) { const float x2 = x * x, x4 = x2 * x2;
+                return 15.5f * x4 * x2 - 40.14f * x4 * x + 31.96f * x4 - 6.868f * x2 * x + 0.4298f * x2 + 0.1191f * x - 0.00232f; };
+            auto dsig = [](float x) { const float x2 = x * x, x4 = x2 * x2;
+                return 93.0f * x4 * x - 200.7f * x4 + 127.84f * x2 * x - 20.604f * x2 + 0.8596f * x + 0.1191f; };
+            const float g = std::pow(y, 1.0f / 2.2f);
+            float u[3] = {}, w[3] = {};
+            for (int col = 0; col < 3; ++col) for (int r = 0; r < 3; ++r) u[r] += in[col][r] * g;
+            for (float& c : u) {
+                c = std::clamp(c, sig(0.0f), sig(1.0f));
+                float lo = 0.0f, hi = 1.0f;
+                for (int i = 0; i < 8; ++i) { const float mid = 0.5f * (lo + hi); if (sig(mid) < c) lo = mid; else hi = mid; }
+                float x = 0.5f * (lo + hi);
+                for (int i = 0; i < 3; ++i) x = std::clamp(x - (sig(x) - c) / dsig(x), lo, hi);
+                c = std::exp2(x * (4.026069f + 12.47393f) - 12.47393f);
+            }
+            for (int col = 0; col < 3; ++col) for (int r = 0; r < 3; ++r) w[r] += out[col][r] * u[col];
+            for (int i = 0; i < 3; ++i) v[i] = w[i] / k;
+            break;
+        }
+        case 7: {   // v6_encode's toe; the floor is below the shoulder.
+            const float b = y - 0.014f - 0.001f;
+            const float root = std::sqrt(b * b + 4.0f * y * 0.001f);
+            for (float& c : v) c = 2.0f * y * 0.001f / (root - b);
+            break;
+        }
+        // 8: the classic codec's shoulder is the identity at the floor.
+        default: break;
+    }
+    if (saturation != 1.0f) {
+        const float l = 0.2126f * v[0] + 0.7152f * v[1] + 0.0722f * v[2];
+        for (float& c : v) c = l + (c - l) / saturation;
+    }
+    if (contrast != 1.0f)
+        for (float& c : v) c = 0.18f * std::pow(std::max(c, 0.0f) / 0.18f, 1.0f / contrast);
+    return std::max(v[1], 1e-8f);
+}
 
 struct Frame6 {   // the frame's snapshots (ProcessInline): one divisor, encoding, gate and cap
     uint8_t hdr_mode{};
@@ -226,13 +315,15 @@ ScalePlan plan_frame_scale(const Settings& s, NormStream& stream, bool frame_res
     return plan;
 }
 
-// ---- Preprocess on this path (renodx_prep.comp): runtime_prep.comp's push block and curve anchors ------
+// ---- Preprocess on this path (renodx_prep.comp): its push block and the curve anchors of prep_math.glsl ------
 struct PrepPush {
     uint32_t w, h, mode, flags, curve;
     float bias, contrast, saturation, k, cap;
     float dt;
+    float divisor;   // kPrepNormalise: RenoDX's divisor, 0 = its 1x1 scale texel
 };
-enum : uint32_t { kPrepAuto = 1, kPrepRestore = 4, kPrepReset = 8, kPrepLinear = 16 };
+enum : uint32_t { kPrepAuto = 1, kPrepRestore = 4, kPrepReset = 8, kPrepLinear = 16, kPrepNormalise = 32, kPrepRatio = 64,
+                  kPrepApart = 128, kPrepRecompute = 256 };
 // nr_runtime.cpp kPrepAnchor: each curve's input scale that leaves mid grey where it was.
 constexpr float kPrepAnchor[7] = {1.0f, 1.0f, 1.2195122f, 2.9275228f, 1.0052344f, 0.7231708f, 0.8083602f};
 
@@ -428,6 +519,15 @@ std::map<uint32_t, VkDescriptorType> reflect(const std::vector<uint32_t>& code) 
 
 }  // namespace
 
+FrameUnits frame_units(const Settings& s, VkFormat format, bool hdr_flag) {
+    const uint8_t hdr = frame_hdr_mode(format, hdr_flag);
+    if (s.source_encoding == 1u || (s.source_encoding == 0u && hdr == 0u)) return {0, 0.f};
+    const codec::SourceUnits u = interpret_source_units(s, hdr);
+    if (u.encoding == codec::Encoding::Pq) return {2, 0.f};
+    if (u.encoding == codec::Encoding::Sdr) return {0, 0.f};
+    return {1, u.absolute ? u.unit_nits : 0.f};
+}
+
 struct Stage::Impl {
     VkDevice device{};
     VkPhysicalDevice physical{};
@@ -443,7 +543,13 @@ struct Stage::Impl {
 
     enum P { kLinearize, kAutoscale, kExposureScale, kEncode6, kResolve6, kReduce6, kReduce6Unshaped, kCommit6,
              kCommitExposure, kEncodeL, kDecodeL, kReduceL, kReduceLUnshaped, kApplyL, kCompose, kUpsample, kBand,
-             kPrep, kPrepEncode, kResolveCommit6, kCount };
+             kPrep, kPrepEncode, kResolveCommit6, kDebug,
+             // the resolve when [Preprocess] made the proxy (NR_PREP_RESOLVE builds, linux/shaders/renodx-prep/prep_resolve.hlsli)
+             kResolve6Prep, kResolveCommit6Prep, kReduce6UnshapedPrep,
+             kDecodeReduceL,   // legacy_decode + the black-level reduce in one pass (the SDR frame in place)
+             kComposeDecode,   // look_compose + legacy_decode + the reduce (SDR, the network at the frame's extent)
+             kStFbIn, kStPrep, kStBox, kStApply,
+             kCount };
     Program programs[kCount];
 
     // The stack's ping-pong: HDR resolves pass k into work_a / work_b (k even / odd), SDR decodes into
@@ -456,6 +562,11 @@ struct Stage::Impl {
     Image work_p, prep_keep;
     VkBuffer prep_state{};
     VkDeviceMemory prep_state_memory{};
+    // The engine-data panel's divisor: the scale texel copied here every 32nd recording (host-visible, read by facts()
+    // a few frames later; a torn or stale value is only a display).
+    VkBuffer probe{};
+    VkDeviceMemory probe_memory{};
+    float* probe_mapped{};
     VkBuffer unread{};             // a buffer for the look programs' trace slot, which the stage never reads
     VkDeviceMemory unread_memory{};
     bool prep_state_fresh = false, prep_was_on = false;
@@ -472,12 +583,52 @@ struct Stage::Impl {
     std::vector<PassLook> looks;
     uint32_t logged_passes = 1;
     Image motion;                  // the game's motion vectors, copied (region at the origin)
+    Image st_fineh, st_fbadd, st_d0, st_d1, st_t0, st_t1, st_g0, st_g1, st_f0[2], st_f1[2];
+    uint32_t st_cur = 0; bool st_valid = false;
+    // Passes (fast)'s images: the fine part (RG16F: the edit's fine part and the answer's lightness) and the guided
+    // filter's quarter-size work images; with `feedback` (the method is Feedback / Hybrid) also the feedback's add and
+    // its history, which go when the method is Extrapolation.
+    void ensure_st(VkCommandBuffer cmd, uint32_t nw, uint32_t nh, bool feedback) {
+        if (!programs[kStFbIn].pipeline) {
+            load(programs[kStFbIn], "st_fb_in", 60); load(programs[kStPrep], "st_prep", 20); load(programs[kStBox], "st_box", 20);
+            load(programs[kStApply], "st_apply", 84);
+        }
+        const VkImageUsageFlags rw = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+        const uint32_t lw = (nw + 3) / 4, lh = (nh + 3) / 4;
+        if (st_fineh.w != nw || st_fineh.h != nh) {
+            for (Image* i : {&st_fineh, &st_fbadd, &st_d0, &st_d1, &st_t0, &st_t1, &st_g0, &st_g1, &st_f0[0], &st_f0[1], &st_f1[0], &st_f1[1]})
+                retire(*i);
+            st_fineh = make_image(nw, nh, VK_FORMAT_R16G16_SFLOAT, rw);
+            for (Image* i : {&st_d0, &st_d1, &st_t0, &st_t1, &st_g0, &st_g1}) *i = make_image(lw, lh, VK_FORMAT_R32G32B32A32_SFLOAT, rw);
+            st_valid = false;
+        }
+        if (feedback && !st_fbadd.handle) {
+            st_fbadd = make_image(nw, nh, VK_FORMAT_R16G16B16A16_SFLOAT, rw);
+            for (Image* i : {&st_f0[0], &st_f0[1], &st_f1[0], &st_f1[1]}) *i = make_image(lw, lh, VK_FORMAT_R32G32B32A32_SFLOAT, rw);
+            st_valid = false;
+        } else if (!feedback && st_fbadd.handle) {
+            for (Image* i : {&st_fbadd, &st_f0[0], &st_f0[1], &st_f1[0], &st_f1[1]}) retire(*i);
+            st_valid = false;
+        }
+        init_fresh(cmd);
+    }
+    // The guided filter's rest, from its 4 x 4 cell means in (st_d0, st_d1): the box mean, the coefficients, their box
+    // mean into (outa, outb)
+    void st_gf(VkCommandBuffer cmd, uint32_t nw, uint32_t nh, const Image& outa, const Image& outb, uint32_t radius, float eps) {
+        struct { uint32_t low[2], radius, coef; float eps; } g{{(nw + 3) / 4, (nh + 3) / 4}, radius, 1u, eps};
+        const uint32_t gx = (g.low[0] + 15) / 16, gy = (g.low[1] + 15) / 16;
+        dispatch(cmd, kStBox, S(kStBox, {{0, st_d0.view}, {1, st_d1.view}, {4, st_t0.view}, {5, st_t1.view}}), &g, sizeof g, gx, gy);
+        g.coef = 0u;
+        dispatch(cmd, kStBox, S(kStBox, {{0, st_t0.view}, {1, st_t1.view}, {4, outa.view}, {5, outb.view}}), &g, sizeof g, gx, gy);
+    }
     Image exposure;                // texel (0,0) of the game's exposure texture, copied
     bool commit_cleared = false;
     bool decoded_storage = false;  // decoded is the output's own format (else RGBA16F + blit)
     NormStream norm;
-    std::vector<std::pair<uint64_t, Image>> retired;
-    std::vector<std::pair<uint64_t, VkDescriptorSet>> retired_sets;
+    nr::gpu::Uses gpu_uses;
+    template<class T> struct Retired { uint64_t first; T second; nr::gpu::Uses uses; };
+    std::vector<Retired<Image>> retired;
+    std::vector<Retired<VkDescriptorSet>> retired_sets;
     std::vector<VkImage> fresh;    // made, not yet in GENERAL
     std::map<std::string, VkDescriptorSet> sets;
     uint64_t recordings = 0;
@@ -485,6 +636,7 @@ struct Stage::Impl {
     Frame6 f6;
     uint32_t feed = kFeedV1;       // this frame's
     uint32_t logged_feed = ~0u;
+    Stage::Facts facts;            // the last frame's, for facts()
     PrepPush prep_push{};          // this frame's Preprocess
     bool prep_on = false, ratio_resolve = false;
 
@@ -516,6 +668,7 @@ struct Stage::Impl {
         VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         ai.allocationSize = req.size; ai.memoryTypeIndex = type;
         VkDeviceMemory m{};
+        nr::vram::Scope kind(nr::vram::kRenoDX, -1);   // the RenoDX processing's, not a network's
         check(vkAllocateMemory(device, &ai, nullptr, &m), "memory");
         return m;
     }
@@ -607,7 +760,15 @@ struct Stage::Impl {
     }
     // The set of `p` over these views, made on first use and kept (every image is the stage's own; a retired
     // image takes every kept set with it, see retire()).
+    // this recording's frame view standing in for work0 (HDR, linear RGBA16F read in place) and its pool: a set
+    // naming it is made there, never cached (the view lives for this recording)
+    VkImageView borrowed_w0{};
+    bool w0_logged = false;
+    VkDescriptorPool borrowed_pool{};
     VkDescriptorSet S(P p, const std::map<uint32_t, VkImageView>& views, const std::map<uint32_t, VkBuffer>& buffers = {}) {
+        if (borrowed_w0)
+            for (const auto& [b, v] : views)
+                if (v == borrowed_w0) return set_for(programs[p], views, buffers, borrowed_pool);
         std::string key = std::to_string(int(p));
         for (const auto& [b, v] : views) key += "," + std::to_string(b) + ":" + std::to_string(uint64_t(v));
         for (const auto& [b, v] : buffers) key += ";" + std::to_string(b) + ":" + std::to_string(uint64_t(v));
@@ -623,18 +784,19 @@ struct Stage::Impl {
     // and the sets naming them (the linearize's, the commit's, each pass's compose) are this recording's only - a
     // game's image handle can come back for another image once the game frees it - and are freed once the frames in
     // flight are past them, as the retired images are.
-    struct Borrow { VkImageView in{}, out{}, motion{}; VkDescriptorPool pool{}; };
+    struct Borrow { nr::gpu::Ticket gpu; VkImageView in{}, out{}, motion{}; VkDescriptorPool pool{}; };
     std::vector<Borrow> borrows;
     bool in_place_logged = false, motion_logged = false;
     Borrow& borrow_slot() {
         if (borrows.empty()) borrows.resize(66);   // retire()'s 64 recordings, and two
-        Borrow& b = borrows[size_t(recordings % borrows.size())];
+        Borrow& b = nr::gpu::slot(borrows, size_t(recordings % borrows.size()));
+        b.gpu = nr::gpu::current();
         if (b.in) vkDestroyImageView(device, b.in, nullptr);
         if (b.out) vkDestroyImageView(device, b.out, nullptr);
         if (b.motion) vkDestroyImageView(device, b.motion, nullptr);
         b.in = b.out = b.motion = VK_NULL_HANDLE;
         if (!b.pool) {
-            constexpr uint32_t kSets = 2 + kMaxUnlockedPasses;
+            constexpr uint32_t kSets = 16 + 2 * kMaxUnlockedPasses;   // + the HDR frame-as-work0 sets
             VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 8 * kSets},
                                             {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 12 * kSets},
                                             {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 * kSets}};
@@ -772,17 +934,17 @@ struct Stage::Impl {
     // An image out of use: destroyed once frames in flight are past it, with every kept set (one may name it).
     void retire(Image& im) {
         if (im.handle) {
-            retired.push_back({recordings + 64, im});
-            for (const auto& [key, set] : sets) retired_sets.push_back({recordings + 64, set});
+            retired.push_back({recordings + 64, im, gpu_uses});
+            for (const auto& [key, set] : sets) retired_sets.push_back({recordings + 64, set, gpu_uses});
             sets.clear();
         }
         im = {};
     }
     void collect() {
         for (auto it = retired.begin(); it != retired.end();)
-            if (it->first <= recordings) { destroy(it->second); it = retired.erase(it); } else ++it;
+            if (it->first <= recordings && it->uses.ready()) { destroy(it->second); it = retired.erase(it); } else ++it;
         for (auto it = retired_sets.begin(); it != retired_sets.end();)
-            if (it->first <= recordings) { vkFreeDescriptorSets(device, pool, 1, &it->second); it = retired_sets.erase(it); }
+            if (it->first <= recordings && it->uses.ready()) { vkFreeDescriptorSets(device, pool, 1, &it->second); it = retired_sets.erase(it); }
             else ++it;
     }
 
@@ -793,15 +955,22 @@ struct Stage::Impl {
         exposure = make_image(1, 1, f, VK_IMAGE_USAGE_SAMPLED_BIT);
     }
     // Preprocess's images, state and programs, made the first time it runs.
+    // Its image is the frame's alone (written before it is read): it goes when Preprocess is off and comes back with it;
+    // the state (its meter) stays.
     void ensure_prep() {
-        if (prep_state) return;
         const VkImageUsageFlags rw = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
-        if (hdr) work_p = make_image(cfg.width, cfg.height, VK_FORMAT_R16G16B16A16_SFLOAT, rw);
-        else prep_keep = make_image(cfg.nr_width, cfg.nr_height, VK_FORMAT_R16G16B16A16_SFLOAT, rw);
+        if (hdr && !work_p.handle) work_p = make_image(cfg.width, cfg.height, VK_FORMAT_R16G16B16A16_SFLOAT, rw);
+        if (!hdr && !prep_keep.handle) prep_keep = make_image(cfg.nr_width, cfg.nr_height, VK_FORMAT_R16G16B16A16_SFLOAT, rw);
+        if (prep_state) return;
         make_buffer(16, &prep_state, &prep_state_memory);
         prep_state_fresh = true;
         load(programs[kPrep], "prep", sizeof(PrepPush));
-        if (hdr) load(programs[kPrepEncode], "prep_encode", 16);
+        if (hdr) {
+            load(programs[kPrepEncode], "prep_encode", 16);
+            load(programs[kResolve6Prep], "v6_resolve_prep", sizeof(V6PrepConstants));
+            load(programs[kResolveCommit6Prep], "v6_resolve_commit_prep", sizeof(V6PrepConstants));
+            load(programs[kReduce6UnshapedPrep], "v6_pedestal_reduce_unshaped_prep", sizeof(V6PrepConstants));
+        }
     }
     Image& stack_out(uint32_t pass) { return hdr ? ((pass & 1u) ? work_b : work_a) : ((pass & 1u) ? decoded_alt : decoded); }
     VkImageView scale_or_work0() const { return units.absolute ? work0.view : scale.view; }
@@ -828,11 +997,14 @@ struct Stage::Impl {
 
     // RunLookStage for one pass: the bands, the temporal filter on the pass's own history and every gain into
     // look_out (N'), then, below the frame's extent, P_up and N'_up. Returns whether it shaped.
-    struct Route { bool shaped = false, transport = false; };
+    struct Route { bool shaped = false, transport = false, fused_decode = false; };
+    // the SDR decode (and its black-level reduce) done by the compose itself (look_compose_decode), into `out`
+    // (the pass's write surface; `borrowed`: a view of the recording's), with the pass's colour strength.
+    struct ComposeDecode { VkImageView out{}; float color = 1.f; bool borrowed = false; };
     // `borrow`: the recording's borrowed views and pool when the game's motion vectors are read in place
     // (borrow->motion), else null.
-    Route run_look(VkCommandBuffer cmd, uint32_t pass, const Image& ref, const look::Settings& ls, bool motion_copied,
-                   const StageFrame& fr, bool reset, const Borrow* borrow) {
+    Route run_look(VkCommandBuffer cmd, uint32_t pass, VkImageView ref_view, const look::Settings& ls, bool motion_copied,
+                   const StageFrame& fr, bool reset, const Borrow* borrow, const ComposeDecode* cd = nullptr) {
         const uint32_t W = cfg.width, H = cfg.height, NW = cfg.nr_width, NH = cfg.nr_height;
         Route route;
         route.transport = up_proxy.handle && look::transport_wanted(ls, NW, NH, W, H);
@@ -902,35 +1074,52 @@ struct Stage::Impl {
         const VkImageView mb = band_max_b.handle ? band_max_b.view : look_out.view;
         // The codec set [ref, P, N, ref] and, for the upsample, the look set [ref, P, N', ref].
         const auto look_views = [&](VkImageView n) {
-            return std::map<uint32_t, VkImageView>{{0, ref.view}, {1, proxy.view}, {2, n}, {3, ref.view}, {4, mv},
+            return std::map<uint32_t, VkImageView>{{0, ref_view}, {1, proxy.view}, {2, n}, {3, ref_view}, {4, mv},
                 {5, look_out.view}, {6, ba}, {7, bb}, {8, ma}, {9, mb}, {10, upp}, {11, upn}, {13, look_out.view},
                 {14, hist_out}, {15, hist_in}, {16, hist_out_z}, {17, hist_in_z}};
         };
         const std::map<uint32_t, VkBuffer> trace{{12, unread}};
+        // the reference may be the frame itself (borrowed for this recording): its sets from the borrow pool
+        const bool ref_borrowed = borrow && borrow->in && ref_view == borrow->in;
+        const auto look_set = [&](P p, const std::map<uint32_t, VkImageView>& v) {
+            return ref_borrowed ? set_for(programs[p], v, trace, borrow->pool) : S(p, v, trace);
+        };
         // RecordCompose: the five band passes at half the network's extent, then the compose.
         if (lc.flags & look::kFlagBands) {
             look::Constants band = lc;
             band.size[0] = (NW + 1) / 2; band.size[1] = (NH + 1) / 2;
-            const VkDescriptorSet set = S(kBand, look_views(neural.view), trace);
+            const VkDescriptorSet set = look_set(kBand, look_views(neural.view));
             for (uint32_t mode = 0; mode < 5; ++mode) {
                 band.mode = mode;
                 dispatch(cmd, kBand, set, &band, sizeof band, (band.size[0] + 7) / 8, (band.size[1] + 7) / 8);
             }
         }
         lc.mode = 0;
-        if (motion_borrowed) {
+        if (cd && !route.transport && NW == W && NH == H) {   // the compose decodes and measures too
+            auto views = look_views(neural.view);
+            if (motion_borrowed) views[4] = borrow->motion;
+            views[18] = cd->out;
+            views[19] = block_mean.view;
+            look::Constants cl = lc;
+            cl.padding = bits(cd->color);
+            const bool pooled = motion_borrowed || ref_borrowed || cd->borrowed;
+            dispatch(cmd, kComposeDecode,
+                     pooled ? set_for(programs[kComposeDecode], views, trace, borrow->pool) : S(kComposeDecode, views, trace),
+                     &cl, sizeof cl, (W + 31) / 32, (H + 31) / 32);
+            route.fused_decode = true;
+        } else if (motion_borrowed) {
             auto views = look_views(neural.view);
             views[4] = borrow->motion;
             dispatch(cmd, kCompose, set_for(programs[kCompose], views, trace, borrow->pool), &lc, sizeof lc,
                      (NW + 15) / 16, (NH + 15) / 16);
         } else {
-            dispatch(cmd, kCompose, S(kCompose, look_views(neural.view), trace), &lc, sizeof lc, (NW + 15) / 16,
+            dispatch(cmd, kCompose, look_set(kCompose, look_views(neural.view)), &lc, sizeof lc, (NW + 15) / 16,
                      (NH + 15) / 16);
         }
         if (route.transport) {   // RecordUpsample: P_up and N'_up at the frame's extent
             look::Constants up = lc;
             up.size[0] = W; up.size[1] = H;
-            dispatch(cmd, kUpsample, S(kUpsample, look_views(look_out.view), trace), &up, sizeof up, (W + 15) / 16,
+            dispatch(cmd, kUpsample, look_set(kUpsample, look_views(look_out.view)), &up, sizeof up, (W + 15) / 16,
                      (H + 15) / 16);
         }
         if (temporal) {   // FinishLookPass
@@ -1000,8 +1189,11 @@ Stage::Stage(const HostDevice& host, const StageConfig& cfg) : impl_(std::make_u
         m.load(m.programs[Impl::kReduceL], "legacy_reduce", lg);
         m.load(m.programs[Impl::kReduceLUnshaped], "legacy_reduce_unshaped", lg);
         m.load(m.programs[Impl::kApplyL], "legacy_apply", lg);
+        m.load(m.programs[Impl::kDecodeReduceL], "legacy_decode_reduce", lg);
+        if (const char* e = std::getenv("NR_RDX_CD"); e && e[0] == '1') m.load(m.programs[Impl::kComposeDecode], "look_compose_decode", sizeof(look::Constants));   // tried, off
     }
     m.load(m.programs[Impl::kCompose], "look_compose", sizeof(look::Constants));
+    m.load(m.programs[Impl::kDebug], "debug", 5 * sizeof(uint32_t));   // NR Control's debug views (renodx_debug.comp)
     if (cfg.nr_width < cfg.width || cfg.nr_height < cfg.height)
         m.load(m.programs[Impl::kUpsample], "look_upsample", sizeof(look::Constants));
 
@@ -1036,6 +1228,8 @@ Stage::Stage(const HostDevice& host, const StageConfig& cfg) : impl_(std::make_u
 Stage::~Stage() {
     Impl& m = *impl_;
     if (m.prof.pool) vkDestroyQueryPool(m.device, m.prof.pool, nullptr);
+    if (m.probe_memory) { vkUnmapMemory(m.device, m.probe_memory); vkFreeMemory(m.device, m.probe_memory, nullptr); }
+    if (m.probe) vkDestroyBuffer(m.device, m.probe, nullptr);
     for (auto& b : m.borrows) {
         if (b.in) vkDestroyImageView(m.device, b.in, nullptr);
         if (b.out) vkDestroyImageView(m.device, b.out, nullptr);
@@ -1046,6 +1240,7 @@ Stage::~Stage() {
                       &m.decoded_alt, &m.block_mean, &m.scale, &m.commit, &m.motion, &m.exposure, &m.up_proxy,
                       &m.up_neural, &m.band_a, &m.band_b, &m.band_max_a, &m.band_max_b, &m.work_p, &m.prep_keep})
         m.destroy(*im);
+    for (Image* im : {&m.st_fineh, &m.st_fbadd, &m.st_d0, &m.st_d1, &m.st_t0, &m.st_t1, &m.st_g0, &m.st_g1, &m.st_f0[0], &m.st_f0[1], &m.st_f1[0], &m.st_f1[1]}) m.destroy(*im);
     for (auto& pl : m.looks)
         for (int i = 0; i < 2; ++i) { m.destroy(pl.history[i]); m.destroy(pl.history_z[i]); }
     for (auto& r : m.retired) m.destroy(r.second);
@@ -1068,7 +1263,12 @@ namespace {
 // stage has; NRUnlockPasses (ours) as NRPasses.
 bool history_settings_differ(const Settings& a, const Settings& b) {
     auto same3 = [](const auto& x, const auto& y) { return x[0] == y[0] && x[1] == y[1] && x[2] == y[2]; };
-    return a.auto_mask != b.auto_mask || a.chained_history != b.chained_history || a.codec_mode != b.codec_mode ||
+    return a.passes_mode != b.passes_mode || a.fast_method != b.fast_method ||
+           std::memcmp(a.fast_passes, b.fast_passes, sizeof a.fast_passes) != 0 ||
+           std::memcmp(a.fast_halo_limit, b.fast_halo_limit, sizeof a.fast_halo_limit) != 0 ||
+           std::memcmp(a.fast_fine, b.fast_fine, sizeof a.fast_fine) != 0 ||
+           a.fast_edit_strength != b.fast_edit_strength ||
+           a.auto_mask != b.auto_mask || a.chained_history != b.chained_history || a.codec_mode != b.codec_mode ||
            a.depth_mode != b.depth_mode || a.feed_mode != b.feed_mode || a.intensity != b.intensity ||
            a.local_structure != b.local_structure || a.local_tone != b.local_tone ||
            a.mvec_scale_x != b.mvec_scale_x || a.mvec_scale_y != b.mvec_scale_y ||
@@ -1104,6 +1304,14 @@ void Stage::set(const Settings& s) {
 }
 
 uint8_t Stage::hdr_mode() const { return impl_->hdr; }
+Stage::Facts Stage::facts() const {
+    Facts f = impl_->facts;
+    if (impl_->probe_mapped && f.hdr_mode && !f.absolute) {
+        const float d = impl_->probe_mapped[0];
+        if (d > 0.f && d < 1e9f) f.divisor = d;
+    }
+    return f;
+}
 
 void working_resolution(const Settings& s, uint32_t rw, uint32_t rh, uint32_t gw, uint32_t gh, uint32_t* nw,
                         uint32_t* nh) {
@@ -1119,6 +1327,7 @@ void working_resolution(const Settings& s, uint32_t rw, uint32_t rh, uint32_t gw
 
 uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network& network) {
     Impl& m = *impl_;
+    m.gpu_uses.touch();
     ++m.recordings;
     m.collect();
     const Settings& s = m.settings;
@@ -1155,11 +1364,16 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
     }
     if (m.recreate) m.history_reset = true;
 
+    const bool v6 = m.hdr;
+
     // The stack's own images and look histories, as this frame's depth needs them.
     if (passes > 1) {
         const VkImageUsageFlags rw = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
         if (m.hdr && !m.work_b.handle) m.work_b = m.make_image(W, H, VK_FORMAT_R16G16B16A16_SFLOAT, rw);
         if (!m.hdr && !m.decoded_alt.handle) m.decoded_alt = m.make_image(W, H, m.decoded.format, rw);
+    } else if (m.work_b.handle || m.decoded_alt.handle) {   // one pass: the stack's images go
+        m.retire(m.work_b);
+        m.retire(m.decoded_alt);
     }
     while (m.looks.size() > passes) {
         for (int i = 0; i < 2; ++i) { m.retire(m.looks.back().history[i]); m.retire(m.looks.back().history_z[i]); }
@@ -1187,7 +1401,7 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
     m.f6.gate = v6_dark_gate(m.units);
     m.f6.cap = codec::BlackPedestalCap(m.units);
 
-    // Preprocess this frame (runtime_prep's push block; RESET when it has just come on).
+    // Preprocess this frame (renodx_prep.comp's push block; RESET when it has just come on).
     const Preprocess& pp = fr.preprocess;
     m.prep_on = pp.active();
     if (m.prep_on != m.prep_was_on || (m.prep_on && pp != m.prep_last)) m.history_reset = true;
@@ -1204,24 +1418,59 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
         const int64_t now = now_ns();
         m.prep_push = {m.hdr ? W : NW, m.hdr ? H : NH, 0u,
                        (pp.exposure == 1 ? uint32_t(kPrepAuto) : 0u) | (m.hdr ? uint32_t(kPrepLinear) : 0u) |
-                           (m.prep_was_on ? 0u : uint32_t(kPrepReset)),
+                           (m.prep_was_on ? 0u : uint32_t(kPrepReset)) | (pp.inverse ? 0u : uint32_t(kPrepRatio)),
                        curve, pp.exposure == 0 ? 0.0f : std::clamp(pp.bias_ev, -8.0f, 8.0f),
                        std::clamp(pp.contrast, 0.5f, 2.0f), std::clamp(pp.saturation, 0.05f, 2.0f), kPrepAnchor[curve],
-                       4.0f, m.prep_was_on ? float(now - m.prep_metered_ns) / 1e9f : 0.0f};
+                       4.0f, m.prep_was_on ? float(now - m.prep_metered_ns) / 1e9f : 0.0f, 0.0f};
         m.prep_metered_ns = now;
+    } else if (m.work_p.handle || m.prep_keep.handle) {   // off: its image goes (ensure_prep)
+        m.retire(m.work_p);
+        m.retire(m.prep_keep);
     }
     m.prep_was_on = m.prep_on;
     m.prep_last = pp;
     const bool prep_exposure = m.prep_on && pp.exposure != 0;
+    m.facts = Stage::Facts{};
+    m.facts.hdr_mode = m.hdr;
+    m.facts.absolute = m.units.absolute;
+    m.facts.prep_exposure = prep_exposure;
     // Preprocess's exposure replaces RenoDX's divisor; a frame of absolute units then takes the N/P resolve too,
     // so that Preprocess's change comes out of it as it does on relative frames.
     m.ratio_resolve = m.prep_on && m.hdr && !frame_display_codec(s, m.hdr, m.units);
+    // Without Preprocess's exposure (HDR) RenoDX's own exposure stays: Preprocess's forward half divides by RenoDX's
+    // divisor (or its same-frame scale, metered on the frame before it) and the encode then divides by 1.
+    const bool prep_normalise = m.prep_on && m.hdr && !prep_exposure;
+    if (prep_normalise) {
+        m.prep_push.flags |= kPrepNormalise;
+        m.prep_push.divisor = m.f6.divisor > 0.f ? m.f6.divisor : 0.f;
+    }
     if (prep_exposure && m.hdr) m.f6.divisor = 1.f;
     const std::map<uint32_t, VkBuffer> prep_state{{0, m.prep_state}};
+    // Binding 4 of Preprocess's sets: RenoDX's scale texel (HDR); an image of the stage's that is never read (SDR).
+    const VkImageView prep_scale = m.hdr ? m.scale_or_work0() : m.block_mean.view;
+    // SDR Preprocess with the network's input in its own image (NR_PREP_APART=0: in the proxy, P kept and restored)
+    static const bool apart_on = [] { const char* e = std::getenv("NR_PREP_APART"); return !(e && e[0] == '0'); }();
+    const bool prep_apart = apart_on && m.prep_on && !m.hdr;
+    // HDR with Preprocess: the resolve's ratio is taken behind Preprocess's curve (the _prep programs); with its
+    // Inverse off, in the picture the network was shown (RenoDX's own resolve).
+    const bool prep_resolve = m.prep_on && m.hdr && pp.inverse;
+    // Curve = none keeps v6_encode. Tell the inverse which codec it applied, rather than treating it as identity.
+    // Internal curve IDs 7 / 8 are the display toe+shoulder / classic shoulder, not Preprocess menu choices.
+    const uint32_t prep_inverse_curve = m.prep_push.curve != 0u ? m.prep_push.curve
+        : frame_display_codec(s, m.hdr, m.units) ? 7u : 8u;
+    const float floor_behind = prep_resolve ? prep_floor(prep_inverse_curve, m.prep_push.k, m.prep_push.contrast,
+                                                          m.prep_push.saturation) : 0.f;
+    const auto prep_constants = [&](const V6Constants& v) {
+        V6PrepConstants c{v, m.prep_push.contrast, m.prep_push.saturation, floor_behind};
+        c.v.padding[0] = prep_inverse_curve;
+        std::memcpy(&c.v.padding[1], &m.prep_push.k, sizeof(float));
+        return c;
+    };
     // Preprocess's forward half (HDR): the pass's running image -> work_p, its meter first on the frame (work0).
     const auto prep_forward_hdr = [&](const Image& from, bool meter) {
         PrepPush pp_push = m.prep_push;
-        const VkDescriptorSet set = m.S(Impl::kPrep, {{1, from.view}, {2, m.work_p.view}, {3, m.work_p.view}}, prep_state);
+        const VkDescriptorSet set = m.S(Impl::kPrep, {{1, from.view}, {2, m.work_p.view}, {3, m.work_p.view},
+                                                      {4, prep_scale}}, prep_state);
         if (meter && pp.exposure == 1) m.dispatch(cmd, Impl::kPrep, set, &pp_push, sizeof pp_push, 1, 1);
         pp_push.mode = 1;
         m.dispatch(cmd, Impl::kPrep, set, &pp_push, sizeof pp_push, gx, gy);
@@ -1233,25 +1482,61 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
     // the linearize reads the frame, and the commit, the stage's last step, writes it.
     Impl::Borrow* borrow = nullptr;
     const bool same = fr.colour.image == fr.output.image;
-    if (m.hdr) {
+    // SDR (legacy codec) in place too, one pass: the frame read where it is by the encode, the look and the
+    // decode, the decode (with the black-level reduce in the same pass) storing into the output. NR_RDX_SDR_INPLACE=0:
+    // as before (copy in, decode, reduce, apply, copy out).
+    static const bool sdr_inplace_off = [] { const char* e = std::getenv("NR_RDX_SDR_INPLACE"); return e && e[0] == '0'; }();
+    const bool sdr_inplace = !m.hdr && passes == 1 && !sdr_inplace_off;
+    if (m.hdr || sdr_inplace) {
         const bool out_ok = m.decoded_storage && (fr.output.usage & VK_IMAGE_USAGE_STORAGE_BIT) &&
                             fr.output.format == m.decoded.format && fr.output.width == W && fr.output.height == H;
         const bool in_ok = (!same || out_ok) && (fr.colour.usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
                            fr.colour.format == m.original.format && fr.colour.width == W && fr.colour.height == H;
         if (in_ok || out_ok) {
             borrow = &m.borrow_slot();
-            if (in_ok) borrow->in = m.view_of(fr.colour.image, fr.colour.format);
+            // the output's view first - the frame that is also the output is read in place
+            // only when its answer is stored in place too (else the copy-out would start from the wrong layout)
             if (out_ok) borrow->out = m.view_of(fr.output.image, fr.output.format);
+            if (in_ok && (!same || borrow->out)) borrow->in = m.view_of(fr.colour.image, fr.colour.format);
         }
     }
     const bool read_in_place = borrow && borrow->in;
     const bool store_in_place = borrow && borrow->out;
-    if (m.hdr && !m.in_place_logged) {
+    // HDR with a linear (Encoding 1) RGBA16F or B10G11R11 frame read in place: v6_linearize would copy it into work0 bit for
+    // bit (every half pattern through its Load and store unchanged), and every
+    // reader of work0 Loads its own texels (no filtering) before the frame is written - so the frame is work0, no
+    // linearize. NR_RDX_W0_FRAME=0: as before.
+    static const bool w0_frame_off = [] { const char* e = std::getenv("NR_RDX_W0_FRAME"); return e && e[0] == '0'; }();
+    // B10G11R11 too: every 11/10-bit pattern reads the same 32-bit floats directly and through work0's RGBA16F
+    // (half/r11_copy) - but not when pass 0 has no strength (its copy of the running image, vkCmdCopyImage, needs
+    // work0's format).
+    float t0 = 0.f, c0 = 0.f;
+    m.strengths(0, &t0, &c0);
+    const bool w0_format = fr.colour.format == VK_FORMAT_R16G16B16A16_SFLOAT ||
+                           (fr.colour.format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && (t0 > 0.f || c0 > 0.f));
+    // (Preprocess's forward binds work0 as an rgba16f storage image - with Preprocess on, only an RGBA16F
+    // frame with storage usage stands in for it)
+    const bool w0_prep_ok = !m.prep_on || (fr.colour.format == VK_FORMAT_R16G16B16A16_SFLOAT &&
+                                           (fr.colour.usage & VK_IMAGE_USAGE_STORAGE_BIT));
+    const bool w0_frame = v6 && read_in_place && !w0_frame_off && m.f6.encoding == 1u && w0_format && w0_prep_ok &&
+                          fr.colour.width == W && fr.colour.height == H;
+    Image frame_w0;
+    if (w0_frame) {
+        frame_w0 = m.work0;
+        frame_w0.handle = fr.colour.image; frame_w0.memory = VK_NULL_HANDLE; frame_w0.view = borrow->in;
+        m.borrowed_w0 = borrow->in; m.borrowed_pool = borrow->pool;
+        if (!m.w0_logged) { m.w0_logged = true; nr::logf("[nr] RenoDX stage: the linear frame read as it is (no linearize)"); }
+    } else {
+        m.borrowed_w0 = VK_NULL_HANDLE; m.borrowed_pool = VK_NULL_HANDLE;
+    }
+    const Image& w0 = w0_frame ? frame_w0 : m.work0;
+    if ((m.hdr || sdr_inplace) && !m.in_place_logged) {
         m.in_place_logged = true;
         nr::logf("[nr] RenoDX stage: the frame %s, the answer %s", read_in_place ? "read in place" : "copied in",
                  store_in_place ? "stored into the output" : "copied out");
     }
     // The output in GENERAL for the HDR store into it (after the linearize's reads when it is the frame itself).
+    bool store_prepared = false;   // prepare_store ran (once a recording)
     const auto prepare_store = [&] {
         if (store_in_place && same && read_in_place)
             Impl::image_barrier(cmd, fr.output.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
@@ -1261,10 +1546,10 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
             Impl::image_barrier(cmd, fr.output.image, fr.output.before, VK_IMAGE_LAYOUT_GENERAL, fr.output.before_stage,
                                 fr.output.before_access, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
     };
-    // The last pass's resolve and the commit in one dispatch when the commit takes no pedestal (v6_resolve_commit:
-    // the same output bits). NR_RENODX_FUSE=0 keeps the two (a measurement aid).
+    // The last pass's resolve and the commit in one dispatch when the commit takes no pedestal (v6_resolve_commit).
+    // The recorded RDNA4 fixtures matched the two-dispatch output. NR_RENODX_FUSE=0 keeps the two for comparison.
     static const bool fuse_off = [] { const char* e = std::getenv("NR_RENODX_FUSE"); return e && e[0] == '0'; }();
-    const bool fuse = m.hdr && !fuse_off && !frame_pedestal_removal(s, m.hdr, m.units);
+    const bool fuse = v6 && !fuse_off && !frame_pedestal_removal(s, m.hdr, m.units);
     bool fused = false;
     if (read_in_place) {
         Impl::image_barrier(cmd, fr.colour.image, fr.colour.before, VK_IMAGE_LAYOUT_GENERAL, fr.colour.before_stage,
@@ -1293,11 +1578,13 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
         const V6Constants lin = make_v6(s, m.f6, W, H, W, H, W, H, W, H, 0.f, 0.f, 0.f);
         const VkImageView src = read_in_place ? borrow->in : m.original.view;
         const std::map<uint32_t, VkImageView> lv{{0, src}, {1, src}, {2, src}, {3, src}, {4, m.work0.view}};
-        m.dispatch(cmd, Impl::kLinearize,
-                   read_in_place ? m.set_for(m.programs[Impl::kLinearize], lv, {}, borrow->pool) : m.S(Impl::kLinearize, lv),
-                   &lin, sizeof lin, gx, gy);
-        if (m.prep_on) prep_forward_hdr(m.work0, true);
-        const Image& metered = m.prep_on ? m.work_p : m.work0;
+        if (!w0_frame)
+            m.dispatch(cmd, Impl::kLinearize,
+                       read_in_place ? m.set_for(m.programs[Impl::kLinearize], lv, {}, borrow->pool) : m.S(Impl::kLinearize, lv),
+                       &lin, sizeof lin, gx, gy);
+        // with Preprocess's exposure the frame is metered after its forward half; without it before (RenoDX's scale)
+        if (m.prep_on && !prep_normalise) prep_forward_hdr(w0, true);
+        const Image& metered = m.prep_on && !prep_normalise ? m.work_p : w0;
         m.feed = kFeedV1;
         if (!m.units.absolute && !prep_exposure) {
             // 2b. this frame's scale texel: the v1 meter and the governor (feed v1).
@@ -1324,6 +1611,8 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
                     break;
             }
             m.feed = select_feed(s, m.hdr, m.units, readable, fr.auto_exposure || !fr.create_flags_known);
+            m.facts.feed = m.feed == kFeedV1 ? 0 : m.feed == kFeedTexture ? 1 : 2;
+            m.facts.exposure_texture = !fr.exposure.image ? 0 : readable ? 1 : 2;
             if (m.feed != m.logged_feed) {   // SelectFeed's line, once per decision
                 m.logged_feed = m.feed;
                 nr::logf("[nr] RenoDX stage: NR feed %s (NRFeedMode=%u; exposure texture %s, auto exposure %s, "
@@ -1379,6 +1668,7 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
                            feed_constants, sizeof feed_constants, 1, 1);
             }
         }
+        if (prep_normalise) prep_forward_hdr(w0, false);   // after RenoDX's scale, which it divides by
     }
 
     // 3. The stack: each pass encodes the running image, runs the network on it, shapes its edit and resolves it
@@ -1388,7 +1678,20 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
     bool motion_copied = false;
     // Read in place where the game's image stays in GENERAL and can be sampled (the compose reads it at the region's
     // base); else the vectors' region, copied to the origin of an image of its own (once a frame, every pass reads it).
-    const bool motion_wanted = ls.stabilize == 2u && have_motion && look::dispatched(ls, false);
+    // Edit strength (method 3) runs at any strength but 1 (its own slider; Passes (fast) is not its)
+    const uint32_t fast_slot = std::min(s.fast_method, 2u);   // the chosen method's own settings (Edit strength: none)
+    const bool fast = s.passes_mode == 1u && (s.fast_method == 3u ? s.fast_edit_strength != 1.f : s.fast_passes[fast_slot] > 1.f);
+    const bool fast_motion = have_motion && fr.fast_motion_available;
+    const bool fast_history = s.fast_method == 1u || s.fast_method == 2u;   // Feedback / Hybrid (Edit strength: none)
+    const bool fast_feedback = fast && fast_history && fast_motion;
+    m.facts.fast_passes = s.passes_mode == 1u ? (s.fast_method == 3u ? s.fast_edit_strength : s.fast_passes[fast_slot]) : 0.f;
+    m.facts.motion = fast_motion;
+    m.facts.fast_fallback = fast && fast_history && !fast_motion;
+    if (!fast) {
+        for (Image* im : {&m.st_fineh, &m.st_fbadd, &m.st_d0, &m.st_d1, &m.st_t0, &m.st_t1, &m.st_g0, &m.st_g1, &m.st_f0[0], &m.st_f0[1], &m.st_f1[0], &m.st_f1[1]}) m.retire(*im);
+        m.st_valid = false;
+    }
+    const bool motion_wanted = (ls.stabilize == 2u && have_motion && look::dispatched(ls, false)) || fast_feedback;
     if (motion_wanted && fr.motion.before == VK_IMAGE_LAYOUT_GENERAL && fr.motion.after == VK_IMAGE_LAYOUT_GENERAL &&
         (fr.motion.usage & VK_IMAGE_USAGE_SAMPLED_BIT)) {
         if (!borrow) borrow = &m.borrow_slot();
@@ -1423,6 +1726,7 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
         motion_copied = true;
     }
     const bool reset_all = fr.reset || m.history_reset;
+    if (reset_all || !fast_feedback) m.st_valid = false;
     m.history_reset = false;
     m.recreate = false;
     ColourFrame p;
@@ -1442,9 +1746,15 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
     for (uint32_t k = 0; k < passes; ++k) {
         float transfer = 1.f, color = 1.f;
         m.strengths(k, &transfer, &color);
-        const Image& ref = k == 0 ? (m.hdr ? m.work0 : m.original) : m.stack_out(k - 1);
+        const Image& ref = k == 0 ? (m.hdr ? w0 : m.original) : m.stack_out(k - 1);
         Image& write = m.stack_out(k);
-        if (m.hdr && transfer <= 0.f && color <= 0.f) {
+        // the SDR frame read where it is (one pass): its view and sets naming it from the borrow pool
+        const bool ref_frame = !m.hdr && k == 0 && read_in_place;
+        const VkImageView ref_view = ref_frame ? borrow->in : ref.view;
+        const auto SR = [&](Impl::P prog, const std::map<uint32_t, VkImageView>& v) {
+            return ref_frame ? m.set_for(m.programs[prog], v, {}, borrow->pool) : m.S(prog, v);
+        };
+        if (v6 && transfer <= 0.f && color <= 0.f) {
             // An explicit zero-strength pass carries the running image across exactly.
             Impl::copy_general(cmd, ref, write);
             executed = int32_t(k);
@@ -1453,7 +1763,7 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
             continue;
         }
         // 3a. encode: the running image -> the proxy at the network's extent.
-        if (m.hdr) {
+        if (v6) {
             if (m.prep_on && k > 0) prep_forward_hdr(ref, false);
             const Image& src = m.prep_on ? m.work_p : ref;
             if (m.prep_on && pp.curve != 0) {
@@ -1462,7 +1772,8 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
                 m.dispatch(cmd, Impl::kPrepEncode, m.S(Impl::kPrepEncode, {{0, m.work_p.view}, {4, m.proxy.view}}), push,
                            sizeof push, nx, ny);
             } else {
-                const V6Constants enc = make_v6(s, m.f6, NW, NH, W, H, NW, NH, NW, NH, transfer, color, 0.f);
+                V6Constants enc = make_v6(s, m.f6, NW, NH, W, H, NW, NH, NW, NH, transfer, color, 0.f);
+                if (prep_normalise) enc.divisor = 1.f;   // Preprocess's forward half divided already
                 m.dispatch(cmd, Impl::kEncode6,
                            m.S(Impl::kEncode6, {{0, src.view}, {1, src.view}, {2, src.view}, {3, m.scale_or_work0()},
                                                 {4, m.proxy.view}}),
@@ -1479,19 +1790,43 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
             if (ls.upsample == look::kUpsampleAreaInput && m.up_proxy.handle && look::transport_wanted(ls, NW, NH, W, H))
                 c.padding[0] = look::kAreaEncode;
             m.dispatch(cmd, Impl::kEncodeL,
-                       m.S(Impl::kEncodeL, {{0, ref.view}, {1, ref.view}, {2, ref.view}, {3, ref.view}, {4, m.proxy.view}}),
+                       SR(Impl::kEncodeL, {{0, ref_view}, {1, ref_view}, {2, ref_view}, {3, ref_view}, {4, m.proxy.view}}),
                        &c, sizeof c, nx, ny);
-            if (m.prep_on) {   // the network's input in place, P kept (runtime_prep.comp mode 1); the meter once a frame
+            if (m.prep_on) {   // the network's input in place, P kept (renodx_prep.comp mode 1); the meter once a frame
+                // the network's input into prep_keep, the proxy left as P - nothing kept or put back
                 PrepPush pp_push = m.prep_push;
-                const VkDescriptorSet set = m.S(Impl::kPrep, {{1, m.proxy.view}, {2, m.prep_keep.view}, {3, m.neural.view}},
+                if (prep_apart) pp_push.flags |= kPrepApart;
+                const VkDescriptorSet set = m.S(Impl::kPrep, {{1, m.proxy.view}, {2, m.prep_keep.view}, {3, m.neural.view}, {4, prep_scale}},
                                                 prep_state);
                 if (k == 0 && pp.exposure == 1) m.dispatch(cmd, Impl::kPrep, set, &pp_push, sizeof pp_push, 1, 1);
                 pp_push.mode = 1;
                 m.dispatch(cmd, Impl::kPrep, set, &pp_push, sizeof pp_push, nx, ny);
             }
         }
+        // Work in the input the network actually reads, including SDR Preprocess APART.
+        const VkImageView fast_input = prep_apart ? m.prep_keep.view : m.proxy.view;
+        const float nfast = std::clamp(s.fast_passes[fast_slot], 1.f, 8.f);
+        const uint32_t segment = std::min(uint32_t(nfast), 3u) - 1u;
+        const float kt[] = {1.f, 1.77f, 2.36f, 2.94f}, wt[] = {0.f, 0.5f, 0.67f, 0.75f};
+        const float part = nfast - float(segment + 1u);
+        const float fast_k = nfast > 4.f ? 2.94f + 0.58f * (nfast - 4.f) : kt[segment] + part * (kt[segment + 1] - kt[segment]);
+        const float fast_w = nfast > 4.f ? std::min(0.8f, 1.f - 1.f / nfast) : wt[segment] + part * (wt[segment + 1] - wt[segment]);
+        if (fast) m.ensure_st(cmd, NW, NH, fast_history);
+        if (fast_feedback && motion_copied) {
+            struct { uint32_t size[2], low[2], mbase[2], mgrid[2]; float mscale[2], w; uint32_t flags, block; float cstop, darkcol; }
+                fp{{NW, NH}, {(NW + 3) / 4, (NH + 3) / 4}, {}, {fr.motion.width, fr.motion.height},
+                   {fr.motion_scale_x * float(NW), fr.motion_scale_y * float(NH)}, fast_w,
+                   16u | 2u | (m.st_valid ? 1u : 0u), 4u, 0.f, 0.45f};
+            const bool borrowed = borrow && borrow->motion;
+            if (borrowed) { fp.mbase[0] = fr.motion_x; fp.mbase[1] = fr.motion_y; }
+            const std::map<uint32_t, VkImageView> views{{0, m.st_f0[m.st_cur].view}, {2, m.st_f1[m.st_cur].view},
+                {1, borrowed ? borrow->motion : m.motion.view}, {4, fast_input}, {5, m.st_fbadd.view}};
+            m.dispatch(cmd, Impl::kStFbIn, borrowed ? m.set_for(m.programs[Impl::kStFbIn], views, {}, borrow->pool)
+                                                   : m.S(Impl::kStFbIn, views), &fp, sizeof fp, nx, ny);
+        }
         // 3b. the network.
         const bool reset = reset_all || (k > 0 && !s.chained_history);
+        p.image = prep_apart ? m.prep_keep.handle : m.proxy.handle;
         m.mark(cmd, "before-network");
         network(k, p, n, reset);
         m.mark(cmd, "network");
@@ -1501,38 +1836,166 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                              VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
                                  VK_ACCESS_TRANSFER_WRITE_BIT);
-        // SDR with Preprocess: its change taken back out of the answer, P back into the proxy (mode 2, RESTORE).
-        if (m.prep_on && !m.hdr) {
+        if (fast) {
+            const bool fb = fast_feedback && motion_copied;
+            struct { uint32_t size[2], low[2]; float k; uint32_t mode; float halo, chroma; uint32_t satkeep;
+                     float fine, base, rho, lam, dcol, cfloor, ring, ccap, nohalo; uint32_t restored; float ocap, darkcol; }
+                ap{{NW, NH}, {(NW + 3) / 4, (NH + 3) / 4}, fast_k, fb ? (s.fast_method == 2u ? 8u : 6u) : 9u,
+                   fb ? nfast - 1.f : (s.fast_halo_limit[fast_slot] ? 0.f : 1.f), fb ? 0.6f : 0.3f, bits(0.5f),
+                   fb ? 1.f : 2.f, 1.f, 0.3f, 0.f, 0.5f, fb ? 0.f : 0.6f, 2.f, fb ? 0.f : 2.5f,
+                   fb ? (s.fast_halo_limit[fast_slot] ? 1.f : 0.5f) : 0.f, 0u, fb ? -0.5f : 0.f, fb ? 0.45f : 0.f};
+            if (fb && s.fast_method == 1u) ap.k = nfast - 1.f;
+            // Fine detail: Extrapolation's fine band, Feedback's detail add (k), Hybrid's feedback branch's (halo);
+            // (the chosen method's own Fine, also when Feedback / Hybrid run as Extrapolation for want of motion vectors)
+            const float fine = s.fast_fine[fast_slot];
+            if (fine != 1.f) {
+                if (!fb) ap.fine *= fine;
+                else if (s.fast_method == 1u) ap.k *= fine;
+                else { ap.halo *= fine; ap.fine = fine; }   // Hybrid: feedback branch and overlay's fine part
+            }
+            ap.restored = fb ? 1u : 0u;   // with feedback also P given back and this frame's edit's cell means
+            const bool edit = s.fast_method == 3u;   // Edit strength: the apply alone (no fine part, no guided filter)
+            if (edit) { ap.mode = 10u; ap.k = std::clamp(s.fast_edit_strength, 0.f, 4.f); }
+            const uint32_t pp[5] = {NW, NH, (NW + 3) / 4, (NH + 3) / 4, fb ? 1u : 0u};
+            if (!edit) {
+                m.dispatch(cmd, Impl::kStPrep, m.S(Impl::kStPrep, {{0, fast_input}, {1, m.neural.view},
+                    {4, m.st_fineh.view}, {5, m.st_d0.view}, {6, m.st_d1.view}}), pp, sizeof pp, nx, ny);
+                m.st_gf(cmd, NW, NH, m.st_g0, m.st_g1, fb ? 2u : 4u, fb ? 1e9f : 1e-3f);
+            }
+            m.dispatch(cmd, Impl::kStApply, m.S(Impl::kStApply,
+                {{0, fast_input}, {1, fb ? m.st_fbadd.view : m.st_fineh.view}, {2, m.st_g0.view}, {3, m.st_g1.view}, {4, m.neural.view}, {5, m.st_fineh.view},
+                 {6, m.st_d0.view}, {7, m.st_d1.view}}),
+                &ap, sizeof ap, nx, ny);
+            if (fb) {   // filtered into the next frame's history
+                m.st_gf(cmd, NW, NH, m.st_f0[m.st_cur ^ 1u], m.st_f1[m.st_cur ^ 1u], 2u, 1e9f);
+                m.st_cur ^= 1u; m.st_valid = true;
+            }
+            m.mark(cmd, "fast-apply");
+        }
+        // SDR with Preprocess: transfer the edit back through the bounded inverse, restore P to the proxy (mode 2, RESTORE). Not on the
+        // last pass while NR Control's debug view shows this layer: the view is of the network's own input and answer
+        // (fix list B3), and it replaces the picture this pass would make.
+        const bool debug_raw = s.debug_view >= 1u && s.debug_view <= 3u && k + 1 == passes;
+        if (m.prep_on && !m.hdr && !debug_raw) {
             PrepPush back = m.prep_push;
             back.mode = 2;
-            back.flags = (back.flags & ~uint32_t(kPrepReset)) | uint32_t(kPrepRestore);
+            back.flags = (back.flags & ~uint32_t(kPrepReset)) | (prep_apart ? 0u : uint32_t(kPrepRestore));
+            // (off; NR_PREP_RECOMP=1 runs it): the network's input made again from P, not
+            // read - exact (half_rtz) but slower (4K prep 0.635 -> 0.757 ms: mode 2 is ALU-bound, the forward costs more)
+            static const bool recompute = [] { const char* e = std::getenv("NR_PREP_RECOMP"); return e && e[0] == '1'; }();
+            if (prep_apart && recompute) back.flags |= kPrepRecompute;
+            const VkImageView nin = prep_apart ? m.prep_keep.view : m.proxy.view, kept = prep_apart ? m.proxy.view : m.prep_keep.view;
             m.dispatch(cmd, Impl::kPrep,
-                       m.S(Impl::kPrep, {{1, m.proxy.view}, {2, m.prep_keep.view}, {3, m.neural.view}}, prep_state),
+                       m.S(Impl::kPrep, {{1, nin}, {2, kept}, {3, m.neural.view}, {4, prep_scale}}, prep_state),
                        &back, sizeof back, nx, ny);
         }
         // 3c. the look: Adjust NR's look, Detail stability, edge-aware upsampling.
-        const Impl::Route route = m.run_look(cmd, k, ref, ls, motion_copied, fr, reset, borrow);
+        // SDR in place at the frame's extent with the look shaping and the black-level restore: the compose decodes
+        // (look_compose_decode); its store into the output comes after everything that read the frame. NR_RDX_CD=0: apart.
+        static const bool cd_on = [] { const char* e = std::getenv("NR_RDX_CD"); return e && e[0] == '1'; }();
+        // (tried 10-25: look_compose_decode is slower than the two programs - 1.10 / 1.43 ms against 0.70 + 0.37 at 4K,
+        // the compose loses its occupancy - so it stays apart; NR_RDX_CD=1 runs the fused one)
+        const bool fuse_cd = sdr_inplace && cd_on && s.codec_mode != 0u && NW == W && NH == H && look::dispatched(ls, false);
+        Impl::ComposeDecode cd;
+        if (fuse_cd) {
+            cd.out = store_in_place ? borrow->out : write.view;
+            cd.color = color;
+            cd.borrowed = store_in_place;
+            prepare_store();
+            store_prepared = true;
+        }
+        const Impl::Route route = m.run_look(cmd, k, ref_view, ls, motion_copied, fr, reset, borrow, fuse_cd ? &cd : nullptr);
         const VkImageView rp = route.transport ? m.up_proxy.view : m.proxy.view;
         const VkImageView rn = route.transport ? m.up_neural.view : route.shaped ? m.look_out.view : m.neural.view;
         const uint32_t pw = route.transport ? W : NW, ph = route.transport ? H : NH;
         // 3d. resolve onto the running image.
-        if (m.hdr && fuse && k + 1 == passes) {
+        if (v6 && fuse && k + 1 == passes) {
             const V6Constants res = make_v6(s, m.f6, W, H, W, H, pw, ph, pw, ph, transfer, color, s.chroma_clamp_stops,
                                             m.ratio_resolve);
             const std::map<uint32_t, VkImageView> fv{{0, ref.view}, {1, rp}, {2, rn}, {3, m.scale_or_work0()},
                                                      {4, store_in_place ? borrow->out : m.decoded.view}};
             prepare_store();
-            m.dispatch(cmd, Impl::kResolveCommit6,
-                       store_in_place ? m.set_for(m.programs[Impl::kResolveCommit6], fv, {}, borrow->pool)
-                                      : m.S(Impl::kResolveCommit6, fv),
-                       &res, sizeof res, gx, gy);
+            const Impl::P rc = prep_resolve ? Impl::kResolveCommit6Prep : Impl::kResolveCommit6;
+            const V6PrepConstants pres = prep_constants(res);
+            m.dispatch(cmd, rc, store_in_place ? m.set_for(m.programs[rc], fv, {}, borrow->pool) : m.S(rc, fv),
+                       prep_resolve ? static_cast<const void*>(&pres) : &res, prep_resolve ? sizeof pres : sizeof res,
+                       gx, gy);
             fused = true;
-        } else if (m.hdr) {
+        } else if (v6) {
             const V6Constants res = make_v6(s, m.f6, W, H, W, H, pw, ph, pw, ph, transfer, color, s.chroma_clamp_stops,
                                             m.ratio_resolve);
-            m.dispatch(cmd, Impl::kResolve6,
-                       m.S(Impl::kResolve6, {{0, ref.view}, {1, rp}, {2, rn}, {3, m.scale_or_work0()}, {4, write.view}}),
-                       &res, sizeof res, gx, gy);
+            const Impl::P rv = prep_resolve ? Impl::kResolve6Prep : Impl::kResolve6;
+            const V6PrepConstants pres = prep_constants(res);
+            m.dispatch(cmd, rv, m.S(rv, {{0, ref.view}, {1, rp}, {2, rn}, {3, m.scale_or_work0()}, {4, write.view}}),
+                       prep_resolve ? static_cast<const void*>(&pres) : &res, prep_resolve ? sizeof pres : sizeof res,
+                       gx, gy);
+        } else if (sdr_inplace) {
+            // the frame read where it is (ref_view), the answer stored into the output when it takes it; with
+            // the black-level restore the decode and its reduce in one pass (legacy_decode_reduce: the same values),
+            // then the apply on what was stored.
+            LegacyConstants c{};
+            c.size[0] = W; c.size[1] = H; c.source_size[0] = W; c.source_size[1] = H;
+            c.proxy_size[0] = c.neural_size[0] = pw; c.proxy_size[1] = c.neural_size[1] = ph;
+            c.paper_white_scale = s.paper_white_scale; c.transfer_strength = transfer; c.color_strength = color;
+            c.hdr = 0; c.diffuse_white_nits = s.diffuse_white_nits;
+            const VkImageView out_view = store_in_place ? borrow->out : write.view;
+            const bool borrowed = ref_frame || store_in_place;
+            // (10-25: the unshaped reduce first, on the frame in place, then the decode - 4K still tool 0.174 + 0.146 ms
+            // against legacy_decode_reduce's 0.389, ReShade route 0.43 for the fused one; NR_RDX_SPLIT_UNSHAPED=0: fused)
+            static const bool split_unshaped = [] { const char* e = std::getenv("NR_RDX_SPLIT_UNSHAPED"); return !(e && e[0] == '0'); }();
+            const auto SB = [&](Impl::P prog, const std::map<uint32_t, VkImageView>& v) {
+                return borrowed ? m.set_for(m.programs[prog], v, {}, borrow->pool) : m.S(prog, v);
+            };
+            if (!store_prepared) prepare_store();
+            store_prepared = true;
+            if (route.fused_decode) {   // decoded and measured by the compose: the apply
+                LegacyConstants a = c;
+                a.proxy_size[0] = a.neural_size[0] = NW; a.proxy_size[1] = a.neural_size[1] = NH;
+                a.padding[0] = s.sdr_black_restore == 1u ? 2.f : 0.061f;
+                a.padding[1] = float(s.sdr_black_restore);
+                m.dispatch(cmd, Impl::kApplyL,
+                           SB(Impl::kApplyL, {{0, ref_view}, {1, m.proxy.view}, {2, m.neural.view}, {3, ref_view},
+                                              {4, out_view}, {5, m.block_mean.view}}),
+                           &a, sizeof a, gx, gy);
+            } else if (s.codec_mode != 0u && route.shaped && split_unshaped) {
+                // the unshaped measure reads only the untouched frame and the network's answer, never the
+                // decode: the reduce first, on the frame as it is, then the decode stored in place, then the apply
+                LegacyConstants r = c;
+                r.proxy_size[0] = r.neural_size[0] = NW; r.proxy_size[1] = r.neural_size[1] = NH;
+                m.dispatch(cmd, Impl::kReduceLUnshaped,
+                           SB(Impl::kReduceLUnshaped, {{0, ref_view}, {1, m.proxy.view}, {2, m.neural.view}, {3, ref_view},
+                                                       {4, out_view}, {5, m.block_mean.view}}),
+                           &r, sizeof r, (W + 31) / 32, (H + 31) / 32);
+                m.dispatch(cmd, Impl::kDecodeL, SB(Impl::kDecodeL, {{0, ref_view}, {1, rp}, {2, rn}, {3, ref_view}, {4, out_view}}),
+                           &c, sizeof c, gx, gy);
+                LegacyConstants a = r;
+                a.padding[0] = s.sdr_black_restore == 1u ? 2.f : 0.061f;
+                a.padding[1] = float(s.sdr_black_restore);
+                m.dispatch(cmd, Impl::kApplyL,
+                           SB(Impl::kApplyL, {{0, ref_view}, {1, m.proxy.view}, {2, m.neural.view}, {3, ref_view},
+                                              {4, out_view}, {5, m.block_mean.view}}),
+                           &a, sizeof a, gx, gy);
+            } else if (s.codec_mode != 0u) {
+                LegacyConstants f = c;
+                f.padding[0] = route.shaped ? 1.f : 0.f;   // the reduce's measure: the unshaped answer's resolve
+                std::memcpy(&f.padding[2], &NW, 4);
+                std::memcpy(&f.padding[3], &NH, 4);
+                m.dispatch(cmd, Impl::kDecodeReduceL,
+                           SB(Impl::kDecodeReduceL, {{0, ref_view}, {1, rp}, {2, rn}, {3, ref_view}, {4, out_view},
+                                                     {5, m.block_mean.view}, {6, m.proxy.view}, {7, m.neural.view}}),
+                           &f, sizeof f, (W + 31) / 32, (H + 31) / 32);
+                LegacyConstants a = c;
+                a.proxy_size[0] = a.neural_size[0] = NW; a.proxy_size[1] = a.neural_size[1] = NH;
+                a.padding[0] = s.sdr_black_restore == 1u ? 2.f : 0.061f;
+                a.padding[1] = float(s.sdr_black_restore);
+                m.dispatch(cmd, Impl::kApplyL,
+                           SB(Impl::kApplyL, {{0, ref_view}, {1, m.proxy.view}, {2, m.neural.view}, {3, ref_view},
+                                              {4, out_view}, {5, m.block_mean.view}}),
+                           &a, sizeof a, gx, gy);
+            } else {
+                m.dispatch(cmd, Impl::kDecodeL, SB(Impl::kDecodeL, {{0, ref_view}, {1, rp}, {2, rn}, {3, ref_view}, {4, out_view}}),
+                           &c, sizeof c, gx, gy);
+            }
         } else {
             LegacyConstants c{};
             c.size[0] = W; c.size[1] = H; c.source_size[0] = W; c.source_size[1] = H;
@@ -1573,25 +2036,39 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
             const bool unshaped = executed == 0 && final_shaped;
             const V6Constants red = make_v6(s, m.f6, W, H, W, H, NW, NH, NW, NH, final_transfer, final_color,
                                             s.chroma_clamp_stops, m.ratio_resolve);
+            const Impl::P ru = prep_resolve ? Impl::kReduce6UnshapedPrep : Impl::kReduce6Unshaped;
             const VkDescriptorSet set = unshaped
-                ? m.S(Impl::kReduce6Unshaped, {{0, m.work0.view}, {1, m.proxy.view}, {2, m.neural.view},
-                                               {3, m.scale_or_work0()}, {4, m.block_mean.view}})
-                : m.S(Impl::kReduce6, {{0, work_final.view}, {1, m.work0.view}, {2, m.scale_or_work0()},
-                                       {3, m.work0.view}, {4, m.block_mean.view}});
-            m.dispatch(cmd, unshaped ? Impl::kReduce6Unshaped : Impl::kReduce6, set, &red, sizeof red, (W + 31) / 32,
-                       (H + 31) / 32);
+                ? m.S(ru, {{0, w0.view}, {1, m.proxy.view}, {2, m.neural.view},
+                           {3, m.scale_or_work0()}, {4, m.block_mean.view}})
+                : m.S(Impl::kReduce6, {{0, work_final.view}, {1, w0.view}, {2, m.scale_or_work0()},
+                                       {3, w0.view}, {4, m.block_mean.view}});
+            const V6PrepConstants pred = prep_constants(red);
+            const bool prep_red = unshaped && prep_resolve;
+            m.dispatch(cmd, unshaped ? ru : Impl::kReduce6, set, prep_red ? static_cast<const void*>(&pred) : &red,
+                       prep_red ? sizeof pred : sizeof red, (W + 31) / 32, (H + 31) / 32);
         }
         const V6Constants com = make_v6(s, m.f6, W, H, W, H, W, H, W, H, final_transfer, final_color, 0.f);
         const bool v2 = !m.units.absolute && m.feed != kFeedV1;
         const Impl::P commit = v2 ? Impl::kCommitExposure : Impl::kCommit6;
-        const std::map<uint32_t, VkImageView> cv{{0, work_final.view}, {1, m.work0.view},
-                                                 {2, v2 ? m.scale.view : m.scale_or_work0()}, {3, m.work0.view},
+        const std::map<uint32_t, VkImageView> cv{{0, work_final.view}, {1, w0.view},
+                                                 {2, v2 ? m.scale.view : m.scale_or_work0()}, {3, w0.view},
                                                  {4, store_in_place ? borrow->out : m.decoded.view}, {5, m.block_mean.view}};
         prepare_store();
         m.dispatch(cmd, commit, store_in_place ? m.set_for(m.programs[commit], cv, {}, borrow->pool) : m.S(commit, cv),
                    &com, sizeof com, gx, gy);
     } else {
         result = &m.stack_out(uint32_t(executed));
+    }
+    // NR Control's debug view of this layer ([Inspect] DebugView), over what goes to the frame
+    if (s.debug_view >= 1u && s.debug_view <= 3u) {
+        const uint32_t dv[5] = {W, H, NW, NH, s.debug_view};
+        // the network's input: with SDR Preprocess apart, prep_keep (the proxy holds the frame); else the proxy
+        const VkImageView shown_in = m.prep_on && !m.hdr && prep_apart ? m.prep_keep.view : m.proxy.view;
+        const std::map<uint32_t, VkImageView> v{{0, shown_in}, {1, m.neural.view},
+                                                {4, store_in_place ? borrow->out : result->view}};
+        m.dispatch(cmd, Impl::kDebug,
+                   store_in_place ? m.set_for(m.programs[Impl::kDebug], v, {}, borrow->pool) : m.S(Impl::kDebug, v), dv,
+                   sizeof dv, gx, gy);
     }
 
     if (store_in_place) {
@@ -1629,8 +2106,46 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
     Impl::memory_barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
     m.mark(cmd, "copy-out");
+    // the engine-data panel's divisor (Facts::divisor): the scale texel, every 32nd frame
+    if (v6 && !m.units.absolute && m.scale.handle && (m.recordings & 31u) == 1u) {
+        if (!m.probe) {
+            VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            bi.size = 256; bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            if (vkCreateBuffer(m.device, &bi, nullptr, &m.probe) == VK_SUCCESS) {
+                VkMemoryRequirements req{}; vkGetBufferMemoryRequirements(m.device, m.probe, &req);
+                const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+                uint32_t type = m.mem.memoryTypeCount;
+                for (uint32_t i = 0; i < m.mem.memoryTypeCount; ++i)
+                    if ((req.memoryTypeBits & (1u << i)) && (m.mem.memoryTypes[i].propertyFlags & want) == want) { type = i; break; }
+                VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; ai.allocationSize = req.size; ai.memoryTypeIndex = type;
+                void* p = nullptr;
+                if (type == m.mem.memoryTypeCount || vkAllocateMemory(m.device, &ai, nullptr, &m.probe_memory) != VK_SUCCESS ||
+                    vkBindBufferMemory(m.device, m.probe, m.probe_memory, 0) != VK_SUCCESS ||
+                    vkMapMemory(m.device, m.probe_memory, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS) {
+                    if (m.probe_memory) vkFreeMemory(m.device, m.probe_memory, nullptr);
+                    vkDestroyBuffer(m.device, m.probe, nullptr);
+                    m.probe = VK_NULL_HANDLE; m.probe_memory = VK_NULL_HANDLE;
+                } else {
+                    m.probe_mapped = static_cast<float*>(p);
+                    m.probe_mapped[0] = 0.f;
+                }
+            }
+        }
+        if (m.probe) {
+            Impl::memory_barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            VkBufferImageCopy c{};
+            c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            c.imageExtent = {1, 1, 1};
+            vkCmdCopyImageToBuffer(cmd, m.scale.handle, VK_IMAGE_LAYOUT_GENERAL, m.probe, 1, &c);
+            Impl::memory_barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+        }
+    }
     m.prof_end();
     return ran;
 }
 
 }  // namespace nr::renodx
+
+namespace nr::renodx { bool Stage::recordings_done() const { return impl_->gpu_uses.ready(); } }

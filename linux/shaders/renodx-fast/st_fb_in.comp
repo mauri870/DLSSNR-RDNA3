@@ -1,0 +1,48 @@
+#version 460
+// Passes (fast): accepted Extrapolation / Feedback / Hybrid arithmetic.
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) uniform texture2D CA;
+layout(set = 0, binding = 2) uniform texture2D CB;
+layout(set = 0, binding = 1) uniform texture2D Motion;
+layout(set = 0, binding = 4, rgba16f) uniform image2D Proxy;
+layout(set = 0, binding = 5, rgba16f) uniform writeonly image2D FbAdd;
+layout(push_constant) uniform Push { uvec2 size, low, mbase, mgrid; vec2 mscale; float w; uint flags, block; float cstop, darkcol; } pc;
+#include "st_math.glsl"
+void main() {
+    const uvec2 px = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(px, pc.size))) return;
+    const vec4 p = imageLoad(Proxy, ivec2(px));
+    vec3 np = p.rgb;
+    float conf = 0.0;   
+    if ((pc.flags & 1u) != 0u) {
+        vec2 prev = vec2(px) + 0.5;
+        if ((pc.flags & 2u) != 0u) {
+            const uvec2 t = pc.mbase + min(uvec2((vec2(px) + 0.5) * vec2(pc.mgrid) / vec2(pc.size)), pc.mgrid - 1u);
+            prev += texelFetch(Motion, ivec2(t), 0).xy * pc.mscale;
+        }
+        if ((pc.flags & 16u) != 0u) {   
+            if (all(greaterThanEqual(prev, vec2(0.0))) && all(lessThanEqual(prev, vec2(pc.size)))) {
+                const float I = st_lab(p.rgb).x;
+                float mI, vI;
+                const vec3 q = st_gfq(CA, CB, prev, I, pc.low, mI, vI);
+                const float z = (I - mI) * (I - mI) / (vI + 0.0004);
+                conf = exp(-0.125 * z);
+                vec3 add = pc.w * conf * q;
+                if (pc.darkcol > 0.0) {   
+                    const vec3 X = st_lab(p.rgb), Y = st_lab(clamp(p.rgb + add, 0.0, 1.0));
+                    add = st_enc(st_lin(vec3(Y.x, X.yz + smoothstep(0.0, pc.darkcol, X.x) * (Y.yz - X.yz)))) - p.rgb;
+                }
+                float s = 1.0;
+                for (int c = 0; c < 3; ++c) {
+                    if (add[c] > 1e-7) s = min(s, max(1.0 - p[c], 0.0) / add[c]);
+                    else if (add[c] < -1e-7) s = min(s, max(p[c], 0.0) / -add[c]);
+                }
+                np = p.rgb + s * add;
+            }
+        }
+    }
+    imageStore(Proxy, ivec2(px), vec4(np, p.a));
+    imageStore(FbAdd, ivec2(px), vec4(np - p.rgb, conf));
+}

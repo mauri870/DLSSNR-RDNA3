@@ -34,9 +34,11 @@
 #include "nr_pe_crash.hpp"
 #include "nr_pe_log.hpp"
 #include "nr_pe_session.hpp"
+#include "nr_engine_panel.hpp"
 #include "nr_pe_vkdevice.hpp"
 
 #include <MinHook.h>
+#include <d3dcommon.h>
 #include <dxgi1_6.h>
 #include <tlhelp32.h>
 
@@ -47,6 +49,7 @@
 #include <reshade.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -61,6 +64,7 @@
 #include <type_traits>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 
 extern "C" __declspec(dllexport) const char* NAME = "DLSS 5 NR on AMD";
@@ -163,6 +167,8 @@ bool renodx_on = false;
 effect_runtime* bound = nullptr;
 effect_technique technique{};
 effect_texture_variable mv_var{}, depth_var{};
+// The engine-data panel's facts from the last frame fed (feed), drawn on the add-on page.
+nr::pe::panel::Facts panel_facts;
 bool need_reset = true;
 // The bound effect runtime's presents, and their count when NR last ran a frame: frames between two NR frames
 // without NR ([DlssNr] Enabled or RenoDX's NeuralUplift off, the technique off, frames declined) and the next NR
@@ -176,8 +182,17 @@ bool missing_reported = false;
 std::string last_status;
 unsigned frames_run = 0, frames_declined = 0;
 
+// The motion-vector source (VORT or LumeniteFX Kernel), below.
+void motion_after_reload();
+void motion_choice_changed();
+
 const nr::Controls& settings() {
+    const int motion_was = config.motion_vectors;
     if (!config_path.empty() && config.reload(config_path)) {
+        if (config.motion_vectors != motion_was) {   // MotionVectors edited in the file: apply it at the next present
+            motion_choice_changed();
+            log("[nr] settings reloaded: MotionVectors %s", config.motion_vectors == 1 ? "lumenite" : "vort");
+        }
         if (session) {
         session->set_history_strength(renodx_on ? 1.0f : config.history);
         session->set_white_point(config.white_point);
@@ -247,7 +262,9 @@ void report(const std::string& status) {
     reshade::log::message(reshade::log::level::info, ("nr: " + status).c_str());
 }
 
+
 void resolve(effect_runtime* rt) {
+    motion_after_reload();
     technique = rs::call(rt, &effect_runtime::find_technique, kEffect, kTechnique);
     mv_var = rs::call(rt, &effect_runtime::find_texture_variable, kEffect, "DLSS5_MV");
     depth_var = rs::call(rt, &effect_runtime::find_texture_variable, kEffect, "DLSS5_Depth");
@@ -598,6 +615,426 @@ bool dump_ensure(device* dev, unsigned w, unsigned h, format f) {
     return true;
 }
 
+// ---- Wine's d3dcompiler_47 and `[fastopt]` ------------------------------------
+//
+// ReShade turns an effect's `[loop]` into `[fastopt]` in the HLSL it generates for shader model 4 and up
+// (effect_codegen_hlsl.cpp), and Wine's d3dcompiler_47 (vkd3d-shader) rejects that attribute ("E5017 ...
+// Unhandled attribute 'fastopt'") while it ignores `[loop]` itself. The effects in the package have their
+// `[loop]` removed for it in the Linux package (the Windows package's are as published, for the system's
+// compiler); LumeniteFX is installed from its author's GitHub and is not changed. So when ReShade's own call to D3DCompile fails on `[fastopt]`, it is called again
+// with the attribute taken out of the generated HLSL - the same HLSL the effect without `[loop]` gives. Only
+// ReShade's calls, only after such a failure; the game's own compiles and every compile that succeeds are untouched.
+// MinHook is ours (linked into this module): the device watch (Vulkan) and the D3DCompile retry below use it.
+bool minhook_initialized = false;
+bool vk_watch = false;
+bool minhook_start() {
+    if (!minhook_initialized) {
+        const MH_STATUS mh = MH_Initialize();
+        minhook_initialized = mh == MH_OK || mh == MH_ERROR_ALREADY_INITIALIZED;
+    }
+    return minhook_initialized;
+}
+
+using D3DCompileFn = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const void*, void*, LPCSTR, LPCSTR, UINT, UINT,
+                                      ID3DBlob**, ID3DBlob**);
+D3DCompileFn real_d3dcompile = nullptr;
+void* d3dcompile_target = nullptr;
+HMODULE reshade_module = nullptr;
+std::atomic<unsigned> fastopt_retries{0};
+
+HRESULT WINAPI d3dcompile_hook(LPCVOID src, SIZE_T size, LPCSTR name, const void* defines, void* include,
+                               LPCSTR entry, LPCSTR target, UINT flags1, UINT flags2, ID3DBlob** code,
+                               ID3DBlob** errors) {
+    void* const caller = __builtin_return_address(0);
+    const HRESULT hr = real_d3dcompile(src, size, name, defines, include, entry, target, flags1, flags2, code, errors);
+    if (SUCCEEDED(hr) || !src || !size || !errors || !*errors) return hr;
+    HMODULE from = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            static_cast<LPCWSTR>(caller), &from) || from != reshade_module)
+        return hr;
+    const std::string message(static_cast<const char*>((*errors)->GetBufferPointer()), (*errors)->GetBufferSize());
+    if (message.find("fastopt") == std::string::npos) return hr;
+    static const std::string attribute = "[fastopt] ";   // as ReShade writes it
+    const std::string_view text(static_cast<const char*>(src), size);
+    std::string hlsl;
+    hlsl.reserve(text.size());
+    size_t removed = 0;
+    for (size_t at = 0;;) {
+        const size_t next = text.find(attribute, at);
+        if (next == std::string_view::npos) { hlsl.append(text.substr(at)); break; }
+        hlsl.append(text.substr(at, next - at));
+        at = next + attribute.size();
+        ++removed;
+    }
+    if (!removed) return hr;
+    (*errors)->Release(); *errors = nullptr;
+    if (code && *code) { (*code)->Release(); *code = nullptr; }
+    const HRESULT again = real_d3dcompile(hlsl.data(), hlsl.size(), name, defines, include, entry, target, flags1,
+                                          flags2, code, errors);
+    const unsigned n = ++fastopt_retries;
+    if (n == 1 || FAILED(again))
+        log("[nr] d3dcompiler_47 rejected `[fastopt]` in ReShade's HLSL for %s; compiled again without it (%zu "
+            "removed): %s", entry ? entry : "?", removed, SUCCEEDED(again) ? "ok" : "FAILED");
+    return again;
+}
+
+// Before ReShade compiles its effects (it does so once its effect runtime is up, after the device): ReShade loads
+// D3DCompiler_47.dll by name under Wine (dll_main.cpp DliNotifyHook2), so this is the module it gets.
+void hook_d3dcompile() {
+    if (d3dcompile_target || !GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version")) return;
+    reshade_module = reshade::internal::get_reshade_module_handle();
+    const HMODULE compiler = LoadLibraryW(L"D3DCompiler_47.dll");
+    void* const fn = compiler ? reinterpret_cast<void*>(GetProcAddress(compiler, "D3DCompile")) : nullptr;
+    if (!fn || !reshade_module) { log("[nr] d3dcompiler_47: not found; no `[fastopt]` retry"); return; }
+    if (!minhook_start() || MH_CreateHook(fn, reinterpret_cast<void*>(&d3dcompile_hook),
+                                          reinterpret_cast<void**>(&real_d3dcompile)) != MH_OK ||
+        MH_EnableHook(fn) != MH_OK) {
+        log("[nr] d3dcompiler_47: the `[fastopt]` retry could not be installed");
+        return;
+    }
+    d3dcompile_target = fn;
+}
+
+void unhook_d3dcompile() {
+    if (!d3dcompile_target) return;
+    MH_DisableHook(d3dcompile_target);
+    MH_RemoveHook(d3dcompile_target);
+    d3dcompile_target = nullptr;
+}
+
+// ---- the motion-vector source: VORT (shipped) or LumeniteFX Kernel ---------------------------------------------
+//
+// dlssnr-amd.ini MotionVectors chooses; this applies it to ReShade - DLSS5_Feed.fx's DLSS5_MV_PROVIDER (2 VORT, 3
+// LumeniteFX Kernel) and which provider technique is on - and checks every launch that LumeniteFX still offers what
+// DLSS5_Feed reads: its effect compiled, its technique on and before DLSS5_Feed, its flow texture Kernel::tFlow the one
+// DLSS5_Feed samples, and vectors that are not all zero while the picture moves (nor NaN, nor beyond the screen).
+// LumeniteFX is installed from its author's GitHub and may be a newer version than the one tested; whenever a check
+// fails this session goes back to VORT and the add-on page and dlssnr-amd.log say why. The file keeps the choice, so
+// the next launch tries again. With VORT chosen nothing here touches ReShade unless it is switching away from
+// LumeniteFX.
+constexpr const char* kVortEffect = "vort_Motion.fx";
+constexpr const char* kVortTechnique = "vort_MotionEffects";
+constexpr const char* kLumeniteEffect = "lumenite_Kernel.fx";
+constexpr const char* kLumeniteTechnique = "Lumenite_Kernel";
+constexpr const char* kLumeniteFlow = "V__Kernel__tFlow";   // Kernel::tFlow under ReShade's unique name ('V' + "::Kernel::" + name, ':' -> '_')
+
+struct MotionSource {
+    bool sync_due = true;      // apply the file's choice at the next present
+    bool checks_due = false;   // the effects were reloaded: check LumeniteFX
+    bool reloading = false;    // a definition changed: the checks wait for ReShade's reload (the effects are the old ones)
+    bool lumenite_active = false;   // ReShade is set to LumeniteFX (by us)
+    bool fell_back = false;    // a check failed this session
+    std::string reason;
+    // The data check: every 60th DLSS5_Feed frame (every 600th once the vectors were seen moving) the flow texture
+    // and four 32x32 patches of the frame are copied out, and read at the next sample.
+    resource flow_copy{}, patch_copy{};
+    resource_desc flow_desc{};
+    format patch_format = format::unknown;
+    bool pending = false;
+    uint64_t frames = 0;
+    std::vector<uint8_t> last_patches;
+    unsigned moving = 0, zero_moving = 0, bad_in_row = 0, samples = 0;
+    bool verified = false;     // vectors seen moving with the picture
+    std::string probe_failure; // from the data check, applied at the next present
+    // Since when DLSS5_Feed has been missing with LumeniteFX set (ReShade compiles every effect again after a switch).
+    std::chrono::steady_clock::time_point missing_since{};
+};
+MotionSource motion;
+
+bool lumenite_on_disk() {
+    const std::string folder = nr::pe::module_folder();
+    if (folder.empty()) return false;
+    const DWORD a = GetFileAttributesA((folder + "\\reshade-shaders\\Shaders\\lumenite_Kernel.fx").c_str());
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+int feed_provider(effect_runtime* rt) {
+    char value[16] = {};
+    if (rt->get_preprocessor_definition_for_effect(kEffect, "DLSS5_MV_PROVIDER", value) ||
+        rt->get_preprocessor_definition("DLSS5_MV_PROVIDER", value))
+        return std::atoi(value);
+    return 0;
+}
+
+// Forget the samples in flight (the copies themselves retire with their frame).
+void motion_forget() {
+    motion.pending = false;
+    motion.last_patches.clear();
+}
+
+// The staging pair, with the device idle or going away.
+void motion_release(device* dev) {
+    if (dev && motion.flow_copy.handle) dev->destroy_resource(motion.flow_copy);
+    if (dev && motion.patch_copy.handle) dev->destroy_resource(motion.patch_copy);
+    motion.flow_copy = motion.patch_copy = resource{};
+    motion.pending = false;
+    motion.last_patches.clear();
+}
+
+// Set ReShade to `lumenite` or VORT: the provider definition (DLSS5_Feed.fx rebuilds) and the provider techniques.
+void motion_apply(effect_runtime* rt, bool lumenite) {
+    const effect_technique lum = rs::call(rt, &effect_runtime::find_technique, kLumeniteEffect, kLumeniteTechnique);
+    const effect_technique vort = rs::call(rt, &effect_runtime::find_technique, kVortEffect, kVortTechnique);
+    const int want = lumenite ? 3 : 2;
+    // Coming from LumeniteFX: ours, or the preset's (install.bat (LumeniteFX: y) turns VORT off there).
+    const bool from_lumenite = motion.lumenite_active || feed_provider(rt) == 3;
+    if (feed_provider(rt) != want) {
+        rt->set_preprocessor_definition("DLSS5_MV_PROVIDER", lumenite ? "3" : "2");
+        rt->reload_effect_next_frame(kEffect);
+        motion.reloading = true;
+        // A preset definition: ReShade compiles every effect again (runtime_api.cpp set_preprocessor_definition_for_effect).
+        log("[nr] motion vectors: DLSS5_MV_PROVIDER=%d (%s); ReShade compiles its effects again", want,
+            lumenite ? "LumeniteFX Kernel" : "VORT");
+    }
+    if (lum.handle && rt->get_technique_state(lum) != lumenite) rt->set_technique_state(lum, lumenite);
+    // VORT is switched on only when coming from LumeniteFX; with VORT chosen it is left as the preset has it.
+    if (vort.handle && (lumenite || from_lumenite) && rt->get_technique_state(vort) == lumenite)
+        rt->set_technique_state(vort, !lumenite);
+    if (motion.lumenite_active != lumenite) {
+        motion.lumenite_active = lumenite;
+        motion_forget();
+        motion.moving = motion.zero_moving = motion.bad_in_row = motion.samples = 0;
+        motion.verified = false;
+        motion.frames = 0;
+        need_reset = true;
+    }
+    motion.checks_due = lumenite;
+}
+
+void motion_fall_back(effect_runtime* rt, const std::string& why) {
+    motion.fell_back = true;
+    motion.reason = why;
+    log("[nr] motion vectors: LumeniteFX is not used this session - %s; VORT instead", why.c_str());
+    reshade::log::message(reshade::log::level::warning, ("nr: LumeniteFX not used - " + why).c_str());
+    motion_apply(rt, false);
+}
+
+// At a present, outside effect rendering: the file's choice, then the checks after a reload.
+void motion_sync(effect_runtime* rt) {
+    if (!rt) return;
+    if (!technique.handle) {   // still compiling, or DLSS5_Feed.fx failed to
+        const auto now = std::chrono::steady_clock::now();
+        if (motion.missing_since == std::chrono::steady_clock::time_point{}) motion.missing_since = now;
+        if (motion.lumenite_active && !motion.fell_back && now - motion.missing_since > std::chrono::seconds(180))
+            motion_fall_back(rt, "DLSS5_Feed.fx did not come up with LumeniteFX as its provider in 3 minutes (ReShade.log)");
+        return;
+    }
+    motion.missing_since = {};
+    if (!motion.probe_failure.empty()) {
+        const std::string why = std::move(motion.probe_failure);
+        motion.probe_failure.clear();
+        motion_fall_back(rt, why);
+        return;
+    }
+    const bool want = config.motion_vectors == 1 && !motion.fell_back;
+    if (motion.sync_due) {
+        motion.sync_due = false;
+        if (want && !lumenite_on_disk() &&
+            !rs::call(rt, &effect_runtime::find_technique, kLumeniteEffect, kLumeniteTechnique).handle) {
+            motion_fall_back(rt, "LumeniteFX is not installed (install.bat (LumeniteFX: y) installs it)");
+            return;
+        }
+        const bool set = feed_provider(rt) == 3;   // ReShade is on LumeniteFX (ours or the preset's)
+        if (want != motion.lumenite_active || want != set) motion_apply(rt, want);
+        else if (want) motion.checks_due = true;
+    }
+    if (!motion.checks_due || !motion.lumenite_active || motion.reloading) return;
+    if (feed_provider(rt) != 3) return;
+    motion.checks_due = false;
+    const effect_technique lum = rs::call(rt, &effect_runtime::find_technique, kLumeniteEffect, kLumeniteTechnique);
+    if (!lum.handle) {
+        unsigned others = 0;   // a compiled lumenite_Kernel.fx without the technique of that name
+        rt->enumerate_techniques(kLumeniteEffect, [](effect_runtime*, effect_technique, void* user) {
+            ++*static_cast<unsigned*>(user);
+        }, &others);
+        motion_fall_back(rt, others ? "lumenite_Kernel.fx has no technique Lumenite_Kernel (a LumeniteFX version this "
+                                      "package does not know?)"
+                             : lumenite_on_disk() ? "lumenite_Kernel.fx did not compile (ReShade.log has the error)"
+                                                  : "lumenite_Kernel.fx was not found");
+        return;
+    }
+    if (!rt->get_technique_state(lum)) rt->set_technique_state(lum, true);
+    if (!rt->get_technique_state(lum)) { motion_fall_back(rt, "the Lumenite_Kernel technique cannot be turned on"); return; }
+    // Before DLSS5_Feed in the effect order, or DLSS5_Feed reads the previous frame's flow.
+    std::vector<effect_technique> order;
+    rt->enumerate_techniques(nullptr, [](effect_runtime*, effect_technique t, void* user) {
+        static_cast<std::vector<effect_technique>*>(user)->push_back(t);
+    }, &order);
+    const auto at = [&](effect_technique t) {
+        return std::find_if(order.begin(), order.end(), [&](effect_technique o) { return o.handle == t.handle; });
+    };
+    if (at(lum) != order.end() && at(technique) != order.end() && at(lum) > at(technique)) {
+        order.erase(at(lum));
+        order.insert(at(technique), lum);
+        rt->reorder_techniques(order.size(), order.data());
+        log("[nr] motion vectors: Lumenite_Kernel moved before DLSS5_Feed in the effect order");
+    }
+    const effect_texture_variable mine = rs::call(rt, &effect_runtime::find_texture_variable, kLumeniteEffect, kLumeniteFlow);
+    const effect_texture_variable feeds = rs::call(rt, &effect_runtime::find_texture_variable, kEffect, kLumeniteFlow);
+    if (!mine.handle || !feeds.handle || mine.handle != feeds.handle) {
+        motion_fall_back(rt, std::string("LumeniteFX's flow texture Kernel::tFlow is ") +
+                                 (!mine.handle ? "not in lumenite_Kernel.fx" : "not the one DLSS5_Feed.fx reads") +
+                                 " (a LumeniteFX version this package does not know?)");
+        return;
+    }
+    log("[nr] motion vectors: LumeniteFX Kernel - compiled, on, before DLSS5_Feed, Kernel::tFlow shared");
+}
+
+void motion_choice_changed() {
+    motion.sync_due = true;
+    motion.fell_back = false;
+    motion.reason.clear();
+    motion.probe_failure.clear();
+}
+
+void motion_after_reload() {
+    motion_forget();
+    motion.reloading = false;
+    motion.checks_due = motion.lumenite_active;
+}
+
+// One flow sample: false while undecided, and a reason when LumeniteFX's vectors fail.
+std::string motion_read(device* dev) {
+    motion.pending = false;
+    std::vector<uint8_t> patches;
+    {
+        subresource_data m{};
+        if (!dev->map_texture_region(motion.patch_copy, 0, nullptr, map_access::read_only, &m)) {
+            log("[nr] motion vectors: the data check's copy could not be read; no data check");
+            motion.verified = true;
+            return {};
+        }
+        const unsigned bpp = dump_bpp(motion.patch_format);
+        patches.resize(size_t(4 * 32) * 32 * bpp);
+        for (unsigned y = 0; y < 32; ++y)
+            std::memcpy(patches.data() + size_t(y) * 4 * 32 * bpp, static_cast<const uint8_t*>(m.data) + size_t(y) * m.row_pitch,
+                        size_t(4 * 32) * bpp);
+        dev->unmap_texture_region(motion.patch_copy, 0);
+    }
+    const bool first = motion.last_patches.empty();
+    const bool moving = !first && patches != motion.last_patches;
+    motion.last_patches.swap(patches);
+    subresource_data m{};
+    if (!dev->map_texture_region(motion.flow_copy, 0, nullptr, map_access::read_only, &m)) {
+        log("[nr] motion vectors: the data check's copy could not be read; no data check");
+        motion.verified = true;
+        return {};
+    }
+    const unsigned w = motion.flow_desc.texture.width, h = motion.flow_desc.texture.height;
+    uint64_t nonzero = 0, bad = 0;
+    for (unsigned y = 0; y < h; ++y) {
+        const uint8_t* line = static_cast<const uint8_t*>(m.data) + size_t(y) * m.row_pitch;
+        for (unsigned x = 0; x < w; ++x) {
+            uint16_t v[2]; std::memcpy(v, line + size_t(x) * 4, 4);
+            if ((v[0] & 0x7FFFu) || (v[1] & 0x7FFFu)) ++nonzero;
+            const float a = dump_half(v[0]), b = dump_half(v[1]);
+            // Delta UV (DLSS5_Feed.fx ProviderMV): beyond 1.5 screens, or NaN/Inf, is no vector.
+            if (((v[0] >> 10) & 0x1Fu) == 31 || ((v[1] >> 10) & 0x1Fu) == 31 || std::fabs(a) > 1.5f || std::fabs(b) > 1.5f) ++bad;
+        }
+    }
+    dev->unmap_texture_region(motion.flow_copy, 0);
+    const uint64_t texels = uint64_t(w) * h;
+    if (++motion.samples <= 3)
+        log("[nr] motion vectors: data check sample %u: %llu of %llu vectors non-zero, %llu unusable, picture %s",
+            motion.samples, (unsigned long long)nonzero, (unsigned long long)texels, (unsigned long long)bad,
+            first ? "not compared yet" : moving ? "moving" : "still");
+    if (texels && bad * 100 > texels) {
+        if (++motion.bad_in_row >= 3)
+            return "LumeniteFX's flow is NaN or beyond the screen on more than 1% of the frame (three samples running)";
+    } else {
+        motion.bad_in_row = 0;
+    }
+    if (moving && !motion.verified) {
+        ++motion.moving;
+        if (nonzero) {
+            motion.verified = true;
+            log("[nr] motion vectors: LumeniteFX's flow moves with the picture (%llu of %llu vectors non-zero)",
+                (unsigned long long)nonzero, (unsigned long long)texels);
+        } else if (++motion.zero_moving >= 10) {
+            return "LumeniteFX's flow stayed all zero on 10 sampled frames while the picture moved";
+        }
+    }
+    return {};
+}
+
+// Why a data check was skipped, once per cause.
+void motion_skip(const char* why) {
+    static std::string last;
+    if (last != why) { last = why; log("[nr] motion vectors: data check skipped - %s", why); }
+}
+
+// In DLSS5_Feed's technique, before the pass reads the vectors: queue the copies, read the previous ones.
+void motion_probe(effect_runtime* rt, command_list* cl, resource_view rtv) {
+    if (!motion.lumenite_active || motion.checks_due || motion.fell_back) return;
+    // NR_DEBUG_MOTION_EVERY=<n> (a test aid): sample every n-th frame until the vectors are verified, not every 60th.
+    static const uint64_t first_every = [] {
+        char v[16] = {};
+        const uint64_t n = GetEnvironmentVariableA("NR_DEBUG_MOTION_EVERY", v, sizeof v) > 0 ? std::strtoull(v, nullptr, 10) : 0;
+        return n >= 2 ? n : uint64_t(60);
+    }();
+    const uint64_t every = motion.verified ? 600 : first_every;
+    if (++motion.frames % every != 0) return;
+    device* dev = rt->get_device();
+    if (motion.pending) {
+        const std::string why = motion_read(dev);
+        if (!why.empty()) { motion.probe_failure = why; motion.fell_back = true; return; }
+    }
+    const effect_texture_variable var = rs::call(rt, &effect_runtime::find_texture_variable, kEffect, kLumeniteFlow);
+    resource_view srv{}, srgb{};
+    if (var.handle) rt->get_texture_binding(var, &srv, &srgb);
+    const resource flow = srv.handle ? rs::call(dev, &device::get_resource_from_view, srv) : resource{};
+    const resource colour = rs::call(dev, &device::get_resource_from_view, rtv);
+    if (!flow.handle || !colour.handle) { motion_skip(!flow.handle ? "Kernel::tFlow has no resource" : "no back buffer"); return; }
+    const resource_desc fd = rs::call(dev, &device::get_resource_desc, flow);
+    const resource_desc cd = rs::call(dev, &device::get_resource_desc, colour);
+    if (fd.texture.format != format::r16g16_float) {   // what DLSS5_Feed.fx declares Kernel::tFlow as
+        log("[nr] motion vectors: Kernel::tFlow is format %u, not RG16F; no data check", unsigned(fd.texture.format));
+        motion.verified = true;
+        motion.frames = 0;
+        return;
+    }
+    if (!dump_bpp(cd.texture.format) || cd.texture.width < 64 || cd.texture.height < 64 || cd.texture.samples > 1) {
+        char why[96];
+        std::snprintf(why, sizeof why, "back buffer format %u, %ux%u, %u samples", unsigned(cd.texture.format),
+                      cd.texture.width, cd.texture.height, unsigned(cd.texture.samples));
+        motion_skip(why);
+        return;
+    }
+    if (!motion.flow_copy.handle || motion.flow_desc.texture.width != fd.texture.width ||
+        motion.flow_desc.texture.height != fd.texture.height || motion.flow_desc.texture.format != fd.texture.format ||
+        motion.patch_format != cd.texture.format) {
+        if (motion.flow_copy.handle) rt->get_command_queue()->wait_idle();
+        motion_release(dev);
+        const resource_desc fs(fd.texture.width, fd.texture.height, 1, 1, fd.texture.format, 1, memory_heap::gpu_to_cpu,
+                               resource_usage::copy_dest);
+        const resource_desc ps(4 * 32, 32, 1, 1, cd.texture.format, 1, memory_heap::gpu_to_cpu, resource_usage::copy_dest);
+        if (!dev->create_resource(fs, nullptr, resource_usage::copy_dest, &motion.flow_copy) ||
+            !dev->create_resource(ps, nullptr, resource_usage::copy_dest, &motion.patch_copy)) {
+            log("[nr] motion vectors: the check's staging textures could not be created; no data check");
+            motion_release(dev);
+            motion.verified = true;   // do not try every frame
+            return;
+        }
+        motion.flow_desc = fd;
+        motion.patch_format = cd.texture.format;
+    }
+    const resource_usage sr = resource_usage::shader_resource, rtu = resource_usage::render_target,
+                         cs = resource_usage::copy_source;
+    cl->barrier(1, &flow, &sr, &cs);
+    cl->copy_texture_region(flow, 0, nullptr, motion.flow_copy, 0, nullptr);
+    cl->barrier(1, &flow, &cs, &sr);
+    cl->barrier(1, &colour, &rtu, &cs);
+    const unsigned w = cd.texture.width, h = cd.texture.height;
+    const unsigned px[4] = {w / 4, 3 * w / 4, w / 4, 3 * w / 4}, py[4] = {h / 4, h / 4, 3 * h / 4, 3 * h / 4};
+    for (unsigned i = 0; i < 4; ++i) {
+        const subresource_box src{px[i] - 16, py[i] - 16, 0, px[i] + 16, py[i] + 16, 1};
+        const subresource_box dst{i * 32, 0, 0, i * 32 + 32, 32, 1};
+        cl->copy_texture_region(colour, 0, &src, motion.patch_copy, 0, &dst);
+    }
+    cl->barrier(1, &colour, &cs, &rtu);
+    motion.pending = true;
+}
+
 void on_init_effect_runtime(effect_runtime* rt) {
     // Before any call into ReShade: if the log ends on this line, the fault is
     // in the first virtual call below, not in anything of ours.
@@ -731,6 +1168,8 @@ void on_init_device(device* dev) {
     // ReShade has wrapped the device's queues (its vkQueueSubmit hook needs
     // that) and before the game has asked for any: the self-test asks itself.
     log("[nr] device %p initialised, api 0x%x", static_cast<void*>(dev), unsigned(dev->get_api()));
+    const device_api api = dev->get_api();
+    if (api == device_api::d3d10 || api == device_api::d3d11 || api == device_api::d3d12) hook_d3dcompile();
 }
 
 // After the game's vkCreateDevice has returned: the loader has set its
@@ -746,6 +1185,7 @@ void on_destroy_device(device* dev) {
     if (own_device(dev)) return;
     // Everything the session made lives on this device's VkDevice.
     std::lock_guard<std::mutex> guard(lock);
+    motion_release(dev);
     if (session) {
         log("[nr] the game's device is being destroyed; closing the session");
         session->wait_idle();
@@ -804,6 +1244,21 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
     // Consumed only by a frame that ran: a reload that comes before a frame the pass turns away still
     // resets the first frame that does run.
     const bool reset = need_reset;
+    {   // the engine-data panel
+        auto& pf = panel_facts;
+        pf.reshade = true;
+        pf.renodx = renodx_on;
+        pf.format = nr::pe::panel::dxgi_format_name(uint32_t(cd.texture.format));
+        pf.hdr = back_buffer_space == color_space::srgb_nonlinear ? 0
+                 : back_buffer_space == color_space::extended_srgb_linear ? 3
+                 : back_buffer_space == color_space::hdr10_st2084 ? 2 : -1;
+        pf.hdr_why = "the swap chain's colour space";
+        if (renodx_on && config.renodx.values.present_encoding != 0) pf.hdr_why = "NRPresentEncoding";
+        pf.motion = motion.handle ? 1 : 0;
+        pf.depth = depth.handle ? 1 : 0;
+        pf.preprocess_exposure = config.controls.preprocess.active() ? config.controls.preprocess.exposure : 0;
+        pf.white_point = renodx_on ? 0.f : config.white_point;
+    }
     if (!vk_loaded) { nr_vk_load(); vk_loaded = true; log("[nr] feed: Vulkan entry points resolved"); }
     // An HDR10 back buffer is PQ (or HLG) over BT.2020, and nothing in this
     // pass decodes either. Running on it anyway would hand the model a picture
@@ -1116,6 +1571,20 @@ struct RenoDXAccess {
     std::string& s(int i) { return *static_cast<std::string*>(nr::pe::renodx_field(r, i)); }
 };
 
+// A hotkey as text, committed when the field is let go; true then.
+bool hotkey_text(const char* label, std::string& value) {
+    static std::map<ImGuiID, std::string> editing;
+    const ImGuiID id = ImGui::GetID(label);
+    auto it = editing.find(id);
+    std::string& t = it != editing.end() ? it->second : (editing[id] = value);
+    char buf[64];
+    std::snprintf(buf, sizeof buf, "%s", t.c_str());
+    if (ImGui::InputText(label, buf, sizeof buf)) t = buf;
+    if (ImGui::IsItemDeactivatedAfterEdit()) { value = t; editing.erase(id); return true; }
+    if (!ImGui::IsItemActive()) editing.erase(id);
+    return false;
+}
+
 template <class Value>
 bool deferred_slider(const char* label, Value& value, float shown, float mn, float mx, float reset_to,
                      bool inherit, const char* help) {
@@ -1149,32 +1618,17 @@ bool model_sliders(float& intensity, float& structure, float& tone, float& skin)
     return changed;
 }
 
-const char* network_name(int int4) { return int4 == 1 ? "INT4 MIXED" : "DEFAULT"; }
+const char* network_name(int n) { return n >= 0 ? nr::network_codename(n) : "?"; }
 
 // The build's progress as a fraction and a phrase (nr::g_build_stage).
-float build_fraction(const nr::pe::Session::State& st, char* text, size_t n) {
-    float f = 0.02f;
-    const char* what = "starting";
-    switch (st.stage) {
-        case 1: f = 0.05f; what = "planning"; break;
-        case 2: f = 0.20f; what = "reading the weights"; break;
-        case 3: f = 0.35f; what = "uploading the weights"; break;
-        case 4: f = 0.40f + 0.55f * (st.pipes_total ? float(st.pipes_done) / float(st.pipes_total) : 0.0f);
-                what = "creating pipelines"; break;
-        case 5: f = 0.97f; what = "finishing"; break;
-        default: break;
-    }
-    if (st.stage == 4) std::snprintf(text, n, "%s %u/%u, %.0f s", what, st.pipes_done, st.pipes_total, st.building_seconds);
-    else std::snprintf(text, n, "%s, %.0f s", what, st.building_seconds);
-    return f;
-}
+float build_fraction(const nr::pe::Session::State& st, char* text, size_t n) { return nr::pe::build_progress(st, text, n); }
 
 // The top of the add-on page: which network runs, what it costs, and a build in progress.
 void draw_state() {
     const nr::pe::Session::State st = session ? session->state() : nr::pe::Session::State{};
     char line[256];
     if (st.running) {
-        const char* kind = st.running_int4 >= 0 ? network_name(st.running_int4) : "DEFAULT";
+        const char* kind = network_name(st.running_net);
         ImGui::Text("Network: %s   model %ux%u", kind, st.model_w, st.model_h);
     } else {
         ImGui::TextUnformatted("Network: none (frames pass through)");
@@ -1194,7 +1648,7 @@ void draw_state() {
     if (st.building) {
         char phase[128];
         const float f = build_fraction(st, phase, sizeof phase);
-        std::snprintf(line, sizeof line, "Building %s network", st.building_int4 >= 0 ? network_name(st.building_int4) : "the");
+        std::snprintf(line, sizeof line, "Building %s", st.building_net >= 0 ? network_name(st.building_net) : "the network");
         ImGui::TextUnformatted(line);
         ImGui::ProgressBar(f, ImVec2(-1.0f, 0.0f), phase);
     }
@@ -1318,44 +1772,108 @@ void draw_overlay(effect_runtime*) {
             help_marker("Limit pixel brightening and darkening.");
             ImGui::TreePop();
         }
-        // This project's own: the post block's previous-frame blend.
+        // This project's own: the post block's previous-frame blend, the linear-light white point, the noise seed.
         changed |= deferred_slider("History (previous frame blend)", config.history, config.history, 0.0f, 1.0f, 1.0f, false, nullptr);
+        changed |= deferred_slider("White point", config.white_point, config.white_point, 0.01f, 100.0f, 1.0f, false,
+                                   "[DlssNr] WhitePoint. Linear-light (floating-point HDR) frames: the value shown to the\n"
+                                   "network as white. 1 = default.");
+        changed |= ImGui::Checkbox("New noise every frame", &c.noise_every_frame);
+        help_marker("[DlssNr] NoiseEveryFrame. Frames without motion vectors (DLSS5_MV not bound): a new noise seed for\n"
+                    "the network every frame, as NVIDIA's DLL does. With no previous result to average it out, a still\n"
+                    "picture shimmers slightly. Off (default): the seed stays fixed.");
     }
 
     // This project's own: [Preprocess]. Off is the upstream behaviour.
-#if NR_INT4
-    if (session && ImGui::TreeNodeEx("Int4 mixed", ImGuiTreeNodeFlags_DefaultOpen)) {
+    // [Network]: which network runs (the three by the DLL's codenames); one that cannot run in this run is greyed out
+    // with the reason. The switch writes Model to the file; the other keys are saved with the rest of it.
+    // (not "Network": the RenoDX table has a group of that name, and the same label is the same node)
+    if (session && ImGui::TreeNodeEx("Network model and options", ImGuiTreeNodeFlags_DefaultOpen)) {
         const nr::pe::Session::State st = session->state();
-        bool on = st.want_int4 == 1;
-        ImGui::BeginDisabled(!st.int4_available);
-        if (ImGui::Checkbox("Use int4 mixed", &on)) {
-            session->set_int4(on);
-            config.int4 = on;
-            if (!config_path.empty()) config.save(config_path);
+        const int shown = st.want_net >= 0 ? st.want_net : config.network.model;
+        if (ImGui::BeginCombo("Network##model", network_name(shown))) {
+            for (int n = 0; n < nr::kNetworkChoices; ++n) {
+                const std::string& why = st.unavailable[n];
+                if (ImGui::Selectable(network_name(n), n == shown, why.empty() ? 0 : ImGuiSelectableFlags_Disabled)) {
+                    session->set_network(n);
+                    config.network.model = n;
+                }
+                if (!why.empty()) { ImGui::SameLine(); ImGui::TextDisabled("- %s", why.c_str()); }
+            }
+            ImGui::EndCombo();
         }
-        ImGui::EndDisabled();
-        char help[256];
-        std::snprintf(help, sizeof help,
-                      "Part of the network in int4 and other low-precision arithmetic: faster, a slightly different picture.\n"
-                      "%s%s%sThe first switch builds the other network (a few seconds); the running one serves until then.",
-                      config.int4_hotkey.empty() ? "" : "The hotkey ", config.int4_hotkey.c_str(),
-                      config.int4_hotkey.empty() ? "" : " switches it too.\n");
-        help_marker(help);
-        if (!st.int4_available) ImGui::TextDisabled("not available in this run (see dlssnr-amd.log)");
-        bool keep = config.int4_keep_both, sound = config.int4_sound;
-        if (ImGui::Checkbox("Keep both networks", &keep)) {
-            config.int4_keep_both = keep;
-            if (!config_path.empty()) config.save(config_path);
-        }
-        help_marker("Keep the other network in memory after a switch, so switching back is instant (more VRAM).");
+        help_marker("CC_SMALL_FP8: 310.9.16's default network, the fastest.\n"
+                    "CC_SILVER_AARDWOLD: 310.8.0's network (310.9.16's preset 1).\n"
+                    "CC_SILVER_AARDWOLD_INT4_MIXED: that network with part of its arithmetic in int4, faster, a slightly "
+                    "different picture.\nSwitching builds the new network in the background; the running one serves until "
+                    "it is ready.");
+        for (int n = 0; n < nr::kNetworkChoices; ++n)
+            if (!st.unavailable[n].empty()) ImGui::TextDisabled("%s: %s", network_name(n), st.unavailable[n].c_str());
+        if (hotkey_text("Hotkey##net", config.network.hotkey) && !config_path.empty()) config.save(config_path);
+        help_marker("[Network] Hotkey: cycles through the networks that can run.\n"
+                    "Ctrl, Shift, Alt and one key, e.g. Ctrl+F11 or Alt+F9; empty: no hotkey.");
+        bool sound = config.network.sound;
         if (ImGui::Checkbox("Sound on switch", &sound)) {
-            config.int4_sound = sound;
+            config.network.sound = sound;
             if (!config_path.empty()) config.save(config_path);
         }
-        if (!config.int4_hotkey.empty()) ImGui::TextDisabled("Hotkey: %s", config.int4_hotkey.c_str());
+        static const char* const residencies[] = {"auto", "resident", "offload", "minimal"};
+        int ri = std::clamp(config.network.residency, 0, 3);
+        if (ImGui::Combo("Residency", &ri, residencies, 4)) {
+            config.network.residency = ri;
+            if (!config_path.empty()) config.save(config_path);
+        }
+        help_marker("What is kept of a network not in use (the networks share one activation memory: mostly weights).\n"
+                    "auto (default): weights in video memory, switching back is quick; to RAM when video memory runs\n"
+                    "short, freed when RAM does too. resident: kept whole, instant, the most video memory.\n"
+                    "offload: weights in RAM, video memory freed. minimal: everything freed, switching back builds anew.\n"
+                    "The running network serves until the other is ready. NR off for 10 s: offload and minimal do the\n"
+                    "same to the running network, auto only when video memory is short.");
+        static const char* const osds[] = {"off", "switch", "always"};
+        int oi = std::clamp(config.network.osd, 0, 2);
+        if (ImGui::Combo("OSD", &oi, osds, 3)) {
+            config.network.osd = oi;
+            if (!config_path.empty()) config.save(config_path);
+        }
+        help_marker("[Network] OSD: the running network in the corner of the picture.\n"
+                    "switch (default): while a switch builds, its progress; then the new network for 3 s.\n"
+                    "always: all the time. off: never.");
+        bool grade = config.network.style_grade;
+        if (ImGui::Checkbox("Style grade (Natural / Cinematic)", &grade)) {
+            config.network.style_grade = grade;
+            if (!config_path.empty()) config.save(config_path);
+        }
+        help_marker("[Network] Style Grade. On (default): Natural and Cinematic are graded after the network as\n"
+                    "NVIDIA's DLL does. Off: the picture these styles had up to 0.0.6, without that grade.\n"
+                    "Standard is not affected. Takes effect at once.");
+        bool mwd = config.network.motion_without_depth;
+        if (ImGui::Checkbox("Motion without depth", &mwd)) {
+            config.network.motion_without_depth = mwd;
+            if (!config_path.empty()) config.save(config_path);
+        }
+        help_marker("[Network] Motion Without Depth. Where the network's previous-frame lookup reads its motion vector.\n"
+                    "On (default): the pixel's own vector, depth not used, as NVIDIA's DLL does.\n"
+                    "Off: with depth (DLSS5_Feed), the vector of the nearest of the pixel and its four diagonal neighbours.\n"
+                    "Only moving edges differ. Takes effect after a restart.");
+        bool rh = config.network.resize_history;
+        if (ImGui::Checkbox("Resize history", &rh)) {
+            config.network.resize_history = rh;
+            if (!config_path.empty()) config.save(config_path);
+        }
+        help_marker("[Network] Resize History. When the size of NR's frame changes (on this route: the game's resolution):\n"
+                    "Off (default): NR's previous result is dropped and NR starts again at the new size, as NVIDIA's DLL does.\n"
+                    "On: the previous result is scaled to the new size and kept.\n"
+                    "It matters for dynamic resolution with NR before the upscaler (OptiScaler route); here sizes change rarely.");
+        bool aco = config.network.aco;
+        if (ImGui::Checkbox("ACO Mode", &aco)) {
+            config.network.aco = aco;
+            if (!config_path.empty()) config.save(config_path);
+        }
+        help_marker("[Network] ACO Mode. On (default): the network's machine code made in advance by the ACO compiler,\n"
+                    "loaded by the AMD driver; when it cannot be used, the driver's compiler is used and dlssnr-amd.log\n"
+                    "says why. Off: the AMD driver's own compiler. CC_SILVER_AARDWOLD_INT4_MIXED needs it on.\n"
+                    "Takes effect after a restart.");
         ImGui::TreePop();
     }
-#endif
 
     if (ImGui::TreeNodeEx("Preprocess", 0)) {
         auto& p = config.preprocess.values;
@@ -1382,6 +1900,20 @@ void draw_overlay(effect_runtime*) {
                                    "Of the picture NR is shown, about mid grey. 1 = upstream.");
         changed |= deferred_slider("Saturation", p.saturation, p.saturation, 0.05f, 2.0f, 1.0f, false,
                                    "Of the picture NR is shown, luminance kept. 1 = upstream.");
+        changed |= hotkey_text("Hotkey##prep", config.preprocess.hotkey);
+        help_marker("[Preprocess] Hotkey: switches the whole preprocess on or off for this run (not written to the file).\n"
+                    "Ctrl, Shift, Alt and one key; empty: no hotkey.");
+        changed |= ImGui::Checkbox("Sound##prep", &config.preprocess.sound);
+        help_marker("[Preprocess] Sound. A cue when it switches: two notes going up = on, going down = off.");
+        ImGui::TreePop();
+    }
+
+    if (ImGui::TreeNodeEx("Log", 0)) {   // [Log]: read once when the game starts
+        changed |= ImGui::Checkbox("Write the log", &config.log_enabled);
+        help_marker("[Log] Enabled. dlssnr-amd.log in the game's folder. Takes effect after a restart.");
+        changed |= ImGui::Checkbox("Clear on start", &config.log_clear);
+        help_marker("[Log] ClearOnStart. On: each start of the game begins a new log; off: appends to the last one.\n"
+                    "Takes effect after a restart.");
         ImGui::TreePop();
     }
 
@@ -1401,6 +1933,58 @@ void draw_overlay(effect_runtime*) {
             session->set_max_passes(renodx_on ? 1u : uint32_t(c.passes));
         }
     }
+    if (ImGui::TreeNodeEx("Motion vectors", ImGuiTreeNodeFlags_DefaultOpen)) {   // MotionVectors, applied at the next present
+        static const char* const sources[] = {"VORT", "LumeniteFX Kernel"};
+        const bool installed = lumenite_on_disk();
+        int chosen = -1;
+        if (ImGui::BeginCombo("Source##motion", sources[std::clamp(config.motion_vectors, 0, 1)])) {
+            if (ImGui::Selectable(sources[0], config.motion_vectors == 0)) chosen = 0;
+            ImGui::BeginDisabled(!installed);
+            if (ImGui::Selectable(sources[1], config.motion_vectors == 1)) chosen = 1;
+            ImGui::EndDisabled();
+            if (!installed && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("LumeniteFX is not installed. install.bat (LumeniteFX: y) installs it from its author's GitHub.");
+            ImGui::EndCombo();
+        }
+        help_marker("The ReShade effect that estimates the motion NR's history follows.\n"
+                    "VORT comes with this package. LumeniteFX Kernel (by Afzaal) is installed separately,\n"
+                    "with install.bat (LumeniteFX: y), from its author's GitHub.\n"
+                    "Switching makes ReShade compile its effects again (NR pauses until they are ready)\n"
+                    "and restarts NR's history.");
+        if (chosen >= 0) {   // choosing LumeniteFX again after it was not used retries it
+            config.motion_vectors = chosen;
+            if (!config_path.empty()) config.save(config_path);
+            motion_choice_changed();
+            log("[nr] motion vectors: %s chosen in the add-on page", sources[chosen]);
+        }
+        if (config.motion_vectors == 1 && motion.fell_back)
+            ImGui::TextWrapped("LumeniteFX is not used this session: %s. VORT runs instead; choose LumeniteFX "
+                               "again to retry.", motion.reason.c_str());
+        else if (motion.lumenite_active)
+            ImGui::TextDisabled("LumeniteFX Kernel%s", motion.verified ? ": its vectors follow the picture" : "");
+        ImGui::TreePop();
+    }
+
+    if (ImGui::TreeNodeEx("Engine data", 0)) {   // what the game hands NR here (nr_engine_panel.hpp)
+        nr::pe::panel::Facts pf = panel_facts;
+        pf.motion_source = motion.lumenite_active ? "LumeniteFX Kernel" : "VORT";
+        if (session) {
+            const nr::pe::Session::State st = session->state();
+            pf.resizes = st.resizes; pf.carried = st.carried;
+            pf.motion_without_depth = st.motion_without_depth;
+            pf.renodx_known = st.renodx_known;
+            pf.renodx_hdr = st.renodx.hdr_mode; pf.renodx_absolute = st.renodx.absolute;
+            pf.renodx_feed = st.renodx.feed; pf.renodx_divisor = st.renodx.divisor;
+            pf.preprocess_ev = st.prep_ev;
+        }
+        if (pf.format.empty()) ImGui::TextDisabled("Not known until NR runs.");
+        else {
+            nr::control_ui::engine_legend();
+            for (const std::string& l : nr::pe::panel::lines(pf)) nr::control_ui::engine_line(l);
+        }
+        ImGui::TreePop();
+    }
+
     ImGui::Separator();
     ImGui::TextUnformatted("Status");
     char line[256];
@@ -1420,35 +2004,39 @@ void draw_overlay(effect_runtime*) {
 // ReShade on the finished picture, so nothing processes it.
 void on_reshade_present(effect_runtime* rt) {
     std::lock_guard<std::mutex> guard(lock);
-    if (rt == bound) ++presents;
+    if (rt != bound) return;
+    ++presents;
+    motion_sync(rt);
+    if (session) session->idle();   // NR off for a while: [Network] Residency
 }
 
 void on_reshade_overlay(effect_runtime*) {
     std::lock_guard<std::mutex> guard(lock);
-    // After an int4 mixed switch (hotkey, menu or ini): the build's progress, then the running network for 3 s.
-    if (session) {
+    // [Network] OSD: after a network switch (hotkey, menu or ini) the build's progress, then the running network for
+    // 3 s (switch, the default); always the running network (always); nothing (off).
+    if (session && config.network.osd != 0) {
         static int seen_want = -2, seen_running = -2;
         static std::chrono::steady_clock::time_point show_until{};
         const nr::pe::Session::State st = session->state();
         const auto now = std::chrono::steady_clock::now();
-        if (st.want_int4 >= 0 && (st.want_int4 != seen_want || (st.running && st.running_int4 != seen_running))) {
+        if (st.want_net >= 0 && (st.want_net != seen_want || (st.running && st.running_net != seen_running))) {
             if (seen_want != -2 && seen_running >= 0) show_until = now + std::chrono::seconds(3);
-            seen_want = st.want_int4;
-            if (st.running) seen_running = st.running_int4;
+            seen_want = st.want_net;
+            if (st.running) seen_running = st.running_net;
         }
-        const bool switching = st.building && st.building_int4 >= 0 && st.running && st.building_int4 != st.running_int4;
-        if (switching || now < show_until) {
+        const bool switching = st.building && st.building_net >= 0 && st.running && st.building_net != st.running_net;
+        if (switching || now < show_until || config.network.osd == 2) {
             ImGui::SetNextWindowPos(ImVec2(24.0f, 64.0f));
             ImGui::SetNextWindowBgAlpha(0.65f);
-            ImGui::Begin("##nr-int4", nullptr,
+            ImGui::Begin("##nr-osd", nullptr,
                          ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize |
                              ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
             if (switching) {
                 char phase[128];
                 const float f = build_fraction(st, phase, sizeof phase);
-                ImGui::Text("NR: switching to %s ... %.0f%%", network_name(st.building_int4), f * 100.0f);
+                ImGui::Text("NR: switching to %s ... %.0f%%", network_name(st.building_net), f * 100.0f);
             } else {
-                ImGui::Text("NR: %s", st.running ? network_name(st.running_int4) : "off");
+                ImGui::Text("NR: %s", st.running ? network_name(st.running_net) : "off");
             }
             ImGui::End();
         }
@@ -1479,11 +2067,9 @@ void on_render_technique(effect_runtime* rt, effect_technique t, command_list* c
         return;
     }
     if (t.handle != technique.handle) return;
+    motion_probe(rt, cl, rtv);
     feed(rt, cl, rtv);
 }
-
-// MinHook is ours (linked into this module) and was started for the device watch.
-bool minhook_initialized = false;
 
 }  // namespace
 
@@ -1513,9 +2099,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         // vulkan-1 loaded as well; the hooks are harmless there, as long as
         // they leave with the add-on (DLL_PROCESS_DETACH below).
         if (GetModuleHandleW(L"vulkan-1.dll")) {
-            const MH_STATUS mh = MH_Initialize();
-            if (mh == MH_OK || mh == MH_ERROR_ALREADY_INITIALIZED) {
-                minhook_initialized = true;
+            if (minhook_start()) {
+                vk_watch = true;
                 log("[nr] vulkan-1.dll is loaded: watching the game's device creation (%s)",
                     nr::pe::vkdevice::install() ? "hooks installed" : "hooks FAILED");
                 nr::pe::vkdevice::set_device_callback(on_vulkan_device_created);
@@ -1538,9 +2123,11 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
         // process exit (reserved != null) the other threads are gone and
         // nothing calls into vulkan-1 any more, so it is left alone.
         if (minhook_initialized && !reserved) {
-            nr::pe::vkdevice::uninstall();
+            unhook_d3dcompile();
+            if (vk_watch) nr::pe::vkdevice::uninstall();
             MH_Uninitialize();
             minhook_initialized = false;
+            vk_watch = false;
         }
         reshade::unregister_overlay(nullptr, draw_overlay);
         reshade::unregister_event<reshade::addon_event::reshade_overlay>(on_reshade_overlay);

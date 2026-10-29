@@ -915,17 +915,124 @@ void fix_float_formats(const Module& m) {
         m.name, static_cast<unsigned long long>(at - m.base));
 }
 
+// ---- 8. A size change re-creates the feature -------------------------------------------------
+//
+// The D3D12 path throws its NR feature away whenever the frame's size changes, in two places, and a new feature is not
+// evaluated in the frame that creates it (it waits for the creation's submission). With the game's dynamic resolution
+// and NR before the upscaler that is every size change: a size that moves every frame ran NR on ~3% of frames
+// (858 features made, 9 evaluated). NVIDIA's DLL evaluates one feature at any
+// size, and a frame at a new size is that of a new feature there (measured on an RTX 5090); this backend does the same
+// per evaluation (nr_pe_session.cpp, Impl::resized). Each evaluation carries its own size (DLSSNR.Width/Height and
+// the subrects are set every frame), so the feature is kept:
+//
+//  a. DlssNr::Proxy::Context::Prepare retires it when the settings, the device, the width or the height differ from
+//     its creation's: cmp [r14+device],rdi/rsi ; jne retire ; cmp [r14+0x3c],ebx (width) ; jne retire ;
+//     cmp [r14+0x40],ecx (height) ; je keep ; retire: ... The width jne becomes two nops and the height je a jmp.
+//  b. DlssNr_Dx12::State::PrepareRunModels (v0.8.91) calls RetryAfterFailure on every pass's model when the
+//     resolution, the placement or the tuning changed, then parks the frame-sized scratch textures on a resolution or
+//     placement change. The models' loop goes through a stub that runs it only for a placement change, or a tuning
+//     change with a feature made (the original condition without the resolution); the textures are still parked and
+//     made again at the new size, and the frame still starts the history afresh (nr.reset).
+// Settings, device, placement and tuning changes still re-create the feature.
+void fix_feature_resize(const Module& m) {
+    static const Sig pat_0891("41 38 46 38 75 15 49 39 BE 98 00 00 00 75 0C 41 39 5E 3C 75 06 41 39 4E 40 74 08 "
+                              "49 8B CE E8");
+    static const Sig pat_084("41 38 46 38 75 12 49 39 76 50 75 0C 41 39 5E 3C 75 06 41 39 4E 40 74 08 49 8B CE E8");
+    uint8_t* hit = nullptr;
+    size_t width_at = 19;                       // the jne after the width compare (v0.8.91)
+    const int hits = find_unique(m, pat_0891, [](uint8_t*) { return true; }, &hit);
+    bool v0891 = hits == 1;
+    if (!v0891) {
+        const int hits_084 = find_unique(m, pat_084, [](uint8_t*) { return true; }, &hit);
+        if (hits_084 != 1) {
+            log("[nr] OptiScaler fix (size change): %d/%d matching sites (v0.8.91/v0.8.4) in %ls, nothing changed",
+                hits, hits_084, m.name);
+            return;
+        }
+        width_at = 16;
+    }
+    // b first: without it a changes nothing (the whole model state is reset before Prepare sees it).
+    uint8_t* loop = nullptr;
+    if (v0891) {
+        // mov ecx,eax (tuning matches) ; cmp byte [rsp+0x41],0 (resolution changed) ; jne models ;
+        // test r13b,r13b (placement changed) ; jne models ; mov rax,[rsi+8] ; cmp qword [rax],0 ; je skip ;
+        // test ecx,ecx ; jne skip ; models: lea r14,[rsi+8] ; lea r15,[r14+0xf0] ; cmp r14,r15 ; je done ;
+        // mov rcx,[r14] ; call RetireState
+        static const Sig loop_0891("8B C8 80 7C 24 41 00 75 1B 45 84 ED 75 16 48 8B 46 08 48 83 38 00 0F 84 ?? ?? ?? ?? "
+                                   "85 C9 0F 85 ?? ?? ?? ?? 4C 8D 76 08 4D 8D BE F0 00 00 00 4D 3B F7 74 11 49 8B 0E E8");
+        const int n = find_unique(m, loop_0891, [](uint8_t*) { return true; }, &loop);
+        if (n != 1) {
+            log("[nr] OptiScaler fix (size change): %d matching sites for the models' reset in %ls, nothing changed",
+                n, m.name);
+            return;
+        }
+    } else {
+        log("[nr] OptiScaler fix (size change): OptiScaler v0.8.4 resets its models on every size change elsewhere; "
+            "nothing changed");
+        return;
+    }
+    constexpr size_t kModels = 36, kAfterLeas = 47, kDone = 69;
+    uint8_t* const at = loop + kModels;
+    // test r13b,r13b ; jnz retire ; mov rax,[rsi+8] ; cmp qword [rax],0 ; je skip ; test ecx,ecx ; je retire ;
+    // skip: jmp done ; retire: lea r14,[rsi+8] ; lea r15,[r14+0xf0] ; jmp after the leas
+    uint8_t stub[40] = {0x45, 0x84, 0xED, 0x75, 0x13, 0x48, 0x8B, 0x46, 0x08, 0x48, 0x83, 0x38, 0x00, 0x74, 0x04,
+                        0x85, 0xC9, 0x74, 0x05, 0xE9, 0, 0, 0, 0, 0x4C, 0x8D, 0x76, 0x08,
+                        0x4D, 0x8D, 0xBE, 0xF0, 0x00, 0x00, 0x00, 0xE9, 0, 0, 0, 0};
+    auto* code = static_cast<uint8_t*>(alloc_near(m.base, m.image, sizeof(stub)));
+    auto rel = [](uint8_t* from_end, uint8_t* to, int32_t* out) {
+        const int64_t d = to - from_end;
+        if (d < INT32_MIN || d > INT32_MAX) return false;
+        *out = static_cast<int32_t>(d);
+        return true;
+    };
+    int32_t to_stub = 0, to_done = 0, to_back = 0;
+    if (!code || !rel(at + 5, code, &to_stub) || !rel(code + 24, loop + kDone, &to_done) ||
+        !rel(code + 40, loop + kAfterLeas, &to_back)) {
+        if (code) VirtualFree(code, 0, MEM_RELEASE);
+        log("[nr] OptiScaler fix (size change): no memory within reach of %ls, nothing changed", m.name);
+        return;
+    }
+    std::memcpy(stub + 20, &to_done, 4);
+    std::memcpy(stub + 36, &to_back, 4);
+    std::memcpy(code, stub, sizeof(stub));
+    DWORD old = 0;
+    VirtualProtect(code, sizeof(stub), PAGE_EXECUTE_READ, &old);
+    FlushInstructionCache(GetCurrentProcess(), code, sizeof(stub));
+    uint8_t jump[11] = {0xE9, 0, 0, 0, 0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+    std::memcpy(jump + 1, &to_stub, 4);
+    static const uint8_t nops[] = {0x90, 0x90}, jmp[] = {0xEB};
+    if (!write_code(at, jump, sizeof(jump)) || !write_code(hit + width_at, nops, sizeof(nops)) ||
+        !write_code(hit + width_at + 6, jmp, sizeof(jmp))) {
+        log("[nr] OptiScaler fix (size change): VirtualProtect failed (%lu)", GetLastError());
+        return;
+    }
+    log("[nr] OptiScaler fix: the NR feature is kept across frame sizes (%ls+0x%llx, +0x%llx)", m.name,
+        static_cast<unsigned long long>(hit + width_at - m.base), static_cast<unsigned long long>(at - m.base));
+}
+
 // ---- The RenoDX-style option (nr_pe_optifix.hpp, renodx_route) --------------------------------
 namespace renodx_impl {
 
 // DlssNrConstants (DlssNr_Common.h, 256 bytes, layout fixed by its static_asserts and the shader cbuffer).
-constexpr size_t kConstants = 256, kMode = 0, kWidth = 8, kHeight = 12, kPassthrough = 32, kReversibleMode = 76,
+constexpr size_t kConstants = 256, kMode = 0, kWhitePoint = 4, kWidth = 8, kHeight = 12, kPassthrough = 32, kReversibleMode = 76,
                  kSkinProtection = 92;
 constexpr uint32_t kEncode = 0, kResolve = 1, kDownsample = 2, kClampProxy = 8, kNeutwoReplace = 2;
 
 // The encode, resolve and clamp as this route wants them (nr_pe_renodx_route.hpp), into `copy`.
+// The encode's own decision, for the engine-data panel (renodx_route::encode_seen): read only.
+void see_encode(const uint8_t* constants) {
+    uint32_t mode = 0, passthrough = 0;
+    float white = 0.f;
+    std::memcpy(&mode, constants + kMode, 4);
+    if (mode != kEncode) return;
+    std::memcpy(&passthrough, constants + kPassthrough, 4);
+    std::memcpy(&white, constants + kWhitePoint, 4);
+    renodx_route::note_encode_seen(passthrough == 0, white);
+}
+
 void rewrite(const uint8_t* constants, uint32_t mode, uint8_t* copy) {
     std::memcpy(copy, constants, kConstants);
+    see_encode(constants);
     if (mode == kClampProxy) {
         // Between two model passes: the same-size Downsample is a plain copy (dlssnr.hlsl "Nothing to do when
         // the sizes already agree"), where ClampProxy would cut a linear frame at 1.
@@ -1084,14 +1191,6 @@ private:
     double sum_ms_ = 0;
     bool failed_ = false;
 };
-
-// The plain OptiScaler route's hook (only installed with NR_OPTI_PROF=1): the timestamps and nothing else.
-void prof_state_run(void* self, void* cmd, void* colour, void* depth, void* motion, void* output, const uint8_t* frame,
-                    void* queue) {
-    OptiProf::get().begin(cmd, queue);
-    real_state_run(self, cmd, colour, depth, motion, output, frame, queue);
-    OptiProf::get().end();
-}
 
 void state_run(void* self, void* cmd, void* colour, void* depth, void* motion, void* output, const uint8_t* frame,
                void* queue) {
@@ -1467,22 +1566,108 @@ void install(const Module& m) {
         static_cast<unsigned long long>(vk_eval - m.base));
 }
 
-// NR_OPTI_PROF=1 on the plain route: State::Run hooked for its timestamps only.
-void install_prof(const Module& m) {
+// The plain route's read-only twins of dispatch_pass / vk_dispatch: what OptiScaler's encode used, nothing changed.
+bool observe_dispatch_pass(void* self, void* cmd, const uint8_t* constants, void* source, void* model, void* original,
+                           void* motion, void* previous, void* target, void* keep, uint32_t* slot) {
+    see_encode(constants);
+    return real_dispatch_pass(self, cmd, constants, source, model, original, motion, previous, target, keep, slot);
+}
+bool observe_vk_dispatch(void* self, void* cmd, const uint8_t* constants, uint64_t tx, uint64_t ty, uint64_t source,
+                         uint64_t model, uint64_t original, uint64_t motion, uint64_t target, uint64_t keep,
+                         uint64_t source_layout, uint64_t motion_layout, uint64_t finished, uint32_t* slot) {
+    if ((finished & 0xFF) == 0) see_encode(constants);
+    return real_vk_dispatch(self, cmd, constants, tx, ty, source, model, original, motion, target, keep, source_layout,
+                            motion_layout, finished, slot);
+}
+
+// DlssNr_Dx12::DispatchPass, by the string only DispatchCompute logs, its one lea, DispatchPass's call of it and the
+// prologue (the same steps install() takes); null when any step does not find exactly one.
+uint8_t* find_dispatch_pass(const Module& m, IMAGE_NT_HEADERS* nt) {
+    static const char kText[] = "DlssNr_Dx12::DispatchCompute [{0}] Failed to create a constants buffer";
+    uint8_t* text = nullptr;
+    int texts = 0;
+    IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+        if (sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) continue;
+        uint8_t* p = m.base + sec->VirtualAddress;
+        for (size_t k = 0; k + sizeof kText <= sec->Misc.VirtualSize; ++k)
+            if (std::memcmp(p + k, kText, sizeof kText) == 0) { text = p + k; ++texts; }
+    }
+    if (texts != 1) return nullptr;
+    static const uint8_t kLea[] = {0x48, 0x8D, 0x05, 0, 0, 0, 0};
+    static const char kLeaMask[] = "???????";
+    uint8_t* lea = nullptr;
+    if (find_unique(m, kLea, kLeaMask, sizeof kLea, [&](uint8_t* p) {
+            return (p[0] == 0x48 || p[0] == 0x4C) && p[1] == 0x8D && (p[2] & 0xC7) == 0x05 && rel32_target(p + 3) == text;
+        }, &lea) != 1)
+        return nullptr;
+    uint8_t* compute = function_start(lea);
+    static const uint8_t kCall[] = {0x4C, 0x8B, 0x4F, 0x50, 0x4C, 0x8B, 0xC5, 0x49, 0x8B, 0xD6, 0x48, 0x8B, 0xCF,
+                                    0xE8, 0, 0, 0, 0};
+    static const char kCallMask[] = "xxxxxxxxxxxxxx????";
+    uint8_t* call = nullptr;
+    if (!compute || find_unique(m, kCall, kCallMask, sizeof kCall, [&](uint8_t* p) { return rel32_target(p + 14) == compute; },
+                                &call) != 1)
+        return nullptr;
+    static const uint8_t kPrologue[] = {0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x08, 0x48, 0x89, 0x68, 0x10, 0x48,
+                                        0x89, 0x70, 0x18, 0x57, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xEC, 0x70};
+    uint8_t* pass = function_start(call);
+    return pass && std::memcmp(pass, kPrologue, sizeof kPrologue) == 0 ? pass : nullptr;
+}
+
+// The plain OptiScaler route: OptiScaler's frame for the menus' engine-data panel (renodx_route::current_frame: where NR
+// runs, the game's exposure texture, its DLSS create flags and sizes). Read-only detours on State::Run, MakeDlssNrPass and
+// ModelVk::Impl::Evaluate - the frame and the game's parameters are read, nothing is changed - each where it is found;
+// with NR_OPTI_PROF=1 State::Run's also takes its timestamps. DispatchPass and DlssNr_Vk::Dispatch are watched for what
+// the encode used (renodx_route::encode_seen), their constants passed on untouched.
+void install_observer(const Module& m) {
     auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(m.base + reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
     static const uint8_t kRunPrologue[] = {0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x18, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41,
                                            0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x81, 0xEC, 0x70, 0x0C, 0x00, 0x00};
     uint8_t* run = string_function(m, nt, "the pre-SR active colour size is invalid");
-    const MH_STATUS init = run && run == string_function(m, nt, "depth or motion-vector subrect is empty") &&
-                                   std::memcmp(run, kRunPrologue, sizeof kRunPrologue) == 0
-                               ? MH_Initialize() : MH_ERROR_NOT_INITIALIZED;
-    if ((init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) ||
-        MH_CreateHook(run, reinterpret_cast<void*>(&prof_state_run), reinterpret_cast<void**>(&real_state_run)) != MH_OK ||
-        MH_EnableHook(run) != MH_OK) {
-        log("[nr] NR_OPTI_PROF: OptiScaler's State::Run could not be hooked in %ls", m.name);
+    if (!run || run != string_function(m, nt, "depth or motion-vector subrect is empty") ||
+        std::memcmp(run, kRunPrologue, sizeof kRunPrologue) != 0)
+        run = nullptr;
+    static const Sig kFlagReads("8B 8D 80 01 00 00 8B C1 C1 E8 03 24 01 88 45 61 8B C1 D1 E8 24 01 88 85 B4 00 00 00");
+    static const uint8_t kMakePrologue[] = {0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x10, 0x48, 0x89, 0x70, 0x18, 0x48, 0x89,
+                                            0x78, 0x20, 0x55, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57};
+    uint8_t* reads = nullptr;
+    uint8_t* make = find_unique(m, kFlagReads, [](uint8_t*) { return true; }, &reads) == 1 ? function_start(reads) : nullptr;
+    if (make && std::memcmp(make, kMakePrologue, sizeof kMakePrologue) != 0) make = nullptr;
+    static const uint8_t kVkEvaluatePrologue[] = {0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x18, 0x55, 0x56, 0x57, 0x41, 0x54,
+                                                  0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x81, 0xEC, 0xF0, 0x0A, 0x00, 0x00};
+    uint8_t* vk_eval = string_function(
+        m, nt, "DlssNr::ModelVk::Impl::Evaluate DLSS-NR Vulkan: the game's buffer is {} (flag {}, format {}), depth {}");
+    if (vk_eval && std::memcmp(vk_eval, kVkEvaluatePrologue, sizeof kVkEvaluatePrologue) != 0) vk_eval = nullptr;
+    const MH_STATUS init = MH_Initialize();
+    if (init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) {
+        log("[nr] engine data: MinHook could not start, OptiScaler's frame is not read");
         return;
     }
-    log("[nr] NR_OPTI_PROF: State::Run hooked (%ls +0x%llx)", m.name, static_cast<unsigned long long>(run - m.base));
+    uint8_t* pass = find_dispatch_pass(m, nt);
+    static const uint8_t kVkDispatchPrologue[] = {0x40, 0x53, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56,
+                                                  0x48, 0x81, 0xEC, 0x00, 0x01, 0x00, 0x00};
+    uint8_t* vk_pass = string_function(m, nt, "DlssNr_Vk::Dispatch DLSS-NR Vulkan pass: a dispatch with nothing to write");
+    if (vk_pass && std::memcmp(vk_pass, kVkDispatchPrologue, sizeof kVkDispatchPrologue) != 0) vk_pass = nullptr;
+    struct { uint8_t* at; void* detour; void** real; const char* name; } hooks[] = {
+        {pass, reinterpret_cast<void*>(&observe_dispatch_pass), reinterpret_cast<void**>(&real_dispatch_pass), "DispatchPass"},
+        {vk_pass, reinterpret_cast<void*>(&observe_vk_dispatch), reinterpret_cast<void**>(&real_vk_dispatch),
+         "DlssNr_Vk::Dispatch"},
+        {run, reinterpret_cast<void*>(&state_run), reinterpret_cast<void**>(&real_state_run), "State::Run"},
+        {make, reinterpret_cast<void*>(&make_pass), reinterpret_cast<void**>(&real_make_pass), "MakeDlssNrPass"},
+        {vk_eval, reinterpret_cast<void*>(&vk_evaluate), reinterpret_cast<void**>(&real_vk_evaluate),
+         "ModelVk::Impl::Evaluate"},
+    };
+    std::string made, missed;
+    for (auto& h : hooks) {
+        const bool ok = h.at && MH_CreateHook(h.at, h.detour, h.real) == MH_OK &&
+                        (MH_EnableHook(h.at) == MH_OK || (MH_RemoveHook(h.at), false));
+        std::string& list = ok ? made : missed;
+        if (!list.empty()) list += ", ";
+        list += h.name;
+    }
+    log("[nr] engine data: OptiScaler's frame read through %s%s%s (%ls; nothing in it is changed)",
+        made.empty() ? "nothing" : made.c_str(), missed.empty() ? "" : "; not found: ", missed.c_str(), m.name);
 }
 
 }  // namespace renodx_impl
@@ -1508,12 +1693,13 @@ void fix_optiscaler() {
     fix_autoexposure_hdr(m);
     fix_release_hold(m);
     fix_float_formats(m);
+    fix_feature_resize(m);
     // The RenoDX-style option, only when it is on at start (nothing of it is installed otherwise).
     RenoDXConfig renodx{};
     if (read_renodx(std::string(module_folder()) + "\\dlssnr-amd.ini", renodx) && renodx.enabled)
         renodx_impl::install(m);
-    else if (renodx_impl::OptiProf::wanted())
-        renodx_impl::install_prof(m);
+    else
+        renodx_impl::install_observer(m);   // read-only, for the engine-data panel (and NR_OPTI_PROF's timestamps)
 #endif
 }
 

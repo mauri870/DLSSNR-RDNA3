@@ -898,6 +898,12 @@ bool Device::busy(const void* owner) {
     return false;
 }
 
+bool Device::busy(const Job* job, uint64_t generation) {
+    std::lock_guard<std::mutex> guard(jobs_mutex_);
+    if (!job || job->gen != generation || job->state == Job::Free) return false;
+    return !(job->state == Job::Submitted && vkGetFenceStatus(device_, job->fence) == VK_SUCCESS);
+}
+
 bool Device::busy(VkImage image) {
     std::lock_guard<std::mutex> guard(jobs_mutex_);
     for (auto& j : jobs_) {

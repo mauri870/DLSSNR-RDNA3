@@ -128,14 +128,40 @@ da430e0a9c6eecefa0d1b27d05e16c426fb5d04e808b194d914eaac4b31bc0f8  $rs/ReShade32.
 EOF
 get "$rs/ReShade-LICENSE.md" https://raw.githubusercontent.com/crosire/reshade/v6.8.0/LICENSE.md \
     237ded5b8344f820113efab1e65e91e1f159d9202c5b4856606a0590d3ffdab0
-# OptiScaler-NR (GPL-3.0), the OptiScaler route's host, shipped as released: 0.8.91. 0.8.4 still works with the same
-# core (NR_OPTI_ZIP=, see linux/package/optiscaler/README.md).
+# OptiScaler-NR (GPL-3.0), the Windows OptiScaler route's host, shipped as released: 0.8.91. 0.8.4 still works with
+# the same core (NR_OPTI_ZIP=, windows/build/build_package.sh).
 get artifacts/ref/downloads/OptiScaler-NR-v0.8.4.zip \
     https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases/download/v0.8.4/OptiScaler-NR-v0.8.4.zip \
     8789912859882e66b3f3a1aa768db947da779dfd65225df69ea919052e73a2e4
 get artifacts/ref/downloads/OptiScaler-NR-v0.8.91.zip \
     https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases/download/v0.8.91/OptiScaler-NR-v0.8.91.zip \
     19a2852bb3f88e09075e3ccc66e0318c52e83a5901d9020a10384ae49d59ff77
+
+# OptiScaler (GPL-3.0), the Linux OptiScaler route's host, shipped as released: the official nightly the Linux packages
+# were tested with (OptiScaler v10.0.0-pre1, nightly-20261028), and its licence from its source tree at that nightly.
+get artifacts/ref/downloads/OptiScaler_v10.0.0-pre1_20261028.7z \
+    https://github.com/optiscaler/OptiScaler-nightly/releases/download/nightly-20261028/OptiScaler_v10.0.0-pre1_20261028.7z \
+    e3a4f533d19a5818a821093f7dcbd9698b96b9b60dcb0e577c569a0b33c94a33
+mkdir -p artifacts/ref/optiscaler-nightly-20261028
+get artifacts/ref/optiscaler-nightly-20261028/LICENSE \
+    https://raw.githubusercontent.com/optiscaler/OptiScaler/b19cfd29134ab9bc75d654b90f55fb05faca91b2/LICENSE \
+    3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
+# Inter 4.1 (SIL Open Font License 1.1), NR Control's font on the Linux OptiScaler route (embedded in dlssnr-amd.asi).
+get artifacts/ref/downloads/Inter-4.1.zip https://github.com/rsms/inter/releases/download/v4.1/Inter-4.1.zip \
+    9883fdd4a49d4fb66bd8177ba6625ef9a64aa45899767dde3d36aa425756b11e
+if [[ ! -f toolchain/fonts/inter-4.1/Inter-Regular.ttf ]]; then
+    mkdir -p toolchain/fonts/inter-4.1
+    python3 - artifacts/ref/downloads/Inter-4.1.zip toolchain/fonts/inter-4.1 <<'PY'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as z:
+    open(f"{sys.argv[2]}/Inter-Regular.ttf", "wb").write(z.read("extras/ttf/Inter-Regular.ttf"))
+    open(f"{sys.argv[2]}/LICENSE.txt", "wb").write(z.read("LICENSE.txt"))
+PY
+fi
+sha256sum -c --quiet - <<EOF
+40d692fce188e4471e2b3cba937be967878f631ad3ebbbdcd587687c7ebe0c82  toolchain/fonts/inter-4.1/Inter-Regular.ttf
+262481e844521b326f5ecd053e59b98c8b2da78c8ee1bdbb6e8174305e54935a  toolchain/fonts/inter-4.1/LICENSE.txt
+EOF
 
 # ---- Windows package only ---------------------------------------------------------------------
 if [[ $windows == 1 ]]; then

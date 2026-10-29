@@ -6,7 +6,8 @@
 Writes (default build/windows/<arch>/network):
     g_<name>.spv + the four marker files   the network, what --spv-dir points at
     runtime/                                 the passes around it (windows/shaders/passes)
-    temporal/                                the temporal variants and the motion estimator
+    g_<name>_grade.spv                      style_grade: the post block with the Natural/Cinematic grade
+    temporal/                                the temporal variants (+ their _grade twins) and the motion estimator
 
 LLPC leaves the large per-fragment loops of fswin_t.comp rolled and spills the arrays they
 index to scratch, so every fswin_t pipeline is preprocessed (ffwd3_t, attn and vit_attn too: UNROLLED below),
@@ -97,6 +98,16 @@ def main():
         base = pipelines[v['base']]
         glslang(a.arch, R / 'windows/shaders' / a.arch / base['source'], base['defines'] + v['add'],
                 out / 'temporal' / f'{name}.spv', unroll=base['source'] in UNROLLED, network=True)
+    grade = table['style_grade']
+    for name in grade['pipelines']:
+        e = pipelines[name]
+        glslang(a.arch, R / 'windows/shaders' / a.arch / e['source'], e['defines'] + a.define + grade['add'],
+                out / f'g_{name}_grade.spv', unroll=e['source'] in UNROLLED, network=True)
+    for name in grade['variants']:
+        base = pipelines[table['variants'][name]['base']]
+        glslang(a.arch, R / 'windows/shaders' / a.arch / base['source'],
+                base['defines'] + table['variants'][name]['add'] + grade['add'], out / 'temporal' / f'{name}_grade.spv',
+                unroll=base['source'] in UNROLLED, network=True)
     for k in MOTION:
         glslang(a.arch, R / 'windows/shaders/passes' / f'{k}.comp', [], out / 'temporal' / f'{k}.spv')
     shutil.copy2(out / 'shader-constants.txt', out / 'temporal' / 'shader-constants.txt')
@@ -106,7 +117,8 @@ def main():
         glslang(a.arch, R / 'windows/shaders/passes' / f'{src}.comp', defines, out / 'runtime' / f'{k}.spv')
     # runtime_upscale.spv carries AMD FidelityFX Super Resolution 1 (MIT): its notice goes with it
     shutil.copy2(R / 'windows/shaders/passes/include/fsr1/LICENSE.txt', out / 'runtime' / 'FidelityFX-FSR1-LICENSE.txt')
-    print(f'{out}: {len(pipelines)} network pipelines, {len(table["variants"]) + len(MOTION)} temporal, '
+    print(f'{out}: {len(pipelines) + len(grade["pipelines"])} network pipelines, '
+          f'{len(table["variants"]) + len(grade["variants"]) + len(MOTION)} temporal, '
           f'{len(RUNTIME) + len(RUNTIME_VARIANTS)} runtime')
 
     if a.check:

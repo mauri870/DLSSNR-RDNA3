@@ -10,14 +10,15 @@
 #   vulkan/         the Khronos loader the Vulkan-layer routes put beside the game
 #   install.bat, install.ps1, README.txt
 #
-#   [NR_MODEL=dlssnr.bin] [NR_INT4=0] bash windows/build/build_package.sh [build dir]
+#   [NR_MODEL=dlssnr.bin [NR_MODEL_SMALL=dlssnr-small.bin]] [NR_INT4=0] bash windows/build/build_package.sh [build dir]
 #
 # The package carries no model: install.ps1 extracts it from the user's nvngx_dlssnr.dll on the first
-# install. NR_MODEL puts a dlssnr.bin you made yourself into the package (for your own use only).
+# install. NR_MODEL puts a dlssnr.bin you made yourself into the package (for your own use only), and with it
+# NR_MODEL_SMALL a dlssnr-small.bin (the new model, from the 310.9.16 DLL).
 #
-# NR_INT4 (default 1): the programs built with int4 mixed and its data in the package; install.ps1 asks which
-# network to install (ACO Mode, int4 mixed on or off; int4 mixed runs with ACO Mode = 1). NR_INT4=0: the default
-# network only.
+# NR_INT4 (default 1): the programs built with int4 mixed and its data in the package; install.ps1 installs all three
+# networks (CC_SMALL_FP8, CC_SILVER_AARDWOLD, CC_SILVER_AARDWOLD_INT4_MIXED; int4 mixed runs with ACO Mode = 1) and
+# asks only which one a game starts with. NR_INT4=0: no int4 mixed.
 #
 # D3D10/11/12 games keep the system's own D3D: the network runs on a Vulkan device of its own and the
 # frame crosses over through shared textures and a shared fence (windows/src/pe/nr_pe_bridge.hpp).
@@ -27,6 +28,11 @@ model=""
 if [[ -n "${NR_MODEL:-}" ]]; then
     [[ -f "$NR_MODEL" ]] || { echo "NR_MODEL: no such file: $NR_MODEL" >&2; exit 1; }
     model=$(realpath -- "$NR_MODEL")
+fi
+small=""
+if [[ -n "$model" && -n "${NR_MODEL_SMALL:-}" ]]; then
+    [[ -f "$NR_MODEL_SMALL" ]] || { echo "NR_MODEL_SMALL: no such file: $NR_MODEL_SMALL" >&2; exit 1; }
+    small=$(realpath -- "$NR_MODEL_SMALL")
 fi
 cd -- "$(dirname -- "$0")/../.."
 out=$(realpath -m -- "${1:-artifacts/windows/package-build}")
@@ -118,11 +124,11 @@ bash windows/build/build_vulkan_loader.sh > /dev/null
 pkg="$out/package"
 rm -rf -- "$pkg"; mkdir -p -- "$pkg"
 if [[ -n "$model" ]]; then
-    bash windows/build/assemble_product_data.sh "$pkg" --model "$model"
+    bash windows/build/assemble_product_data.sh "$pkg" --model "$model" ${small:+--small-model "$small"}
 else
     bash windows/build/assemble_product_data.sh "$pkg"
 fi
-# dlssnr-amd/aco/: the network as ACO's machine code, used with [Network] ACO Mode = 1 in dlssnr-amd.ini (off by
+# dlssnr-amd/aco/: the network as ACO's machine code, used with [Network] ACO Mode = 1 in dlssnr-amd.ini (the
 # default): one record per pipeline (windows/data/aco/records), the Linux network the records were made from
 # (linux/build/build_network.py; a record is found by its SPIR-V's hash) and the template aliases.
 aco="$pkg/dlssnr-amd/aco"
@@ -258,16 +264,9 @@ cp -- artifacts/windows/optiscaler/nr_present_probe.exe "$pkg/dlssnr-amd/"
 
 # dlssnr-amd.ini, put in place at install: the text the programs write themselves (windows/package/make_ini.py),
 # with the line ends a Windows program writes.
-# One set per network choice of install.ps1 (ini/<choice>/).
-if [[ "${NR_INT4:-1}" == 1 ]]; then
-    python3 windows/package/make_ini.py windows/src/pe/nr_pe_config.cpp "$pkg/ini/default" --int4-off > /dev/null
-    python3 windows/package/make_ini.py windows/src/pe/nr_pe_config.cpp "$pkg/ini/aco" --int4-off --aco > /dev/null
-    python3 windows/package/make_ini.py windows/src/pe/nr_pe_config.cpp "$pkg/ini/aco-int4-mixed" --int4 --aco > /dev/null
-else
-    python3 windows/package/make_ini.py windows/src/pe/nr_pe_config.cpp "$pkg/ini/default" > /dev/null
-    python3 windows/package/make_ini.py windows/src/pe/nr_pe_config.cpp "$pkg/ini/aco" --aco > /dev/null
-fi
-sed -i 's/$/\r/' "$pkg/ini/"*/*.ini
+# One set: [Network] Model CC_SMALL_FP8 and ACO Mode 1; install.ps1 writes the network and ACO Mode chosen at install.
+python3 windows/package/make_ini.py windows/src/pe/nr_pe_config.cpp "$pkg/ini" > /dev/null
+sed -i 's/$/\r/' "$pkg/ini/"*.ini
 
 cp -- windows/package/install.bat windows/package/README.txt "$pkg/"
 # Windows PowerShell 5.1 reads a script without a byte-order mark in the ANSI code page.

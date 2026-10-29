@@ -31,6 +31,16 @@ struct Encode {
 };
 Encode last_encode();
 void note_encode(bool hdr, uint32_t width, uint32_t height);
+// What OptiScaler's own encode used for the last frame (its DlssNrConstants, read without changing them, on every
+// OptiScaler route): linear HDR or the frame passed through as it is (already tone mapped), and the white point it
+// divided the linear frame by. For the menus' engine-data panel.
+struct EncodeSeen {
+    uint64_t count = 0;
+    bool linear = false;
+    float white_point = 0.f;
+};
+EncodeSeen encode_seen();
+void note_encode_seen(bool linear, float white_point);
 // The frame OptiScaler is running NR on (its DlssNrFrameInfo, read by the hook on DlssNr_Dx12::State::Run while
 // that call is on this thread; the model's evaluate happens inside it), with what its MakeDlssNrPass saw of the
 // game's DLSS evaluate just before (create flags, DLSS.Exposure.Scale). `known` is false outside such a call.

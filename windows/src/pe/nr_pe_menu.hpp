@@ -3,7 +3,7 @@
 // Present is hooked in the system's dxgi.dll (below OptiScaler's own swap chain, after its menu and frame
 // generation), and while the menu is open it is drawn with ImGui into an 8-bit image of its own and laid over the
 // back buffer in the swap chain's encoding (SDR, scRGB, HDR10), on D3D11 and D3D12 swap chains. It edits the game's
-// dlssnr-amd.ini - [RenoDX] (every NR setting with the RenoDX-style option on), [Preprocess], [Int4Mixed] - which
+// dlssnr-amd.ini - [RenoDX] (every NR setting with the RenoDX-style option on), [Preprocess], [Network] - which
 // the DLL re-reads about once a second, and shows what NR is doing (nr_control_shared.hpp). The same menu as the
 // Linux build's Vulkan layer (linux/src/layer/nr_control_layer.cpp). OptiScaler's own menu (Insert) stays as it is.
 //

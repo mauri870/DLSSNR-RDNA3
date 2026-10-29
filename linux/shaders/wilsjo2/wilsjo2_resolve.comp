@@ -1,0 +1,161 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Mode 1, Resolve: t0 = the proxy the network was shown (Ps), t1 = its answer (Ms), t2 = the kept original,
+// t3 = the 1x1 exposure (ExposureMode 1 / 3), u0 = the frame, written in its own format. The compare (R0, R18) is not
+// here: NR Control's comparison is a pass of its own (wilsjo2_inspect.comp). The debug views are, as the fork's resolve
+// has them (DebugView 1 / 2 after R6, 3 after R9, ShowSkinMask at R17), set by NR Control's [Inspect] for one layer;
+// ShowSkinMask shows the skin weight with or without SkinProtection.
+#define WILSJO2_RESOLVE 1
+#include "wilsjo2_common.glsl"
+
+void main() {
+    const uvec2 p = gl_GlobalInvocationID.xy;
+    if (outside(p)) return;
+    // R0 - R2
+    const vec2 uv = pixel_uv(p);
+    const vec4 Ps = textureLod(t0, uv, 0.0);
+    const vec4 Ms = textureLod(t1, uv, 0.0);
+    const bool passthrough = cb.Passthrough != 0u;
+    vec3 P = passthrough ? Ps.rgb : srgb_decode(Ps.rgb);
+    vec3 M = passthrough ? Ms.rgb : srgb_decode(Ms.rgb);
+    vec3 Md = M;
+    // R3 - R5
+    const vec4 Os = texelFetch(t2, ivec2(p), 0);
+    const float N = passthrough ? 1.0 : white_point();
+    const vec3 O = Os.rgb / N;
+    const float YO = luma(O);
+    float YP = luma(P);
+    // R6
+    if (cb.ApplyModel == 0u) {
+        imageStore(u0, ivec2(p), vec4(max(Os.rgb, vec3(0.0)), Os.a));
+        return;
+    }
+    if (cb.DebugView == 1u) {   // the network's input
+        imageStore(u0, ivec2(p), vec4(P * cb.DebugScale, Os.a));
+        return;
+    }
+    if (cb.DebugView == 2u) {   // its answer
+        imageStore(u0, ivec2(p), vec4(M * cb.DebugScale, Os.a));
+        return;
+    }
+    // R7
+    const ivec2 ps = textureSize(t0, 0);
+    const bool small = uint(ps.x) != cb.Width || uint(ps.y) != cb.Height;
+    // R8: the resize field, below the frame's extent
+    if ((cb.Transfer == 3u || cb.Transfer == 4u) && (uint(ps.x) < cb.Width || uint(ps.y) < cb.Height)) {
+        P = full_proxy(O);
+        M = reconstruct(P, uv, Ms.rgb);
+        Md = M;
+        YP = luma(P);
+    }
+    // Enlargement "Edge-aware" (ours, Transfer 3 -> 5): the change carried as lighting and colour onto the full proxy
+    if (cb.Transfer == 5u && small) {
+        P = full_proxy(O);
+        const vec3 target = lighting(p, P);
+        Md = target;
+        M = cube_scale(P, target);
+        YP = luma(P);
+    }
+    // R9
+    vec3 E = M - P;
+    if (cb.Transfer == 2u) {
+        const vec3 s = clamp(2.0 * sanitize3(Ms.rgb, vec3(0.5)) - 1.0, vec3(-0.999), vec3(0.999));
+        E = (1.0 / 64.0) * s / (1.0 - abs(s));
+    }
+    if (cb.DebugView == 3u) {   // its change, x20 around grey: both directions at once, flat grey = no change
+        imageStore(u0, ivec2(p), vec4(srgb_decode(saturate3(0.5 + E * 20.0)) * cb.DebugScale, Os.a));
+        return;
+    }
+    // R10
+    if ((cb.Transfer == 1u && small) || cb.Transfer == 2u) {
+        P = full_proxy(O);
+        YP = luma(P);
+        M = cube_scale(P, P + E);
+        if (cb.Transfer == 2u) Md = M;
+    }
+    // Ours (ColourLimit, default on): the colour of the network's edit bounded as RenoDX's resolve bounds it
+    // (v6_common.hlsli ResolvePixel: the log2 ratio's opponent part clamped to +/-ChromaClampStops, 1 by default); its
+    // lightness untouched. Only where the bound acts, so an edit inside it is the fork's to the bit.
+    if (cb.ColourLimit != 0u) {
+        const vec3 Pf = max(P, vec3(1.0 / 1024.0));
+        const vec3 lr = log2(max(M, vec3(1.0 / 1024.0))) - log2(Pf);
+        const float l = dot(lr, vec3(0.212639, 0.715169, 0.072192));
+        const vec3 c = lr - l;
+        if (any(greaterThan(abs(c), vec3(1.0)))) {
+            M = Pf * exp2(l + clamp(c, vec3(-1.0), vec3(1.0)));
+            if (cb.Transfer != 2u && cb.Transfer != 5u) Md = M;
+        }
+    }
+    // R11
+    const float T = cb.TransferStrength;
+    const float YM = luma(M);
+    vec3 U;
+    if (YM <= 1e-5) {
+        U = O;
+    } else if (cb.Transfer == 6u && small) {
+        // Enlargement "Classic" (ours, Transfer 4 -> 6): t1 is the answer enlarged by its scaler (wilsjo2_classic.comp);
+        // that picture is the result, the frame adding only the light above the proxy's knee
+        const float headroom = max(0.0, YO - luma(full_proxy(O)));
+        U = lerp3(O, M * ((YM + headroom) / YM), saturate1(T));
+    } else {
+        const float ratio = YO < YP ? YO / max(YP, 1e-6) : (YM + max(0.0, YO - YP)) / YM;
+        U = lerp3(O, hue_oklab(M * ratio, M), saturate1(T));
+    }
+    // R12
+    const float YU = sum3_split(U, kLuma);
+    const float q = (YU + 0.001953125) / (YO + 0.001953125);
+    const float a = pow(max(q, 1e-6), 1.0 + max(T - 1.0, 0.0));
+    const float g = max(cb.MaxRatio, 1.0);
+    const float b = clamp(a, 1.0 / g, g);
+    // Ours (ColourLimit): where the lower guard lifts a darkened answer (b above a), its extra light is added along the
+    // original pixel's colour instead of multiplying the answer's - an answer that lost green and blue at a dark skin
+    // edge became a bright saturated red edge (HL2, KCD2; the fork's R12 does the same). Elsewhere R12 as it is.
+    const float guard_scale = b / max(q, 1e-6);
+    if (cb.ColourLimit != 0u && a < 1.0 / g && guard_scale > 1.0 && YO > 1e-6) U += O * (max(YU, 0.0) * (guard_scale - 1.0) / YO);
+    else U = U * guard_scale;
+    // R13
+    const float C = cb.ColourStrength;
+    vec3 R = lerp3(O * b, U, min(C, 1.0));
+    if (C > 1.0) R = clamp_ap1(from_oklab(vec3(1.0, C, C) * to_oklab(max(R, vec3(0.0)))));
+    // R14
+    const uint rm = cb.ReversibleMode;
+    if (rm == 2u) R = passthrough ? Md : neutwo_decode(Md);
+    else if (rm == 4u) R = passthrough ? Md : hybrid_decode(Md);
+    // R15
+    if ((rm == 2u || rm == 4u) && cb.ModelWorkScale > 0.0 && cb.ModelWorkScale < 0.999 && cb.ReplaceDetailStrength > 0.0) {
+        const float k = clamp(round(1.0 / cb.ModelWorkScale), 1.0, 4.0);
+        const vec2 tap = vec2(k / float(cb.Width), k / float(cb.Height));
+        const vec3 nb = textureLod(t2, uv + vec2(tap.x, 0.0), 0.0).rgb + textureLod(t2, uv - vec2(tap.x, 0.0), 0.0).rgb +
+                        textureLod(t2, uv + vec2(0.0, tap.y), 0.0).rgb + textureLod(t2, uv - vec2(0.0, tap.y), 0.0).rgb;
+        const float blur = luma(O + nb / N) / 5.0;
+        const float contrast = (YO - blur) / (max(YO, blur) + 0.001953125);
+        R = R * exp2(clamp(cb.ReplaceDetailStrength, 0.0, 2.0) * clamp(contrast, -1.0, 1.0));
+    }
+    // Unlike the fork, replacement (including its restored detail) obeys the composition's MaxRatio guard too.
+    if (rm == 2u || rm == 4u) {
+        const float q = (luma(R) + 0.001953125) / (YO + 0.001953125);
+        R *= clamp(q, 1.0 / g, g) / max(q, 1e-6);
+    }
+    // R16
+    R = R * N;
+    // R17
+    if (cb.SkinProtection != 0u) {
+        const vec3 disp = passthrough ? O : srgb_encode(saturate3(O));
+        const float m = skin_weight(disp);
+        const float det = lerp1(cb.EnvironmentDetail, cb.SkinDetail, m);
+        const float col = lerp1(cb.EnvironmentColour, cb.SkinColour, m);
+        const float bY = luma(max(Os.rgb, vec3(0.0)));
+        const float eY = luma(max(R, vec3(0.0)));
+        const float wY = lerp1(bY, eY, det);
+        const vec3 bC = Os.rgb / max(bY, 1e-6);
+        const vec3 eC = R / max(eY, 1e-6);
+        if (det == 0.0 && col == 0.0) R = Os.rgb;
+        else if (det != 1.0 || col != 1.0) R = clamp_ap1(lerp3(bC, eC, col) * wY);
+    }
+    if (cb.ShowSkinMask != 0u) {   // the skin weight, white = skin
+        const float m = skin_weight(passthrough ? O : srgb_encode(saturate3(O)));
+        R = vec3(m) * N;
+    }
+    // R19
+    imageStore(u0, ivec2(p), vec4(max(R, vec3(0.0)), Os.a));
+}

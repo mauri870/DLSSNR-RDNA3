@@ -1,0 +1,21 @@
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+// NR Control's debug views of a RenoDX layer ([Inspect] DebugView), ours: the
+// network's input (the stage's proxy), its answer (neural), or its change x20 around grey (flat grey: no change),
+// written over what the stage hands the frame, the network's pixels picked as the legacy resolve picks them. The values
+// are the network's own encoding: on an SDR frame the picture's own; on an HDR frame the codec's display-like ones.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) uniform texture2D Proxy;
+layout(set = 0, binding = 1) uniform texture2D Neural;
+layout(set = 0, binding = 4) uniform writeonly image2D Output;   // in its own format
+layout(push_constant) uniform Push { uvec2 size, net_size; uint view; } pc;
+
+void main() {
+    const uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(pixel, pc.size))) return;
+    const uvec2 ns = max(pc.net_size, uvec2(1u));
+    const ivec2 q = ivec2(min(uvec2(((vec2(pixel) + 0.5) * vec2(ns)) / vec2(pc.size)), ns - 1u));
+    const vec3 p = texelFetch(Proxy, q, 0).rgb, n = texelFetch(Neural, q, 0).rgb;
+    const vec3 v = pc.view == 1u ? p : pc.view == 2u ? n : clamp(0.5 + 20.0 * (n - p), 0.0, 1.0);
+    imageStore(Output, ivec2(pixel), vec4(v, 1.0));
+}

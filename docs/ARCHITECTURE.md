@@ -5,8 +5,8 @@ code is. For installing and using it, see the [README](../README.md).
 
 ## The network
 
-The NR network of DLSS 5 (`nvngx_dlssnr.dll`: the 310.9.16 new model, the Linux default, and the 310.8.0
-old model, which 310.9.16 also contains) is reimplemented as Vulkan compute shaders in GLSL. Both models
+The NR network of DLSS 5 (`nvngx_dlssnr.dll`: `CC_SMALL_FP8`, 310.9.16's default, and `CC_SILVER_AARDWOLD`, the
+model of 310.8.0, which 310.9.16 also contains) is reimplemented as Vulkan compute shaders in GLSL. Both models
 use the same layer types and the same shaders; they differ in the layer table and the weights. The
 shaders do FP8 matrix multiplication through `VK_KHR_cooperative_matrix` and `VK_EXT_shader_float8`,
 which compile to the RDNA4 WMMA instructions. Precision follows the original operation by operation: FP8
@@ -28,14 +28,27 @@ D3D12 and DXVK translates D3D10/11. Both expose interop interfaces that hand ove
 `VkDevice`, queue, command buffers and images. The network's shaders are recorded straight into the
 game's own command buffer, at the point where the frame is processed.
 
-**`optiscaler` route.** [OptiScaler-NR](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass)
+**`optiscaler` route (Linux, since 0.0.8).** The original [OptiScaler](https://github.com/optiscaler/OptiScaler)
+(shipped unchanged) hooks the game's DLSS/FSR/XeSS upscaler and does the upscaling and frame
+generation. Our NR is an OptiScaler plugin, `dlssnr-amd.asi` (`linux/src/pe/nr_asi_main.cpp`), which OptiScaler
+loads from `OptiScaler/plugins/` (`[Plugins] LoadAsiPlugins = true`). Every upscaler input of OptiScaler ends in its
+exported `NVSDK_NGX_D3D12_EvaluateFeature` (and the D3D11 / Vulkan ones); the plugin wraps those exports, so it
+sees the game's colour, depth, motion vectors, exposure, jitter and reset without byte signatures, and runs the
+NR chain's layers before the upscaler (on a copy of the colour it hands the upscaler instead), after it (on its
+output) or at the game's Present (on the back buffer, before OptiScaler's frame generation). D3D12 games record
+into the game's command list through vkd3d-proton's interop, D3D11 games into a command buffer of ours behind
+DXVK's work, Vulkan games into the game's own command buffer. The wilsjo2 style
+(`linux/src/core/nr_wilsjo2.cpp`, `linux/shaders/wilsjo2/`) and HUD FIX (`linux/src/pe/nr_asi_hudcap.cpp`) are part
+of the plugin; NR Control is drawn by it too (`linux/src/pe/nr_pe_menu.cpp`).
+
+**`optiscaler` route (Windows).** [OptiScaler-NR](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass)
 hooks the game's DLSS/FSR/XeSS upscaler, gathers colour, depth and the engine's own motion vectors,
 and calls NVIDIA's NGX API for feature 18 (DLSS-NR). This project provides that API: an NGX core
 (`dlssnr_core.dll`, which OptiScaler loads through `[Libraries] NvngxPath`) implements the NGX entry
 points and runs our network instead of NVIDIA's. It is deliberately not named `_nvngx.dll`: Streamline
 games would take a loaded module of that name for NVIDIA's own core and lose their DLSS option.
 OptiScaler's file is not modified; a few defects of the bundled release are corrected in memory when
-it loads the core (`linux/src/pe/nr_pe_optifix.cpp`, listed in `linux/package/optiscaler/README.md`).
+it loads the core (`windows/src/pe/nr_pe_optifix.cpp`, listed in `linux/package/optiscaler/README.md`).
 The motion vectors and depth are the engine's own, not estimated as in the ReShade routes.
 
 **`reshade-feeder` route.** For games without an upscaler to hook, a ReShade add-on (the design follows
@@ -63,21 +76,19 @@ the add-on gets a real `VkDevice`. That needs three pieces of plumbing:
 
 Native Vulkan games use the same route: ReShade as a layer under the game's own Vulkan device.
 
-**NR Control.** On Linux, the OptiScaler route's NR menu (End) is a Vulkan layer
-(`linux/src/layer/nr_control_layer.cpp`, menu contents in `linux/src/ui/nr_control_ui.hpp`, shared with the
-ReShade Add-ons page). It draws into an image of its own and composites it in the swap chain's encoding.
-It calls the next layer through its dispatch table only. It talks to the NGX core (a Windows DLL in the
-same process under Proton) through `dlssnr-amd/control.bin` (`linux/src/core/nr_control_shared.hpp`):
-status from the core, settings through `dlssnr-amd.ini`, and on Wayland the keyboard and mouse, which the
-core reads from the game window. The Windows version draws the same menu from the NGX core itself; see
-Windows below.
+**NR Control.** On Linux, the OptiScaler route's NR menu (End) is drawn by the plugin
+(`linux/src/pe/nr_pe_menu.cpp`, menu contents in `linux/src/ui/nr_control_ui.hpp` and `nr_control_pages.hpp`, shared
+with the ReShade Add-ons page) over the game's DXGI swap chain (D3D11 / D3D12 games) or its Vulkan swap chain, in
+the swap chain's encoding. `nr_present_probe.exe` finds DXGI's methods in a process of its own (no D3D device or swap
+chain is made inside the game's). Settings go through `dlssnr-amd.ini`, status through
+`dlssnr-amd/control.bin` (`linux/src/core/nr_control_shared.hpp`). The Windows version draws the same menu from the
+NGX core itself; see Windows below.
 
-**RenoDX style.** `[RenoDX] Enabled = 1` wraps the network in RenoDX's DLSS5 processing on every route
-(`linux/src/core/nr_renodx.cpp`): RenoDX's encode, look and resolve shaders (`linux/shaders/renodx`,
-compiled by Slang as RenoDX builds its Vulkan path), with the network as the model in between. On D3D12
-games on the OptiScaler route a hook on OptiScaler's NR pass (`linux/src/pe/nr_pe_optifix.cpp`,
-`linux/src/pe/nr_pe_renodx_route.hpp`) makes it hand the core the frame as it is and take the answer back as
-it is, so OptiScaler's own NR processing and NR settings do not apply.
+**RenoDX style.** A layer with the RenoDX processing wraps the network in RenoDX's DLSS5 processing on every
+route (`linux/src/core/nr_renodx.cpp`): RenoDX's encode, look and resolve shaders (`linux/shaders/renodx`,
+compiled by Slang as RenoDX builds its Vulkan path), with the network as the model in between. Passes (fast)
+(`linux/shaders/renodx-fast`, `linux/src/core/nr_fast_passes.hpp`) and Preprocess (`linux/shaders/renodx-prep`)
+run inside it.
 
 **Windows.** A native D3D game on Windows has no Vulkan device underneath it. DirectX 10/11/12 games
 keep the system's D3D, and the network runs on a Vulkan device of its own, created on the adapter the
@@ -107,14 +118,14 @@ and `SetColorSpace1` in the system's `dxgi.dll` (`windows/src/pe/nr_pe_menu.cpp`
 swap chain wrapper, so the menu lands on the frame after OptiScaler's menu and frame generation. The
 addresses come from `dlssnr-amd\nr_present_probe.exe`, which makes D3D12 and D3D11 swap chains in a
 process of its own and writes each method as a module path and offset: a swap chain made inside the game
-would be seen, and kept, by the hooks OptiScaler has there. While open, the menu is drawn with Dear ImGui
-(D3D11 or D3D12 backend, on the swap chain's device) into an 8-bit image of its own and laid
-over the back buffer in the swap chain's encoding (SDR, scRGB or HDR10, from `SetColorSpace1` and the
-format). Its contents are Linux's (`windows/src/ui/nr_control_ui.hpp`); status comes from the core in the
+would be seen, and kept, by the hooks OptiScaler has there. While open (and, closed, while the OSD of the
+running network is due), the menu is drawn with Dear ImGui (D3D11 or D3D12 backend, on the swap chain's
+device) into an 8-bit image of its own and laid over the back buffer in the swap chain's encoding (SDR,
+scRGB or HDR10, from `SetColorSpace1` and the format). Its contents are Linux's (`windows/src/ui/nr_control_ui.hpp`); status comes from the core in the
 same process, settings go through `dlssnr-amd.ini`, and keyboard and mouse come from the game window.
 
 The Windows version runs the same network through AMD's Windows shader compiler, which produces slower
-code for the largest kernels than Mesa's ACO does on Linux. With `[Network] ACO Mode = 1` it imports
+code for the largest kernels than Mesa's ACO does on Linux. With `[Network] ACO Mode = 1` (the default) it imports
 machine code made by ACO for the Linux shaders instead (`windows/data/aco/records`; int4 mixed's in
 `windows/data/aco/int4`), through
 `VK_KHR_pipeline_binary`: the driver compiles a shader with the same interface to get its pipeline
@@ -150,13 +161,15 @@ because it fits the job better:
 ```
 linux/                 the Linux version (the reference implementation)
   src/core/              network runtime: graph, Vulkan helpers, planner
-  src/pe/                the Windows DLLs as run under Proton: OptiScaler backend, ReShade add-on
-  src/layer/             NR Control, the OptiScaler route's NR menu (a Linux Vulkan layer); int4 mixed's layer
+  src/pe/                the Windows DLLs as run under Proton: the OptiScaler plugin with NR Control, ReShade add-on
+  src/layer/             int4 mixed's Vulkan layer (ReShade routes)
   src/ui/                menu contents shared by NR Control and the ReShade add-on
   shaders/rdna4/         the network (pipelines.json lists every pipeline and its defines)
-  shaders/passes/        the passes around it (encode, transfer, motion estimation)
+  shaders/passes/        the passes around it (motion estimation, depth, alpha)
   shaders/renodx/        RenoDX's shaders for the RenoDX style (MIT, with its licence)
-  build/                 build_network.py, build_package.sh, build_optiscaler_nr.sh, ...
+  shaders/renodx-fast/   Passes (fast); shaders/renodx-prep/: Preprocess
+  shaders/wilsjo2/       the wilsjo2 style and HUD FIX
+  build/                 build_network.py, build_package.sh, build_asi.sh, ...
   package/               installer, README and model-tools/ (model extraction)
   vulkan-loader/         patches for the Khronos loader used by the reshade-feeder-vulkan/-dx9 routes
 windows/               a separate copy for the AMD Windows driver, changed on its own

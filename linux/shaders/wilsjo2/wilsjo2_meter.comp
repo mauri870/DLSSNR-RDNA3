@@ -1,0 +1,42 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Mode 3, Meter: t0 = the frame (the one the encode reads), u0 = the 64 x 64 meter (32-bit float RGBA). One
+// 8x8 group a tile, 64 x 64 groups: each tile's mean luminance into its texel (r), with 0, 0, 1 in g, b, a.
+#include "wilsjo2_common.glsl"
+
+shared float values[64];
+
+void main() {
+    const uvec2 g = gl_WorkGroupID.xy;
+    const uvec2 l = gl_LocalInvocationID.xy;
+    const uint lane = l.y * 8u + l.x;
+    const ivec2 size = textureSize(t0, 0);
+    const uint fw = uint(size.x), fh = uint(size.y);
+    // The tile's pixels: [tx0, endX) x [ty0, endY), at least one.
+    const uint tx0 = (g.x * fw) / 64u, tx1 = ((g.x + 1u) * fw) / 64u;
+    const uint ty0 = (g.y * fh) / 64u, ty1 = ((g.y + 1u) * fh) / 64u;
+    const uint end_x = max(tx1, tx0 + 1u), end_y = max(ty1, ty0 + 1u);
+    // Each lane sums its pixels, rows outer, columns inner, a step of 8 both ways; luminance that is not finite
+    // counts as 0. The luminance in the resolve's operation order (sum3, wilsjo2_common.glsl), not the encode's: the
+    // order the forked OptiScaler's meter is evaluated in on this hardware and driver (measured against its frames over
+    // 60 frames; with the encode's order its white point is one ulp away on some frames).
+    float sum = 0.0;
+    for (uint ty = ty0 + l.y; ty < end_y; ty += 8u) {
+        for (uint tx = tx0 + l.x; tx < end_x; tx += 8u) {
+            const vec3 c = max(texelFetch(t0, ivec2(min(tx, fw - 1u), min(ty, fh - 1u)), 0).rgb, vec3(0.0));
+            const float y = sum3(c, kLuma);
+            sum += finite1(y) ? max(y, 0.0) : 0.0;
+        }
+    }
+    // The lanes' sums added pairwise: strides 32, 16, 8, 4, 2, 1.
+    values[lane] = sum;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) values[lane] += values[lane + stride];
+        barrier();
+    }
+    if (lane == 0u) {
+        const float taken = float((end_x - tx0) * (end_y - ty0));
+        imageStore(u0, ivec2(g), vec4(taken > 0.0 ? values[0] / taken : 0.0, 0.0, 0.0, 1.0));
+    }
+}

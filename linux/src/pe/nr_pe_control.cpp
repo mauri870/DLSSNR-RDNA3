@@ -1,12 +1,15 @@
 // See nr_pe_control.hpp.
 #include "nr_pe_control.hpp"
+#include "nr_pe_events.hpp"
 #include "nr_control_shared.hpp"
 #include "nr_pe_config.hpp"
 #include "nr_pe_log.hpp"
 #include "nr_screenshot.hpp"
+#include "nr_vram_ledger.hpp"
 
 #include <windows.h>
 #include "MinHook.h"
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -229,7 +232,7 @@ void watch() {
                 if (g_window) {
                     g_previous = reinterpret_cast<WNDPROC>(
                         SetWindowLongPtrW(g_window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&window_proc)));
-                    log("[nr] NR Control: the menu is on a Wayland surface; its input comes from the game's window");
+                    log("[nr] NR Control: its input comes from the game's window (the menu is drawn by our DLL, or by the layer on a Wayland surface)");
                 }
             }
             if (g_window) {
@@ -256,34 +259,212 @@ void watch() {
 
 }  // namespace
 
-void report(const Status& st) {
-    static uint64_t last = 0;
-    static std::once_flag started;
-    static uint32_t screenshot_seen = 0;
+namespace {
+nr::control::LayerStatus* row_of(nr::control::Shared* s, int number, bool make) {
+    if (!s || number <= 0) return nullptr;
+    for (auto& r : s->layers)
+        if (r.number == uint32_t(number)) return &r;
+    if (!make) return nullptr;
+    for (auto& r : s->layers)
+        if (!r.number) { std::memset(&r, 0, sizeof r); r.number = uint32_t(number); r.net = nr::control::kNoNet; return &r; }
+    return nullptr;   // more layers than rows: the rest are not shown
+}
+}  // namespace
+
+// The .asi's chain as chain_layers last had it (g_chain_known: it was ever told): report() makes rows for these only,
+// so a run of a layer just taken out cannot bring its row back.
+std::mutex g_chain_lock;
+std::vector<int> g_chain;
+bool g_chain_known = false;
+std::vector<int> g_frame_layers;
+void present_layers() {
+    nr::control::Shared* s = shared(); if (!s) s = page();
+    std::lock_guard<std::mutex> g(g_chain_lock);
+    for (auto& r : s->layers)
+        if (r.number && r.state == 1 && std::find(g_frame_layers.begin(), g_frame_layers.end(), int(r.number)) == g_frame_layers.end()) {
+            r.state = 3; r.gpu_ms = r.network_ms = 0.f;
+            std::snprintf(r.note, sizeof r.note, "not run on this presented frame");
+        }
+    g_frame_layers.clear();
+}
+
+
+void chain_layers(const std::vector<int>& numbers) {
     nr::control::Shared* s = shared();
-    if (!s) return;
-    std::call_once(started, [s] {
-        screenshot_seen = s->screenshot_request;   // a press from before this run is not a request
+    if (!s) s = page();
+    {
+        std::lock_guard<std::mutex> g(g_chain_lock);
+        g_chain = numbers;
+        g_chain_known = true;
+    }
+    for (auto& r : s->layers)
+        if (r.number && std::find(numbers.begin(), numbers.end(), int(r.number)) == numbers.end()) std::memset(&r, 0, sizeof r);
+    for (int n : numbers) row_of(s, n, true);
+    if (numbers.empty()) {   // no layer runs: nothing of the last run's stays on the page (no report() comes now)
+        s->gpu_ms = s->network_ms = 0.f;
+        s->width = s->height = s->nr_width = s->nr_height = 0;
+        s->render_width = s->render_height = s->output_width = s->output_height = 0;
+        s->passes = 0;
+        s->net_running = nr::control::kNoNet;
+        s->building = 0;
+        s->building_net = nr::control::kNoNet;
+        s->panel_lines = 0;
+        ++s->status_seq;
+    }
+}
+
+void layer_changed(int number) {
+    nr::control::Shared* s = shared();
+    if (!s) s = page();
+    nr::control::LayerStatus* r = row_of(s, number, false);
+    if (!r) return;
+    r->net = nr::control::kNoNet;
+    r->width = r->height = r->nr_width = r->nr_height = 0;
+    r->passes = 0;
+    r->gpu_ms = r->network_ms = 0.f;
+    r->panel_lines = 0;
+    r->updated = 0;
+}
+
+void asi_facts(const char* build, const char* frame_gen) {
+    nr::control::Shared* s = shared();
+    if (!s) s = page();
+    if (build) std::snprintf(s->asi_build, sizeof s->asi_build, "%s", build);
+    if (frame_gen) std::snprintf(s->frame_gen, sizeof s->frame_gen, "%s", frame_gen);
+}
+
+void hud_facts(const char* now, const char* why_game, const char* why_captured, const char* why_estimated) {
+    nr::control::Shared* s = shared();
+    if (!s) s = page();
+    if (now) std::snprintf(s->hud_now, sizeof s->hud_now, "%s", now);
+    const char* why[3] = {why_game, why_captured, why_estimated};
+    for (int i = 0; i < 3; ++i)
+        if (why[i]) std::snprintf(s->hud_why[i], sizeof s->hud_why[i], "%s", why[i]);
+}
+
+void layer_ran(int number, uint32_t processing, uint32_t placement, uint32_t state, const char* note) {
+    {   // a layer the chain no longer has (a Present that waited for its slot while the chain changed): no row again
+        std::lock_guard<std::mutex> g(g_chain_lock);
+        if (g_chain_known && std::find(g_chain.begin(), g_chain.end(), number) == g_chain.end()) return;
+        if (std::find(g_frame_layers.begin(),g_frame_layers.end(),number)==g_frame_layers.end()) g_frame_layers.push_back(number);
+    }
+    nr::control::Shared* s = shared();
+    if (!s) s = page();
+    nr::control::LayerStatus* r = row_of(s, number, true);
+    if (!r) return;
+    if (r->processing != processing || r->placement != placement) {   // another processing / place: the old readings go
+        const uint32_t n = r->number;
+        std::memset(r, 0, sizeof *r);
+        r->number = n;
+        r->net = nr::control::kNoNet;
+    }
+    r->processing = processing;
+    r->placement = placement;
+    r->state = state;
+    if (state != 1u) r->gpu_ms = r->network_ms = 0.f;
+    std::snprintf(r->note, sizeof r->note, "%s", note ? note : "");
+    r->updated = uint32_t(GetTickCount64());
+    // a skip with no run after it is a state (the run's own result comes through report()); the place noted before a
+    // run (state 1, "not recorded yet") is not
+    if (state == 3u && std::strcmp(r->note, "not recorded yet") != 0) nr::pe::events::layer_state(number, state, r->note);
+}
+
+namespace {
+std::once_flag g_watch_started;
+uint32_t g_screenshot_seen = 0;
+void start_watch_on(nr::control::Shared* s) {
+    std::call_once(g_watch_started, [s] {
+        g_screenshot_seen = s->screenshot_request;   // a press from before this run is not a request
         std::thread(watch).detach();
     });
+}
+}  // namespace
+
+void start_input() {
+    if (nr::control::Shared* s = shared()) start_watch_on(s);
+}
+
+void report(const Status& st) {
+    static uint64_t last = 0;
+    uint32_t& screenshot_seen = g_screenshot_seen;
+    nr::control::Shared* s = shared();
+    if (!s) return;
+    start_watch_on(s);
     if (s->screenshot_request != screenshot_seen) {
         screenshot_seen = s->screenshot_request;
         nr::pe::screenshot::request();
     }
     const uint64_t now = GetTickCount64();
+    {   // a run of a layer the chain no longer has (a frame in flight at the change): dropped, its row stays emptied
+        std::lock_guard<std::mutex> g(g_chain_lock);
+        if (g_chain_known && st.layer > 0 && std::find(g_chain.begin(), g_chain.end(), st.layer) == g_chain.end()) return;
+        if (std::find(g_frame_layers.begin(),g_frame_layers.end(),st.layer)==g_frame_layers.end()) g_frame_layers.push_back(st.layer);
+    }
+    if (nr::control::LayerStatus* r = row_of(s, st.layer, true)) {   // a layer's row: every run
+        r->state = !st.nr_on ? 3u : st.building && st.gpu_ms <= 0.f ? 2u : st.waiting ? 3u : 1u;
+        if (!st.nr_on) std::snprintf(r->note, sizeof r->note, "NR is off (toggle key)");
+        else if (st.waiting) std::snprintf(r->note, sizeof r->note, "%s", st.waiting_why.c_str());
+        else r->note[0] = 0;
+        r->net = st.net_running < 0 ? nr::control::kNoNet : uint32_t(st.net_running);
+        r->width = st.width; r->height = st.height;
+        r->nr_width = st.nr_width; r->nr_height = st.nr_height;
+        r->passes = st.passes;
+        r->fast_passes = st.fast_passes; r->motion = st.motion;
+        if (r->state == 1u && st.fast_fallback)
+            std::snprintf(r->note, sizeof r->note, "Extrapolation: no motion vectors");
+        r->gpu_ms = st.gpu_ms; r->network_ms = st.network_ms;
+        r->updated = uint32_t(now);
+        nr::pe::events::layer_state(st.layer, r->state, r->note);
+        if (uint32_t(now) - r->panel_at >= 250u) {   // its engine data, four times a second
+            r->panel_at = uint32_t(now);
+            const size_t lines = std::min<size_t>(st.panel.size(), nr::control::kPanelLines);
+            for (size_t i = 0; i < lines; ++i) std::snprintf(r->panel[i], sizeof r->panel[i], "%s", st.panel[i].c_str());
+            r->panel_lines = uint32_t(lines);
+        }
+    }
+    if (st.vram_known) {
+        s->vram_process_kib = uint32_t(st.vram_usage >> 10);
+        s->vram_budget_kib = uint32_t(st.vram_budget >> 10);
+        s->vram_heap_kib = uint32_t(st.vram_heap >> 10);
+    }
     if (now - last < 250) return;
     last = now;
+    {   // NR's own video memory, by network and kind
+        nr::vram::install_vulkan();   // again, should the entry points have been loaded anew
+        uint64_t by[nr::vram::kOwners][nr::vram::kKinds];
+        nr::vram::totals(by);
+        for (int o = 0; o < nr::vram::kOwners; ++o)
+            for (int k = 0; k < nr::vram::kKinds; ++k) s->vram_kib[o][k] = uint32_t(by[o][k] >> 10);
+        s->vram_known = 1;
+    }
     std::snprintf(s->screenshot, sizeof s->screenshot, "%s", nr::pe::screenshot::status());
     // NR Control is a Vulkan layer the launch options load: no Present from it 10 s after NR first ran = not loaded.
     static uint64_t first = now;
     static uint32_t seen_seq = s->menu_seq;
     static bool told = false;
     if (s->menu_seq != seen_seq) told = true;   // it is there
+    if (s->dll_menu) told = true;               // the .asi draws NR Control itself (a DXGI swap chain): no layer needed
     if (!told && now - first > 10000) {
         told = true;
-        const std::string game = module_folder();
-        log("[nr] NR Control (End) is not loaded: the launch options need VK_ADD_LAYER_PATH=\"%s\\dlssnr-amd\\control\\layer\" "
-            "and VK_LAYER_DLSSNR_control in VK_INSTANCE_LAYERS (install.sh prints the whole line)", game.c_str());
+        // the launch line is read on the Linux side: the folder as a Linux path (Wine's own mapping of any drive;
+        // without it Z: is / and other drives stay as they are)
+        std::string game = std::string(module_folder()) + "\\dlssnr-amd\\control\\layer";
+        using UnixName = char*(__cdecl*)(const wchar_t*);
+        const auto unix_name = reinterpret_cast<UnixName>(reinterpret_cast<void*>(
+            GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "wine_get_unix_file_name")));
+        wchar_t wide[1024];
+        char* mapped = nullptr;
+        if (unix_name && MultiByteToWideChar(CP_ACP, 0, game.c_str(), -1, wide, 1024) > 0) mapped = unix_name(wide);
+        if (mapped) {
+            game = mapped;
+            HeapFree(GetProcessHeap(), 0, mapped);
+        } else {
+            if (game.size() > 2 && (game[0] == 'Z' || game[0] == 'z') && game[1] == ':') game.erase(0, 2);
+            for (char& c : game) if (c == '\\') c = '/';
+        }
+        log("[nr] NR Control (End) is not loaded: a Vulkan game needs VK_ADD_LAYER_PATH=\"%s\" "
+            "and VK_LAYER_DLSSNR_control in VK_INSTANCE_LAYERS in its launch options (install.sh prints the whole line)",
+            game.c_str());
     }
     s->route = st.route;
     s->renodx = st.renodx;
@@ -296,10 +477,33 @@ void report(const Status& st) {
     s->placement = st.placement;
     s->output_width = st.output_width; s->output_height = st.output_height;
     s->passes = st.passes;
-    s->int4 = uint32_t(st.int4);
+    s->net_running = st.net_running < 0 ? nr::control::kNoNet : uint32_t(st.net_running);
+    s->net_want = st.net_want < 0 ? nr::control::kNoNet : uint32_t(st.net_want);
+    for (int n = 0; n < nr::kNetworkChoices; ++n) {
+        std::snprintf(s->net_why[n], sizeof s->net_why[n], "%s", st.net_why[n].c_str());
+    }
+    s->net_known = st.net_want >= 0;
     s->preprocess = st.preprocess;
     s->building = st.building;
+    s->building_net = st.building && st.building_net >= 0 ? uint32_t(st.building_net) : nr::control::kNoNet;
+    s->build_progress = st.build_progress;
+    std::snprintf(s->build_phase, sizeof s->build_phase, "%s", st.build_phase.c_str());
+    const size_t lines = std::min<size_t>(st.panel.size(), nr::control::kPanelLines);
+    for (size_t i = 0; i < lines; ++i) std::snprintf(s->panel[i], sizeof s->panel[i], "%s", st.panel[i].c_str());
+    s->panel_lines = uint32_t(lines);
     ++s->status_seq;
+}
+
+nr::control::Shared* page() {
+    if (nr::control::Shared* s = shared()) return s;
+    static nr::control::Shared* own = [] {
+        auto* s = new nr::control::Shared{};
+        s->version = nr::control::kVersion;
+        s->magic = nr::control::kMagic;
+        s->net_running = s->net_want = s->building_net = nr::control::kNoNet;   // none yet
+        return s;
+    }();
+    return own;
 }
 
 }  // namespace nr::pe::control

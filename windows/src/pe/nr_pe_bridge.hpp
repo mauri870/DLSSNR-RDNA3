@@ -120,6 +120,8 @@ class Device {
     // Can a job still use `owner` / `image`: recorded and not yet submitted, or submitted and not finished.
     bool busy(const void* owner);
     bool busy(VkImage image);
+    // Can this one job (as handed out at `generation`) still run or be running.
+    bool busy(const Job* job, uint64_t generation);
 
     // The GPU-side hand-over on a D3D12 queue: the queue signals the shared fence after everything it
     // has been given so far, our queue waits for that, runs `job`, signals, and the D3D12 queue waits

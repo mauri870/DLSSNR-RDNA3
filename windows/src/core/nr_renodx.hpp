@@ -190,6 +190,20 @@ public:
     // ran the network (0: NR off, or every pass at zero strength - the frame copied through as it is).
     uint32_t record(VkCommandBuffer, const StageFrame&, const Network&);
 
+    // What the last record() decided about the frame, for the menus' engine-data panel.
+    struct Facts {
+        uint8_t hdr_mode = 0;        // 0 SDR, 1 linear HDR, 2 PQ
+        bool absolute = false;       // absolute units: the frame's own nits, no divisor
+        bool prep_exposure = false;  // [Preprocess]'s exposure replaced the divisor
+        int feed = -1;               // the divisor's feed: -1 none (SDR, absolute, Preprocess), 0 the content meter,
+                                     // 1 the game's exposure texture, 2 fixed 1
+        int exposure_texture = -1;   // -1 not looked at, 0 none, 1 readable, 2 not a format the feed reads
+        // The divisor the encode applied to the linear frame (the scale texel's .r, read back every 32nd frame a few
+        // frames late); 0 not known (SDR, absolute units, not read yet).
+        float divisor = 0.f;
+    };
+    Facts facts() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

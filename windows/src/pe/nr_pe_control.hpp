@@ -3,6 +3,8 @@
 // through the page nr_control_shared.hpp lays out: what NR is doing, for the menu to show, and the game window's
 // keyboard and mouse for it, kept from the game while the menu is open.
 #include <cstdint>
+#include <string>
+#include <vector>
 
 namespace nr::control { struct Shared; }
 
@@ -16,7 +18,11 @@ struct Status {
     uint32_t render_width = 0, render_height = 0;   // the game's render extent (the depth guide's), 0 unknown
     uint32_t placement = 0;         // 0 not known, 1 after the upscaler, 2 before it (OptiScaler's frame info)
     uint32_t output_width = 0, output_height = 0;   // the upscaler's output (the game's DLSS evaluate), 0 unknown
-    int int4 = 2;                   // 0 the default network, 1 int4 mixed, 2 not installed
+    int net_running = -1, net_want = -1;   // nr::NetworkChoice, -1 none / not known
+    std::string net_why[3];                // why each network cannot run in this run ("" it can)
+    int building_net = -1;                 // the network being built, -1 none
+    float build_progress = 0.f;            // 0..1 (nr_pe_session.hpp build_progress)
+    std::vector<std::string> panel;        // the engine-data panel's lines (nr_engine_panel.hpp)
 };
 // From each evaluate; written about four times a second. The first call starts the input watcher.
 void report(const Status& s);

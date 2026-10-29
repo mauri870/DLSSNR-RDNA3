@@ -92,27 +92,34 @@ unsigned slot_count(ID3D12GraphicsCommandList* list) {
 // ---- the redirect table the stubs read ----------------------------------------------------------
 // `active` is the number of live pairs; the stubs scan only while it is non-zero. A pair is written
 // `to` first and cleared `from` first, so a reader never pairs a list with a stale continuation.
+// Bit 0 of `to` marks a continuation of another class than the list (kForeign): it is called through
+// its own vtable, never through the list's originals.
 struct alignas(16) RedirectTable {
     volatile int32_t active;
     int32_t pad;
     struct Pair { void* volatile from; void* volatile to; } pairs[16];
 };
 RedirectTable g_rt{};
+constexpr uintptr_t kForeign = 1;
 
-void* target_of(void* self) {
+void* raw_target_of(void* self) {
     if (!g_rt.active) return self;
     for (auto& p : g_rt.pairs)
         if (p.from == self) return p.to;
     return self;
 }
+void* target_of(void* self) {
+    return reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(raw_target_of(self)) & ~kForeign);
+}
 
 // Per-slot stub: if `this` (rcx) is a list with an active cut, replace it with the continuation;
-// then jump to the slot's original. Touches only rax, r10, r11 and flags (volatile, not argument
-// registers in the Windows x64 convention) and never the stack.
+// then jump to the slot's original, or for a continuation of another class to the slot of its own
+// vtable. Touches only rax, r10, r11 and flags (volatile, not argument registers in the Windows x64
+// convention) and never the stack.
 //
 //   0  48 B8 <imm64 &g_rt>        mov  rax, table
 //  10  83 38 00                   cmp  dword [rax], 0
-//  13  74 1E                      je   orig
+//  13  74 2E                      je   orig
 //  15  4C 8D 50 08                lea  r10, [rax+8]
 //  19  41 BB 10 00 00 00          mov  r11d, 16
 //  25  49 3B 0A          scan:    cmp  rcx, [r10]
@@ -120,16 +127,20 @@ void* target_of(void* self) {
 //  30  49 83 C2 10                add  r10, 16
 //  34  41 FF CB                   dec  r11d
 //  37  75 F2                      jne  scan
-//  39  EB 04                      jmp  orig
+//  39  EB 14                      jmp  orig
 //  41  49 8B 4A 08       hit:     mov  rcx, [r10+8]
-//  45  FF 25 00 00 00 00 orig:    jmp  [rip+0]
-//  51  <imm64 original>
-constexpr size_t kStubSize = 64;
-void write_stub(uint8_t* p, const void* table, const void* original) {
+//  45  48 0F BA F1 00             btr  rcx, 0
+//  50  73 09                      jnc  orig
+//  52  48 8B 01                   mov  rax, [rcx]
+//  55  FF A0 <disp32 slot*8>      jmp  [rax+slot*8]
+//  61  FF 25 00 00 00 00 orig:    jmp  [rip+0]
+//  67  <imm64 original>
+constexpr size_t kStubSize = 80;
+void write_stub(uint8_t* p, const void* table, const void* original, unsigned slot) {
     static const uint8_t code[] = {
         0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0,
         0x83, 0x38, 0x00,
-        0x74, 0x1E,
+        0x74, 0x2E,
         0x4C, 0x8D, 0x50, 0x08,
         0x41, 0xBB, 0x10, 0x00, 0x00, 0x00,
         0x49, 0x3B, 0x0A,
@@ -137,38 +148,104 @@ void write_stub(uint8_t* p, const void* table, const void* original) {
         0x49, 0x83, 0xC2, 0x10,
         0x41, 0xFF, 0xCB,
         0x75, 0xF2,
-        0xEB, 0x04,
+        0xEB, 0x14,
         0x49, 0x8B, 0x4A, 0x08,
+        0x48, 0x0F, 0xBA, 0xF1, 0x00,
+        0x73, 0x09,
+        0x48, 0x8B, 0x01,
+        0xFF, 0xA0, 0, 0, 0, 0,
         0xFF, 0x25, 0x00, 0x00, 0x00, 0x00,
         0, 0, 0, 0, 0, 0, 0, 0,
     };
-    static_assert(sizeof code == 59, "stub layout");
+    static_assert(sizeof code == 75, "stub layout");
     std::memset(p, 0xCC, kStubSize);
     std::memcpy(p, code, sizeof code);
     const uint64_t t = reinterpret_cast<uint64_t>(table), o = reinterpret_cast<uint64_t>(original);
+    const uint32_t d = slot * 8;
     std::memcpy(p + 2, &t, 8);
-    std::memcpy(p + 51, &o, 8);
+    std::memcpy(p + 57, &d, 4);
+    std::memcpy(p + 67, &o, 8);
 }
 
+// A class is a set of methods: the originals of one vtable. A process can hold many vtables with the
+// same methods - something that hooks per object gives every list its own copy of the vtable (seen in
+// a D3D12 game with a heap vtable per command list) - and those share one class, its hooks and stubs.
 struct ListClass {
-    void** vtable{};
+    void** vtable{};   // the first vtable seen with these methods
     unsigned slots{};
     void* orig[kMaxSlots]{};
+    void* entry[kMaxSlots]{};   // what a hooked vtable holds: hooks and stubs
+    uint8_t* stubs{};
 };
-ListClass* g_classes[16]{};
+ListClass* g_classes[32]{};
 std::atomic<int> g_class_count{0};
 
+// Every hooked vtable -> its class. Open addressing, entries never removed; written under g_mutex,
+// read without a lock (the class first, then the key with release).
+constexpr size_t kVtables = 8192;
+struct VtEntry {
+    std::atomic<void**> vt{nullptr};
+    ListClass* cls{};
+};
+VtEntry g_vtables[kVtables];
+std::atomic<int> g_vtable_count{0};
+
+size_t vt_hash(void** vt) {
+    return size_t((reinterpret_cast<uintptr_t>(vt) >> 3) * 0x9E3779B97F4A7C15ull >> 51) & (kVtables - 1);
+}
+ListClass* class_by_vtable(void** vt) {
+    for (size_t i = vt_hash(vt), n = 0; n < kVtables; i = (i + 1) & (kVtables - 1), ++n) {
+        void** k = g_vtables[i].vt.load(std::memory_order_acquire);
+        if (k == vt) return g_vtables[i].cls;
+        if (!k) return nullptr;
+    }
+    return nullptr;
+}
+bool register_vtable(void** vt, ListClass* cls) {
+    if (g_vtable_count.load() >= int(kVtables * 3 / 4)) return false;
+    for (size_t i = vt_hash(vt);; i = (i + 1) & (kVtables - 1)) {
+        void** k = g_vtables[i].vt.load(std::memory_order_relaxed);
+        if (k == vt) { g_vtables[i].cls = cls; return true; }
+        if (k) continue;
+        g_vtables[i].cls = cls;
+        g_vtables[i].vt.store(vt, std::memory_order_release);
+        ++g_vtable_count;
+        return true;
+    }
+}
+
 ListClass* class_of(void* self) {
-    void** vt = *static_cast<void***>(self);
-    const int n = g_class_count.load(std::memory_order_acquire);
-    for (int i = 0; i < n; ++i)
-        if (g_classes[i]->vtable == vt) return g_classes[i];
+    if (ListClass* cls = class_by_vtable(*static_cast<void***>(self))) return cls;
     // Called through a vtable that copied our hook from a patched one: the newest class is the only
     // answer that can be right.
+    const int n = g_class_count.load(std::memory_order_acquire);
     return n ? g_classes[n - 1] : nullptr;
 }
 
 template <class F> F orig_fn(void* self, unsigned slot) {
+    return reinterpret_cast<F>(class_of(self)->orig[slot]);
+}
+
+// A method of a list that is not the game's: a continuation. Through our record of its class when its
+// vtable is one we hooked, else through its own vtable.
+void* own_fn(void* list, unsigned slot) {
+    void** vt = *static_cast<void***>(list);
+    if (ListClass* cls = class_by_vtable(vt)) return cls->orig[slot];
+    return vt[slot];
+}
+unsigned cont_slots(ID3D12GraphicsCommandList* list) {
+    if (ListClass* cls = class_by_vtable(*reinterpret_cast<void***>(list))) return cls->slots;
+    return slot_count(list);
+}
+
+// For a hook forwarding a call to where it belongs: the list itself or its continuation. Picks the
+// method and leaves the object in tl_forward for NR_TARGET in the same call: C++17 evaluates the
+// called function before its arguments.
+thread_local void* tl_forward = nullptr;
+template <class F> F fwd_fn(void* self, unsigned slot) {
+    const uintptr_t to = reinterpret_cast<uintptr_t>(raw_target_of(self));
+    tl_forward = reinterpret_cast<void*>(to & ~kForeign);
+    if (to & kForeign) return reinterpret_cast<F>((*static_cast<void***>(tl_forward))[slot]);
     return reinterpret_cast<F>(class_of(self)->orig[slot]);
 }
 
@@ -441,7 +518,7 @@ void abandon(Cut& cut) {
     for (auto& s : cut.segments) {
         if (s.job.discard) s.job.discard();
         if (s.cont) {
-            orig_fn<HRESULT(STDMETHODCALLTYPE*)(List*)>(s.cont->list, kClose)(s.cont->list);
+            reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(List*)>(own_fn(s.cont->list, kClose))(s.cont->list);
             s.cont->state = Cont::Free;
         }
     }
@@ -468,7 +545,7 @@ void forget_list(void* self) {
 bool patch_list_class(List* list, std::string* why);
 
 // ---- the hooks ---------------------------------------------------------------------------------------
-#define NR_TARGET(self) static_cast<List*>(target_of(self))
+#define NR_TARGET(self) static_cast<List*>(tl_forward)
 
 void forget_list(void* self);
 
@@ -511,13 +588,13 @@ void STDMETHODCALLTYPE hk_ClearState(List* self, ID3D12PipelineState* pso) {
     const bool valid = s->valid;
     s->reset(pso);
     s->valid = valid;
-    orig_fn<void(STDMETHODCALLTYPE*)(List*, ID3D12PipelineState*)>(self, kClearState)(NR_TARGET(self), pso);
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*, ID3D12PipelineState*)>(self, kClearState)(NR_TARGET(self), pso);
 }
 
 void STDMETHODCALLTYPE hk_IASetPrimitiveTopology(List* self, D3D12_PRIMITIVE_TOPOLOGY t) {
     ListState* s = state_of(self);
     s->topology = t; s->topology_set = true;
-    orig_fn<void(STDMETHODCALLTYPE*)(List*, D3D12_PRIMITIVE_TOPOLOGY)>(self, kIASetPrimitiveTopology)(NR_TARGET(self), t);
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*, D3D12_PRIMITIVE_TOPOLOGY)>(self, kIASetPrimitiveTopology)(NR_TARGET(self), t);
 }
 
 void STDMETHODCALLTYPE hk_RSSetViewports(List* self, UINT n, const D3D12_VIEWPORT* v) {
@@ -525,7 +602,7 @@ void STDMETHODCALLTYPE hk_RSSetViewports(List* self, UINT n, const D3D12_VIEWPOR
     s->viewport_count = n > 16 ? 16 : n;
     if (v) std::memcpy(s->viewports, v, sizeof(D3D12_VIEWPORT) * s->viewport_count);
     s->viewports_set = true;
-    orig_fn<void(STDMETHODCALLTYPE*)(List*, UINT, const D3D12_VIEWPORT*)>(self, kRSSetViewports)(NR_TARGET(self), n, v);
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*, UINT, const D3D12_VIEWPORT*)>(self, kRSSetViewports)(NR_TARGET(self), n, v);
 }
 
 void STDMETHODCALLTYPE hk_RSSetScissorRects(List* self, UINT n, const D3D12_RECT* r) {
@@ -533,7 +610,7 @@ void STDMETHODCALLTYPE hk_RSSetScissorRects(List* self, UINT n, const D3D12_RECT
     s->scissor_count = n > 16 ? 16 : n;
     if (r) std::memcpy(s->scissors, r, sizeof(D3D12_RECT) * s->scissor_count);
     s->scissors_set = true;
-    orig_fn<void(STDMETHODCALLTYPE*)(List*, UINT, const D3D12_RECT*)>(self, kRSSetScissorRects)(NR_TARGET(self), n, r);
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*, UINT, const D3D12_RECT*)>(self, kRSSetScissorRects)(NR_TARGET(self), n, r);
 }
 
 void STDMETHODCALLTYPE hk_OMSetBlendFactor(List* self, const FLOAT f[4]) {
@@ -541,19 +618,19 @@ void STDMETHODCALLTYPE hk_OMSetBlendFactor(List* self, const FLOAT f[4]) {
     if (f) std::memcpy(s->blend, f, sizeof s->blend);
     else { s->blend[0] = s->blend[1] = s->blend[2] = s->blend[3] = 1.0f; }
     s->blend_set = true;
-    orig_fn<void(STDMETHODCALLTYPE*)(List*, const FLOAT*)>(self, kOMSetBlendFactor)(NR_TARGET(self), f);
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*, const FLOAT*)>(self, kOMSetBlendFactor)(NR_TARGET(self), f);
 }
 
 void STDMETHODCALLTYPE hk_OMSetStencilRef(List* self, UINT ref) {
     ListState* s = state_of(self);
     s->stencil_mode = 1; s->stencil_front = s->stencil_back = ref;
-    orig_fn<void(STDMETHODCALLTYPE*)(List*, UINT)>(self, kOMSetStencilRef)(NR_TARGET(self), ref);
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*, UINT)>(self, kOMSetStencilRef)(NR_TARGET(self), ref);
 }
 
 void STDMETHODCALLTYPE hk_SetPipelineState(List* self, ID3D12PipelineState* pso) {
     ListState* s = state_of(self);
     s->pso = pso; s->pso_set = true; s->so_last = false;
-    orig_fn<void(STDMETHODCALLTYPE*)(List*, ID3D12PipelineState*)>(self, kSetPipelineState)(NR_TARGET(self), pso);
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*, ID3D12PipelineState*)>(self, kSetPipelineState)(NR_TARGET(self), pso);
 }
 
 void STDMETHODCALLTYPE hk_SetDescriptorHeaps(List* self, UINT n, ID3D12DescriptorHeap* const* heaps) {
@@ -570,26 +647,26 @@ void STDMETHODCALLTYPE hk_SetDescriptorHeaps(List* self, UINT n, ID3D12Descripto
     }
     s->heap_count = count;
     for (UINT i = 0; i < s->heap_count; ++i) s->heaps[i] = heaps ? heaps[i] : nullptr;
-    orig_fn<void(STDMETHODCALLTYPE*)(List*, UINT, ID3D12DescriptorHeap* const*)>(self, kSetDescriptorHeaps)(
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*, UINT, ID3D12DescriptorHeap* const*)>(self, kSetDescriptorHeaps)(
         NR_TARGET(self), n, heaps);
 }
 
 template <unsigned kSlot, int kBind>
 void STDMETHODCALLTYPE hk_SetRootSignature(List* self, ID3D12RootSignature* rs) {
     state_of(self)->root[kBind].set_rs(rs);
-    orig_fn<void(STDMETHODCALLTYPE*)(List*, ID3D12RootSignature*)>(self, kSlot)(NR_TARGET(self), rs);
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*, ID3D12RootSignature*)>(self, kSlot)(NR_TARGET(self), rs);
 }
 
 template <unsigned kSlot, int kBind>
 void STDMETHODCALLTYPE hk_SetRootDescriptorTable(List* self, UINT index, D3D12_GPU_DESCRIPTOR_HANDLE h) {
     state_of(self)->root[kBind].set(index, 1, h.ptr);
-    orig_fn<void(STDMETHODCALLTYPE*)(List*, UINT, D3D12_GPU_DESCRIPTOR_HANDLE)>(self, kSlot)(NR_TARGET(self), index, h);
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*, UINT, D3D12_GPU_DESCRIPTOR_HANDLE)>(self, kSlot)(NR_TARGET(self), index, h);
 }
 
 template <unsigned kSlot, int kBind>
 void STDMETHODCALLTYPE hk_SetRoot32BitConstant(List* self, UINT index, UINT value, UINT offset) {
     state_of(self)->root[kBind].constant(index, offset, value);
-    orig_fn<void(STDMETHODCALLTYPE*)(List*, UINT, UINT, UINT)>(self, kSlot)(NR_TARGET(self), index, value, offset);
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*, UINT, UINT, UINT)>(self, kSlot)(NR_TARGET(self), index, value, offset);
 }
 
 template <unsigned kSlot, int kBind>
@@ -597,21 +674,21 @@ void STDMETHODCALLTYPE hk_SetRoot32BitConstants(List* self, UINT index, UINT cou
     RootArgs& r = state_of(self)->root[kBind];
     const auto* v = static_cast<const uint32_t*>(data);
     if (v) for (UINT i = 0; i < count; ++i) r.constant(index, offset + i, v[i]);
-    orig_fn<void(STDMETHODCALLTYPE*)(List*, UINT, UINT, const void*, UINT)>(self, kSlot)(NR_TARGET(self), index, count,
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*, UINT, UINT, const void*, UINT)>(self, kSlot)(NR_TARGET(self), index, count,
                                                                                          data, offset);
 }
 
 template <unsigned kSlot, int kBind, uint8_t kKind>
 void STDMETHODCALLTYPE hk_SetRootView(List* self, UINT index, D3D12_GPU_VIRTUAL_ADDRESS va) {
     state_of(self)->root[kBind].set(index, kKind, va);
-    orig_fn<void(STDMETHODCALLTYPE*)(List*, UINT, D3D12_GPU_VIRTUAL_ADDRESS)>(self, kSlot)(NR_TARGET(self), index, va);
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*, UINT, D3D12_GPU_VIRTUAL_ADDRESS)>(self, kSlot)(NR_TARGET(self), index, va);
 }
 
 void STDMETHODCALLTYPE hk_IASetIndexBuffer(List* self, const D3D12_INDEX_BUFFER_VIEW* view) {
     ListState* s = state_of(self);
     s->ib_set = true; s->ib_null = !view;
     if (view) s->ib = *view;
-    orig_fn<void(STDMETHODCALLTYPE*)(List*, const D3D12_INDEX_BUFFER_VIEW*)>(self, kIASetIndexBuffer)(NR_TARGET(self), view);
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*, const D3D12_INDEX_BUFFER_VIEW*)>(self, kIASetIndexBuffer)(NR_TARGET(self), view);
 }
 
 void STDMETHODCALLTYPE hk_IASetVertexBuffers(List* self, UINT start, UINT n, const D3D12_VERTEX_BUFFER_VIEW* views) {
@@ -620,7 +697,7 @@ void STDMETHODCALLTYPE hk_IASetVertexBuffers(List* self, UINT start, UINT n, con
         s->vb[start + i] = views ? views[i] : D3D12_VERTEX_BUFFER_VIEW{};
         s->vb_mask |= 1u << (start + i);
     }
-    orig_fn<void(STDMETHODCALLTYPE*)(List*, UINT, UINT, const D3D12_VERTEX_BUFFER_VIEW*)>(self, kIASetVertexBuffers)(
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*, UINT, UINT, const D3D12_VERTEX_BUFFER_VIEW*)>(self, kIASetVertexBuffers)(
         NR_TARGET(self), start, n, views);
 }
 
@@ -630,7 +707,7 @@ void STDMETHODCALLTYPE hk_SOSetTargets(List* self, UINT start, UINT n, const D3D
         s->so[start + i] = views ? views[i] : D3D12_STREAM_OUTPUT_BUFFER_VIEW{};
         s->so_mask |= 1u << (start + i);
     }
-    orig_fn<void(STDMETHODCALLTYPE*)(List*, UINT, UINT, const D3D12_STREAM_OUTPUT_BUFFER_VIEW*)>(self, kSOSetTargets)(
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*, UINT, UINT, const D3D12_STREAM_OUTPUT_BUFFER_VIEW*)>(self, kSOSetTargets)(
         NR_TARGET(self), start, n, views);
 }
 
@@ -665,7 +742,7 @@ void STDMETHODCALLTYPE hk_OMSetRenderTargets(List* self, UINT n, const D3D12_CPU
         s->dsv_set = dsv != nullptr;
         if (dsv) s->dsv = *dsv;
     }
-    orig_fn<void(STDMETHODCALLTYPE*)(List*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL,
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL,
                                      const D3D12_CPU_DESCRIPTOR_HANDLE*)>(self, kOMSetRenderTargets)(NR_TARGET(self), n,
                                                                                                     rts, single, dsv);
 }
@@ -673,20 +750,20 @@ void STDMETHODCALLTYPE hk_OMSetRenderTargets(List* self, UINT n, const D3D12_CPU
 void STDMETHODCALLTYPE hk_SetPredication(List* self, ID3D12Resource* r, UINT64 offset, D3D12_PREDICATION_OP op) {
     ListState* s = state_of(self);
     s->predicate = r; s->predicate_offset = offset; s->predicate_op = op; s->predicate_set = true;
-    orig_fn<void(STDMETHODCALLTYPE*)(List*, ID3D12Resource*, UINT64, D3D12_PREDICATION_OP)>(self, kSetPredication)(
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*, ID3D12Resource*, UINT64, D3D12_PREDICATION_OP)>(self, kSetPredication)(
         NR_TARGET(self), r, offset, op);
 }
 
 void STDMETHODCALLTYPE hk_BeginQuery(List* self, ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT index) {
     if (type != D3D12_QUERY_TYPE_TIMESTAMP) ++state_of(self)->open_queries;
-    orig_fn<void(STDMETHODCALLTYPE*)(List*, ID3D12QueryHeap*, D3D12_QUERY_TYPE, UINT)>(self, kBeginQuery)(
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*, ID3D12QueryHeap*, D3D12_QUERY_TYPE, UINT)>(self, kBeginQuery)(
         NR_TARGET(self), heap, type, index);
 }
 
 void STDMETHODCALLTYPE hk_EndQuery(List* self, ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT index) {
     ListState* s = state_of(self);
     if (type != D3D12_QUERY_TYPE_TIMESTAMP && s->open_queries > 0) --s->open_queries;
-    orig_fn<void(STDMETHODCALLTYPE*)(List*, ID3D12QueryHeap*, D3D12_QUERY_TYPE, UINT)>(self, kEndQuery)(
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*, ID3D12QueryHeap*, D3D12_QUERY_TYPE, UINT)>(self, kEndQuery)(
         NR_TARGET(self), heap, type, index);
 }
 
@@ -696,13 +773,13 @@ void STDMETHODCALLTYPE hk_BeginRenderPass(List* self, UINT n, const void* rts, c
     ListState* s = state_of(self);
     s->in_render_pass = true;
     s->pass_suspended = (flags & kPassSuspending) != 0;   // ends suspended: nothing may come between it and its resume
-    orig_fn<void(STDMETHODCALLTYPE*)(List*, UINT, const void*, const void*, UINT)>(self, kBeginRenderPass)(
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*, UINT, const void*, const void*, UINT)>(self, kBeginRenderPass)(
         NR_TARGET(self), n, rts, ds, flags);
 }
 
 void STDMETHODCALLTYPE hk_EndRenderPass(List* self) {
     state_of(self)->in_render_pass = false;
-    orig_fn<void(STDMETHODCALLTYPE*)(List*)>(self, kEndRenderPass)(NR_TARGET(self));
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*)>(self, kEndRenderPass)(NR_TARGET(self));
 }
 
 void STDMETHODCALLTYPE hk_ExecuteBundle(List* self, ID3D12GraphicsCommandList* bundle) {
@@ -741,13 +818,13 @@ void STDMETHODCALLTYPE hk_ExecuteBundle(List* self, ID3D12GraphicsCommandList* b
             if (b.vb_mask & (1u << i)) { s->vb[i] = b.vb[i]; s->vb_mask |= 1u << i; }
         if (b.unknown) s->unknown = true;
     }
-    orig_fn<void(STDMETHODCALLTYPE*)(List*, ID3D12GraphicsCommandList*)>(self, kExecuteBundle)(NR_TARGET(self), bundle);
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*, ID3D12GraphicsCommandList*)>(self, kExecuteBundle)(NR_TARGET(self), bundle);
 }
 
 void STDMETHODCALLTYPE hk_OMSetDepthBounds(List* self, FLOAT lo, FLOAT hi) {
     ListState* s = state_of(self);
     s->depth_bounds[0] = lo; s->depth_bounds[1] = hi; s->depth_bounds_set = true;
-    orig_fn<void(STDMETHODCALLTYPE*)(List*, FLOAT, FLOAT)>(self, kOMSetDepthBounds)(NR_TARGET(self), lo, hi);
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*, FLOAT, FLOAT)>(self, kOMSetDepthBounds)(NR_TARGET(self), lo, hi);
 }
 
 void STDMETHODCALLTYPE hk_SetSamplePositions(List* self, UINT per_pixel, UINT pixels, D3D12_SAMPLE_POSITION* pos) {
@@ -755,61 +832,61 @@ void STDMETHODCALLTYPE hk_SetSamplePositions(List* self, UINT per_pixel, UINT pi
     s->sample_count = per_pixel; s->sample_pixels = pixels; s->samples_set = true;
     s->samples.clear();
     if (pos && per_pixel) s->samples.assign(pos, pos + size_t(per_pixel) * (pixels ? pixels : 1));
-    orig_fn<void(STDMETHODCALLTYPE*)(List*, UINT, UINT, D3D12_SAMPLE_POSITION*)>(self, kSetSamplePositions)(
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*, UINT, UINT, D3D12_SAMPLE_POSITION*)>(self, kSetSamplePositions)(
         NR_TARGET(self), per_pixel, pixels, pos);
 }
 
 void STDMETHODCALLTYPE hk_SetViewInstanceMask(List* self, UINT mask) {
     ListState* s = state_of(self);
     s->view_instance_mask = mask; s->view_instance_set = true;
-    orig_fn<void(STDMETHODCALLTYPE*)(List*, UINT)>(self, kSetViewInstanceMask)(NR_TARGET(self), mask);
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*, UINT)>(self, kSetViewInstanceMask)(NR_TARGET(self), mask);
 }
 
 void STDMETHODCALLTYPE hk_SetPipelineState1(List* self, StateObject* so) {
     ListState* s = state_of(self);
     s->state_object = so; s->so_set = true; s->so_last = true;
-    orig_fn<void(STDMETHODCALLTYPE*)(List*, StateObject*)>(self, kSetPipelineState1)(NR_TARGET(self), so);
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*, StateObject*)>(self, kSetPipelineState1)(NR_TARGET(self), so);
 }
 
 void STDMETHODCALLTYPE hk_RSSetShadingRate(List* self, ShadingRate rate, const ShadingRateCombiner* c) {
     ListState* s = state_of(self);
     s->shading_rate = rate; s->shading_rate_set = true; s->combiners_set = c != nullptr;
     if (c) { s->combiners[0] = c[0]; s->combiners[1] = c[1]; }
-    orig_fn<void(STDMETHODCALLTYPE*)(List*, ShadingRate, const ShadingRateCombiner*)>(
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*, ShadingRate, const ShadingRateCombiner*)>(
         self, kRSSetShadingRate)(NR_TARGET(self), rate, c);
 }
 
 void STDMETHODCALLTYPE hk_RSSetShadingRateImage(List* self, ID3D12Resource* image) {
     ListState* s = state_of(self);
     s->shading_rate_image = image; s->shading_rate_image_set = true;
-    orig_fn<void(STDMETHODCALLTYPE*)(List*, ID3D12Resource*)>(self, kRSSetShadingRateImage)(NR_TARGET(self), image);
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*, ID3D12Resource*)>(self, kRSSetShadingRateImage)(NR_TARGET(self), image);
 }
 
 void STDMETHODCALLTYPE hk_OMSetFrontAndBackStencilRef(List* self, UINT front, UINT back) {
     ListState* s = state_of(self);
     s->stencil_mode = 2; s->stencil_front = front; s->stencil_back = back;
-    orig_fn<void(STDMETHODCALLTYPE*)(List*, UINT, UINT)>(self, kOMSetFrontAndBackStencilRef)(NR_TARGET(self), front, back);
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*, UINT, UINT)>(self, kOMSetFrontAndBackStencilRef)(NR_TARGET(self), front, back);
 }
 
 void STDMETHODCALLTYPE hk_RSSetDepthBias(List* self, FLOAT bias, FLOAT clamp, FLOAT slope) {
     ListState* s = state_of(self);
     s->depth_bias[0] = bias; s->depth_bias[1] = clamp; s->depth_bias[2] = slope; s->depth_bias_set = true;
-    orig_fn<void(STDMETHODCALLTYPE*)(List*, FLOAT, FLOAT, FLOAT)>(self, kRSSetDepthBias)(NR_TARGET(self), bias, clamp,
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*, FLOAT, FLOAT, FLOAT)>(self, kRSSetDepthBias)(NR_TARGET(self), bias, clamp,
                                                                                          slope);
 }
 
 void STDMETHODCALLTYPE hk_IASetIndexBufferStripCutValue(List* self, StripCut v) {
     ListState* s = state_of(self);
     s->strip_cut = v; s->strip_cut_set = true;
-    orig_fn<void(STDMETHODCALLTYPE*)(List*, StripCut)>(self, kIASetIndexBufferStripCutValue)(
+    fwd_fn<void(STDMETHODCALLTYPE*)(List*, StripCut)>(self, kIASetIndexBufferStripCutValue)(
         NR_TARGET(self), v);
 }
 
 // The continuation gets the state the list had when the evaluate began, through the originals (it is
 // not tracked as anything of the game's).
 void apply(const ListState& s, List* c) {
-    auto fn = [c](unsigned slot) { return class_of(c)->orig[slot]; };
-    const unsigned slots = class_of(c)->slots;
+    auto fn = [c](unsigned slot) { return own_fn(c, slot); };
+    const unsigned slots = cont_slots(c);
     if (s.heap_count)
         reinterpret_cast<void(STDMETHODCALLTYPE*)(List*, UINT, ID3D12DescriptorHeap* const*)>(fn(kSetDescriptorHeaps))(
             c, s.heap_count, s.heaps);
@@ -1010,14 +1087,69 @@ bool write_vtable(void** vt, unsigned slot, void* fn) {
     return true;
 }
 
+// Where an address lives, for the log: a module's file name, or private memory (a heap).
+std::string where_is(const void* p) {
+    HMODULE m = nullptr;
+    char path[MAX_PATH] = {};
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           static_cast<const char*>(p), &m) && m && GetModuleFileNameA(m, path, sizeof path)) {
+        const char* base = std::strrchr(path, '\\');
+        return base ? base + 1 : path;
+    }
+    return "private memory";
+}
+
+bool hook_vtable(void** vt, const ListClass* cls, std::string* why) {
+    for (unsigned i = 0; i < cls->slots; ++i)
+        if (cls->entry[i] && !write_vtable(vt, i, cls->entry[i])) {
+            *why = "the command list vtable could not be written";
+            log("[nr] bridge: %s (slot %u)", why->c_str(), i);
+            return false;
+        }
+    return true;
+}
+
+// Another vtable of a class we have: registered, and hooked unless it already holds the hooks.
+bool add_vtable(void** vt, ListClass* cls, bool hooked, std::string* why) {
+    if (!register_vtable(vt, cls)) { *why = "too many command list vtables"; return false; }
+    if (!hooked && !hook_vtable(vt, cls, why)) return false;
+    static int copies = 0;
+    ++copies;
+    if (copies <= 2 || (copies & (copies - 1)) == 0)
+        log("[nr] bridge: command list vtable %p (%s) has the methods of class %p, hooked alike (%d such vtables)",
+            static_cast<void*>(vt), where_is(vt).c_str(), static_cast<void*>(cls->vtable), copies);
+    return true;
+}
+
 bool patch_list_class(List* list, std::string* why) {
     void** vt = *reinterpret_cast<void***>(list);
+    if (ListClass* known = class_by_vtable(vt)) {
+        // Hooked already - unless the vtable holds its class's originals again: a per-object copy that
+        // was freed and its memory used for a new copy.
+        if (vt[kReset] == known->orig[kReset] && known->orig[kReset] != known->entry[kReset])
+            return hook_vtable(vt, known, why);
+        return true;
+    }
     const int n = g_class_count.load();
-    for (int i = 0; i < n; ++i) if (g_classes[i]->vtable == vt) return true;
-    if (n >= 16) { *why = "too many command list classes"; return false; }
+    // A copy of a hooked vtable, our hooks copied with it (Close is a stub of exactly one class).
+    for (int i = 0; i < n; ++i) {
+        const ListClass* c = g_classes[i];
+        const auto* p = static_cast<const uint8_t*>(vt[kClose]);
+        if (c->slots > kClose && p >= c->stubs && p < c->stubs + kStubSize * kMaxSlots)
+            return add_vtable(vt, g_classes[i], true, why);
+    }
+    // The same methods as a class we have.
+    const unsigned slots = slot_count(list);
+    for (int i = 0; i < n; ++i) {
+        const ListClass* c = g_classes[i];
+        bool same = c->slots == slots;
+        for (unsigned k = 0; same && k < slots; ++k) same = vt[k] == c->orig[k];
+        if (same) return add_vtable(vt, g_classes[i], false, why);
+    }
+    if (n >= 32) { *why = "too many command list classes"; return false; }
     auto* cls = new ListClass();
     cls->vtable = vt;
-    cls->slots = slot_count(list);
+    cls->slots = slots;
     for (unsigned i = 0; i < cls->slots; ++i) cls->orig[i] = vt[i];
 
     void* typed[kMaxSlots] = {};
@@ -1082,26 +1214,23 @@ bool patch_list_class(List* list, std::string* why) {
     auto* stubs = static_cast<uint8_t*>(
         VirtualAlloc(nullptr, kStubSize * kMaxSlots, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
     if (!stubs) { delete cls; *why = "no memory for the command list stubs"; return false; }
-    void* entry[kMaxSlots] = {};
     for (unsigned i = kClose; i < cls->slots; ++i) {
-        if (typed[i]) { entry[i] = typed[i]; continue; }
-        write_stub(stubs + kStubSize * i, &g_rt, cls->orig[i]);
-        entry[i] = stubs + kStubSize * i;
+        if (typed[i]) { cls->entry[i] = typed[i]; continue; }
+        write_stub(stubs + kStubSize * i, &g_rt, cls->orig[i], i);
+        cls->entry[i] = stubs + kStubSize * i;
     }
-    entry[kRelease] = typed[kRelease];
+    cls->entry[kRelease] = typed[kRelease];
+    cls->stubs = stubs;
     DWORD old = 0;
     VirtualProtect(stubs, kStubSize * kMaxSlots, PAGE_EXECUTE_READ, &old);
     FlushInstructionCache(GetCurrentProcess(), stubs, kStubSize * kMaxSlots);
     // Published before the vtable points at anything that looks it up.
+    if (!register_vtable(vt, cls)) { *why = "too many command list vtables"; return false; }
     g_classes[n] = cls;
     g_class_count.store(n + 1, std::memory_order_release);
-    for (unsigned i = 0; i < cls->slots; ++i)
-        if (entry[i] && !write_vtable(vt, i, entry[i])) {
-            *why = "the command list vtable could not be written";
-            log("[nr] bridge: %s (slot %u)", why->c_str(), i);
-            return false;
-        }
-    log("[nr] bridge: command list class %p hooked (%u methods)", static_cast<void*>(vt), cls->slots);
+    if (!hook_vtable(vt, cls, why)) return false;
+    log("[nr] bridge: command list class %p hooked (%u methods; vtable in %s, methods in %s)", static_cast<void*>(vt),
+        cls->slots, where_is(vt).c_str(), where_is(cls->orig[kClose]).c_str());
     return true;
 }
 
@@ -1234,7 +1363,7 @@ void restore(List* list, const std::shared_ptr<Snapshot>& state) {
     if (!state) return;
     std::lock_guard<std::recursive_mutex> guard(g_mutex);
     ListClass* cls = class_of(list);
-    if (!cls || cls->vtable != *reinterpret_cast<void***>(list)) return;
+    if (!cls || class_by_vtable(*reinterpret_cast<void***>(list)) != cls) return;
     apply(state->state, static_cast<List*>(target_of(list)));
     *state_of(list) = state->state;
 }
@@ -1250,7 +1379,10 @@ bool cut(List* list, Job job, const std::shared_ptr<Snapshot>& state, std::strin
     for (auto& p : g_rt.pairs) slot = slot || p.from == list;
     if (!slot) { *why = "too many command lists are cut at once"; return false; }
     ListClass* cls = class_of(list);
-    if (!cls || cls->vtable != *reinterpret_cast<void***>(list)) { *why = "the command list's class is not hooked"; return false; }
+    if (!cls || class_by_vtable(*reinterpret_cast<void***>(list)) != cls) {
+        *why = "the command list's class is not hooked";
+        return false;
+    }
     ID3D12Device* device = nullptr;
     if (FAILED(list->GetDevice(IID_PPV_ARGS(&device))) || !device) { *why = "the command list has no device"; return false; }
     const D3D12_COMMAND_LIST_TYPE type = list->GetType();
@@ -1275,7 +1407,7 @@ bool cut(List* list, Job job, const std::shared_ptr<Snapshot>& state, std::strin
     if (cont) {
         if (FAILED(cont->allocator->Reset()) ||
             FAILED(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(List*, ID3D12CommandAllocator*, ID3D12PipelineState*)>(
-                       cls->orig[kReset])(cont->list, cont->allocator, nullptr))) {
+                       own_fn(cont->list, kReset))(cont->list, cont->allocator, nullptr))) {
             device->Release();
             *why = "could not reset a continuation command list";
             return false;
@@ -1291,28 +1423,35 @@ bool cut(List* list, Job job, const std::shared_ptr<Snapshot>& state, std::strin
             *why = "could not create a continuation command list";
             return false;
         }
-        if (*reinterpret_cast<void***>(c->list) != cls->vtable) {
-            c->list->Release();
-            c->allocator->Release();
-            device->Release();
-            *why = "the list's device makes lists of another class (a wrapper sits between them)";
-            g_disabled = true;
-            g_disabled_why = *why;
-            log("[nr] bridge: %s", why->c_str());
-            return false;
-        }
         device->AddRef();   // held by the continuation for its life
         g_conts.push_back(std::move(c));
         cont = g_conts.back().get();
     }
     device->Release();
+    // The list's device may make lists of another class than the game's list: something between the
+    // two gave the game's lists vtables of their own. The continuation is then called through its own
+    // vtable (kForeign), never through the methods of the list's class.
+    void** cont_vt = *reinterpret_cast<void***>(cont->list);
+    const bool foreign = class_by_vtable(cont_vt) != cls;
+    static bool said_foreign = false;
+    if (foreign && !said_foreign) {
+        said_foreign = true;
+        const unsigned cs = slot_count(cont->list), n = cs < cls->slots ? cs : cls->slots;
+        unsigned differ = 0;
+        for (unsigned i = 0; i < n; ++i) differ += cont_vt[i] != cls->orig[i];
+        log("[nr] bridge: the continuation is of another class than the list (list vtable %p in %s, methods in %s; "
+            "continuation vtable %p in %s; %u of %u methods differ): called through its own vtable",
+            static_cast<void*>(*reinterpret_cast<void***>(list)), where_is(*reinterpret_cast<void***>(list)).c_str(),
+            where_is(cls->orig[kClose]).c_str(), static_cast<void*>(cont_vt), where_is(cont_vt).c_str(), differ, n);
+    }
 
     // Close the half recorded so far: the list itself on the first cut, the previous continuation on
     // a later one in the same list (one per pass).
     List* current = static_cast<List*>(target_of(list));
-    const HRESULT hr = reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(List*)>(cls->orig[kClose])(current);
+    const HRESULT hr = reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(List*)>(
+        current == list ? cls->orig[kClose] : own_fn(current, kClose))(current);
     if (FAILED(hr)) {
-        reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(List*)>(cls->orig[kClose])(cont->list);
+        reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(List*)>(own_fn(cont->list, kClose))(cont->list);
         cont->state = Cont::Free;
         char text[96];
         std::snprintf(text, sizeof text, "the command list would not close (0x%08lX)", (unsigned long)hr);
@@ -1327,7 +1466,7 @@ bool cut(List* list, Job job, const std::shared_ptr<Snapshot>& state, std::strin
     auto& c = g_cuts[list];
     if (c.segments.empty()) ++g_pending;
     c.segments.push_back(Segment{std::move(job), cont});
-    set_pair(list, cont->list);
+    set_pair(list, reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(cont->list) | (foreign ? kForeign : 0)));
     return true;
 }
 

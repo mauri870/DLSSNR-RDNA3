@@ -1,0 +1,39 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Mode 2, the area resample: t0 = the source (Ws x Hs) -> u0 at the dispatch extent (Width x Height): a copy
+// at the same size; otherwise each destination texel the area-weighted mean of the source texels it covers (colour),
+// and the alpha of the source texel under its centre. Products and divisions in f32, left to right.
+#include "wilsjo2_common.glsl"
+
+void main() {
+    const uvec2 p = gl_GlobalInvocationID.xy;
+    if (outside(p)) return;
+    const ivec2 src = textureSize(t0, 0);
+    const float Ws = float(src.x), Hs = float(src.y), Wd = float(cb.Width), Hd = float(cb.Height);
+    if (uint(src.x) == cb.Width && uint(src.y) == cb.Height) {
+        imageStore(u0, ivec2(p), texelFetch(t0, ivec2(p), 0));
+        return;
+    }
+    // ours: Downscale "Bilinear before encoding" (CompareMode 1) - the source's bilinear sample at the texel's centre
+    if (cb.CompareMode == 1u) {
+        imageStore(u0, ivec2(p), textureLod(t0, pixel_uv(p), 0.0));
+        return;
+    }
+    const float x0 = (float(p.x) * Ws) / Wd, x1 = (float(p.x + 1u) * Ws) / Wd;
+    const float y0 = (float(p.y) * Hs) / Hd, y1 = (float(p.y + 1u) * Hs) / Hd;
+    const float area = (x1 - x0) * (y1 - y0);
+    const int i0 = int(floor(x0)), i1 = int(ceil(x1)) - 1, j0 = int(floor(y0)), j1 = int(ceil(y1)) - 1;
+    vec3 acc = vec3(0.0);
+    for (int j = j0; j <= j1; ++j) {
+        const int jj = clamp(j, 0, src.y - 1);
+        const float wy = max(min(y1, float(j + 1)) - max(y0, float(j)), 0.0);
+        for (int i = i0; i <= i1; ++i) {
+            const int ii = clamp(i, 0, src.x - 1);
+            const float wx = max(min(x1, float(i + 1)) - max(x0, float(i)), 0.0);
+            acc += texelFetch(t0, ivec2(ii, jj), 0).rgb * (wx * wy);
+        }
+    }
+    const int ax = clamp(int(floor(((float(p.x) + 0.5) * Ws) / Wd)), 0, src.x - 1);
+    const int ay = clamp(int(floor(((float(p.y) + 0.5) * Hs) / Hd)), 0, src.y - 1);
+    imageStore(u0, ivec2(p), vec4(acc / area, texelFetch(t0, ivec2(ax, ay), 0).a));
+}

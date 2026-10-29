@@ -10,11 +10,50 @@ std::atomic<bool> encode_hdr{false};
 std::atomic<uint64_t> encode_extent{0};
 }  // namespace
 
-bool installed() { return hooked.load(); }
+namespace {
+thread_local int t_call_style = -1;   // -1: the process's (hooked); 0 / 1: this call's, from CallStyle
+}  // namespace
+bool installed() { return t_call_style >= 0 ? t_call_style == 1 : hooked.load(); }
 void set_installed() { hooked.store(true); }
+CallStyle::CallStyle(bool renodx) : previous(t_call_style) { t_call_style = renodx ? 1 : 0; }
+CallStyle::~CallStyle() { t_call_style = previous; }
+namespace {
+thread_local const renodx::Settings* t_call_settings = nullptr;
+}  // namespace
+CallSettings::CallSettings(const renodx::Settings* settings) : previous(t_call_settings) { t_call_settings = settings; }
+CallSettings::~CallSettings() { t_call_settings = previous; }
+const renodx::Settings* call_settings() { return t_call_settings; }
+namespace {
+thread_local const Wilsjo2Facts* t_call_wilsjo2 = nullptr;
+}  // namespace
+CallWilsjo2::CallWilsjo2(const Wilsjo2Facts* facts) : previous(t_call_wilsjo2) { t_call_wilsjo2 = facts; }
+CallWilsjo2::~CallWilsjo2() { t_call_wilsjo2 = previous; }
+const Wilsjo2Facts* call_wilsjo2() { return t_call_wilsjo2; }
+namespace {
+thread_local int t_call_network = -1;
+}  // namespace
+CallNetwork::CallNetwork(int network) : previous(t_call_network) { t_call_network = network; }
+CallNetwork::~CallNetwork() { t_call_network = previous; }
+int call_network() { return t_call_network; }
+namespace {
+thread_local int t_call_layer = 0;
+}  // namespace
+CallLayer::CallLayer(int number) : previous(t_call_layer) { t_call_layer = number; }
+CallLayer::~CallLayer() { t_call_layer = previous; }
+int call_layer() { return t_call_layer; }
+
 Encode last_encode() {
     const uint64_t e = encode_extent.load();
     return {encodes.load(), encode_hdr.load(), uint32_t(e), uint32_t(e >> 32)};
+}
+std::atomic<uint64_t> seen_count{0};
+std::atomic<bool> seen_linear{false};
+std::atomic<float> seen_white{0.f};
+EncodeSeen encode_seen() { return {seen_count.load(), seen_linear.load(), seen_white.load()}; }
+void note_encode_seen(bool linear, float white_point) {
+    seen_linear.store(linear);
+    seen_white.store(white_point);
+    seen_count.fetch_add(1);
 }
 void note_encode(bool hdr, uint32_t width, uint32_t height) {
     encode_hdr.store(hdr);

@@ -1,0 +1,43 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// The finished picture's HDR10 conversion (the fork's finished-colour modes 0 and 1), our modes 20 / 21:
+//   20: t0 = the HDR10 (PQ, BT.2020) back buffer -> u0 = linear BT.709 in scRGB units (1 = 80 nits), alpha kept;
+//       this conversion retains negative components (wide-gamut colours); later processing has its own limits.
+//   21: t0 = that linear picture after NR, t2 = the original back buffer -> u0 = PQ BT.2020 again; a pixel whose
+//       result is not finite keeps the original's colour; the original's alpha.
+#include "wilsjo2_common.glsl"
+
+const float kM1 = 2610.0 / 16384.0, kM2 = 2523.0 / 32.0;
+const float kC1 = 3424.0 / 4096.0, kC2 = 2413.0 / 128.0, kC3 = 2392.0 / 128.0;
+
+vec3 decode_pq(vec3 code) {
+    const vec3 p = pow(saturate3(code), vec3(1.0 / kM2));
+    return pow(max(p - kC1, vec3(0.0)) / max(kC2 - kC3 * p, vec3(1e-6)), vec3(1.0 / kM1)) * 125.0;
+}
+vec3 encode_pq(vec3 light) {
+    const vec3 p = pow(saturate3(light / 125.0), vec3(kM1));
+    return pow((kC1 + kC2 * p) / (1.0 + kC3 * p), vec3(kM2));
+}
+// Rows as the specification writes them (row-major), applied as row . v.
+vec3 to709(vec3 v) {
+    return vec3(dot(vec3(1.6604910, -0.5876411, -0.0728499), v), dot(vec3(-0.1245505, 1.1328999, -0.0083494), v),
+                dot(vec3(-0.0181508, -0.1005789, 1.1187297), v));
+}
+vec3 to2020(vec3 v) {
+    return vec3(dot(vec3(0.6274039, 0.3292830, 0.0433131), v), dot(vec3(0.0690973, 0.9195404, 0.0113623), v),
+                dot(vec3(0.0163914, 0.0880133, 0.8955953), v));
+}
+
+void main() {
+    const uvec2 p = gl_GlobalInvocationID.xy;
+    if (outside(p)) return;
+    const vec4 pixel = texelFetch(t0, ivec2(p), 0);
+    if (cb.Mode == 20u) {
+        imageStore(u0, ivec2(p), vec4(to709(decode_pq(pixel.rgb)), pixel.a));
+        return;
+    }
+    const vec4 base = texelFetch(t2, ivec2(p), 0);
+    const vec3 result = encode_pq(to2020(pixel.rgb));
+    const bool ok = finite1(result.r) && finite1(result.g) && finite1(result.b);
+    imageStore(u0, ivec2(p), vec4(ok ? result : base.rgb, base.a));
+}

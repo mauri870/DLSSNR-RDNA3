@@ -2,10 +2,9 @@
 
 VK_BINDING(4) RWTexture2D<float4> BlockMean : register(u0);
 
-groupshared float BlockSumFinal[256];
-groupshared float BlockSumUntouched[256];
-groupshared float BlockMaxUntouched[256];
-groupshared uint  BlockValidCount[256];
+// DLSSNR-AMD: the 256 partial sums of the block's four quantities, one row each (the sum, the untouched sum, the
+// untouched max, the valid count - an integer <= 4 kept as a float: every partial sum of them is exact).
+groupshared float BlockPart[4][256];
 
 [numthreads(16, 16, 1)]
 void main(uint3 group_id : SV_GroupID, uint3 group_thread : SV_GroupThreadID) {
@@ -36,23 +35,29 @@ void main(uint3 group_id : SV_GroupID, uint3 group_thread : SV_GroupThreadID) {
       }
     }
   }
-  BlockSumFinal[thread_index] = sum_final;
-  BlockSumUntouched[thread_index] = sum_untouched;
-  BlockMaxUntouched[thread_index] = max_untouched;
-  BlockValidCount[thread_index] = valid;
+  BlockPart[0][thread_index] = sum_final;
+  BlockPart[1][thread_index] = sum_untouched;
+  BlockPart[2][thread_index] = max_untouched;
+  BlockPart[3][thread_index] = float(valid);
+  GroupMemoryBarrierWithGroupSync();
+  // DLSSNR-AMD: the four running totals on four threads instead of all four on thread 0, each in its order
+  // (partial 0, 1, ... 255): the same additions and maxima, side by side.
+  if (thread_index < 4u) {
+    const uint row = thread_index;
+    float total = 0.0;
+    [unroll(16)]
+    for (uint i = 0u; i < 256u; ++i) {
+      const float v = BlockPart[row][i];
+      total = row == 2u ? max(total, v) : total + v;
+    }
+    BlockPart[row][0] = total;
+  }
   GroupMemoryBarrierWithGroupSync();
   if (thread_index == 0u) {
-    float total_final = 0.0;
-    float total_untouched = 0.0;
-    float total_max_untouched = 0.0;
-    uint total_valid = 0u;
-    for (uint i = 0u; i < 256u; ++i) {
-      total_final += BlockSumFinal[i];
-      total_untouched += BlockSumUntouched[i];
-      total_max_untouched = max(total_max_untouched, BlockMaxUntouched[i]);
-      total_valid += BlockValidCount[i];
-    }
-    const float count = max(float(total_valid), 1.0);
+    const float total_final = BlockPart[0][0];
+    const float total_untouched = BlockPart[1][0];
+    const float total_max_untouched = BlockPart[2][0];
+    const float count = max(BlockPart[3][0], 1.0);
     // z carries the untouched block MAX: the commit's dark gate needs to know
     // whether the block is genuinely near-black, not merely dark ON AVERAGE -
     // a bright feature crossing a dark block lifts the mean lift estimate and

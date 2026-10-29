@@ -25,10 +25,11 @@ namespace {
 // representative typed VkFormat and MUTABLE_FORMAT_BIT for the views, so the
 // blit reads the image the way vkd3d chose to. The family decides the transfer
 // mode - 8-bit families take the UNORM detour, which is what the SRGB member
-// gets too - and the entry below is that representative. This is inferred
-// from vkd3d-proton's format table as remembered, not read from its source on
-// this machine; a typeless resource is logged as such so a wrong picture can
-// be traced back here.
+// gets too - and the entry below is that representative (vkd3d-proton's
+// libs/vkd3d/utils.c: R16G16B16A16_TYPELESS is created R16G16B16A16_SFLOAT, as
+// OptiScaler-NR also counts it a float format). A game that views that family
+// as UNORM would be read as half floats; a typeless resource is logged as such so a
+// wrong picture can be traced back here.
 VkFormat vulkan_format(DXGI_FORMAT format) {
     switch (format) {
     case DXGI_FORMAT_R8G8B8A8_UNORM: return VK_FORMAT_R8G8B8A8_UNORM;
@@ -48,6 +49,10 @@ VkFormat vulkan_format(DXGI_FORMAT format) {
     case DXGI_FORMAT_R16G16B16A16_TYPELESS: return VK_FORMAT_R16G16B16A16_SFLOAT;
     case DXGI_FORMAT_R32G32B32A32_FLOAT: return VK_FORMAT_R32G32B32A32_SFLOAT;
     case DXGI_FORMAT_R16G16_FLOAT: return VK_FORMAT_R16G16_SFLOAT;
+    // Motion vectors in a typeless two-channel family: vkd3d-proton creates both as the float format (utils.c), so
+    // views and blits see what the game wrote.
+    case DXGI_FORMAT_R16G16_TYPELESS: return VK_FORMAT_R16G16_SFLOAT;
+    case DXGI_FORMAT_R32G32_TYPELESS: return VK_FORMAT_R32G32_SFLOAT;
     case DXGI_FORMAT_R32_FLOAT: return VK_FORMAT_R32_SFLOAT;
     case DXGI_FORMAT_R16_FLOAT: return VK_FORMAT_R16_SFLOAT;
     case DXGI_FORMAT_R32G32_FLOAT: return VK_FORMAT_R32G32_SFLOAT;

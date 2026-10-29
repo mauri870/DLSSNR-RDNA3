@@ -7,6 +7,7 @@
 
 #include <windows.h>
 #include "MinHook.h"
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -31,7 +32,7 @@ nr::control::Shared* shared() {
         auto* s = new nr::control::Shared{};
         s->version = nr::control::kVersion;
         s->magic = nr::control::kMagic;
-        s->int4 = 2;
+        s->net_running = s->net_want = s->building_net = 3;   // none yet (nr::NetworkChoice)
         g_shared = s;
         return s;
     }();
@@ -289,9 +290,19 @@ void report(const Status& st) {
     s->placement = st.placement;
     s->output_width = st.output_width; s->output_height = st.output_height;
     s->passes = st.passes;
-    s->int4 = uint32_t(st.int4);
+    s->net_running = st.net_running < 0 ? 3u : uint32_t(st.net_running);
+    s->net_want = st.net_want < 0 ? 3u : uint32_t(st.net_want);
+    for (int n = 0; n < 3; ++n) {
+        std::snprintf(s->net_why[n], sizeof s->net_why[n], "%s", st.net_why[n].c_str());
+    }
+    s->net_known = st.net_want >= 0;
     s->preprocess = st.preprocess;
     s->building = st.building;
+    s->building_net = st.building && st.building_net >= 0 ? uint32_t(st.building_net) : 3u;
+    s->build_progress = st.build_progress;
+    const size_t lines = std::min<size_t>(st.panel.size(), nr::control::kPanelLines);
+    for (size_t i = 0; i < lines; ++i) std::snprintf(s->panel[i], sizeof s->panel[i], "%s", st.panel[i].c_str());
+    s->panel_lines = uint32_t(lines);
     ++s->status_seq;
 }
 

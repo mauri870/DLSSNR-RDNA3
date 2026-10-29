@@ -1,5 +1,5 @@
 #pragma once
-// [Int4Mixed] in dlssnr-amd.ini: Enabled (the int4 mixed network at start), Hotkey (switch int4 mixed / the default
+// [Network] Model = CC_SILVER_AARDWOLD_INT4_MIXED (any other Model: off), else the old [Int4Mixed] in dlssnr-amd.ini: Enabled (the int4 mixed network at start), Hotkey (switch int4 mixed / the default
 // network in game), KeepBoth (keep the other network resident after a switch) and Sound (the switch cue).
 // enabled -1: no file, no section or no readable value - which counts as
 // on: these are read only where int4 mixed was installed, and choosing it at install means wanting it on. hotkey
@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cstdio>
 #include <string>
+#include "nr_ini_network.hpp"
 
 namespace nr {
 struct Int4Ini {
@@ -25,6 +26,8 @@ inline Int4Ini ini_int4(const std::string& path) {
         return s.substr(i);
     };
     auto lower = [](std::string s) { for (auto& c : s) c = char(std::tolower(static_cast<unsigned char>(c))); return s; };
+    int model = -1;
+    std::string network_hotkey; bool have_network_hotkey = false, network_sound = true;
     std::string section; char line[512];
     while (std::fgets(line, sizeof line, f)) {
         std::string t = line;
@@ -34,8 +37,18 @@ inline Int4Ini ini_int4(const std::string& path) {
         if (t.empty()) continue;
         if (t.front() == '[') { const auto e = t.find(']'); section = lower(trim(t.substr(1, e == std::string::npos ? std::string::npos : e - 1))); continue; }
         const auto eq = t.find('=');
-        if (eq == std::string::npos || section != "int4mixed") continue;
+        if (eq == std::string::npos) continue;
         const std::string key = lower(trim(t.substr(0, eq))), raw = trim(t.substr(eq + 1)), val = lower(raw);
+        // [Network] Model names the network (CC_SILVER_AARDWOLD_INT4_MIXED: int4 mixed); it wins over the old section.
+        if (section == "network") {
+            if (key == "model") {
+                const int n = network_choice(raw);
+                if (n >= 0) model = n == kSilverAardwoldInt4 ? 1 : 0;
+            } else if (key == "hotkey") network_hotkey = raw, have_network_hotkey = true;
+            else if (key == "sound") network_sound = !(val == "0" || val == "false" || val == "off" || val == "no");
+            continue;
+        }
+        if (section != "int4mixed") continue;
         if (key == "enabled") {
             if (val == "1" || val == "true" || val == "on" || val == "yes") r.enabled = 1;
             else if (val == "0" || val == "false" || val == "off" || val == "no") r.enabled = 0;
@@ -44,6 +57,8 @@ inline Int4Ini ini_int4(const std::string& path) {
         else if (key == "sound") r.sound = !(val == "0" || val == "false" || val == "off" || val == "no");
     }
     std::fclose(f);
+    if (model >= 0) { r.enabled = model; r.sound = network_sound; }
+    if (have_network_hotkey) r.hotkey = network_hotkey;
     return r;
 }
 }  // namespace nr

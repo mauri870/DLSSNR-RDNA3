@@ -62,8 +62,17 @@ PUSH_CONSTANTS(CodecConstants) {
   // Dword 25: 2 tapers the commit's dark restore before its cutoff; 0/1
   // retain the hard gate. The root/push-constant allocation stays 112 B.
   uint DarkGateMode;
+#ifdef NR_PREP_RESOLVE
+  // DLSSNR-AMD: [Preprocess]'s curve (runtime_prep.comp numbering), its input scale, contrast and saturation, and the
+  // resolve's floor behind them; dwords 26..30 (the first two are the 112 B allocation's tail). Only the _prep builds
+  // declare them.
+  uint PrepCurve;
+  float PrepK;
+  float PrepContrast;
+  float PrepSaturation;
+  float PrepFloor;
+#endif
 };
-
 // Display proxy curve (the Curve == 1 branch of v6_encode) as a function of
 // the max channel m in proxy units: f = shoulder(toe(m)).  The encode scales
 // all three channels by g(m) = f(m) / m, so P = x * g(m) and max(P) = f(m):
@@ -116,6 +125,10 @@ float DisplayCurveInverse(float u) {
   const float root = sqrt(b * b + 4.0 * t * kDisplayToeB);
   return b < 0.0 ? 2.0 * t * kDisplayToeB / (root - b) : 0.5 * (b + root);
 }
+
+#ifdef NR_PREP_RESOLVE
+#include "prep_resolve.hlsli"
+#endif
 
 #include "codec_math.hlsli"
 
@@ -347,8 +360,13 @@ float3 ResolvePixel(uint2 pixel, float3 original) {
     // N == P is exact identity.  Luma is bounded to +/-2 stops and chroma to
     // +/-ChromaClampStops so invalid ratios cannot explode the untouched HDR
     // source.  There is deliberately no host-side health/authority multiplier.
+#ifdef NR_PREP_RESOLVE
+    // DLSSNR-AMD: the proxy is [Preprocess]'s; the ratio is taken behind its curve (prep_resolve.hlsli).
+    const float3 safe_ratio = PrepSafeRatio(proxy, neural);
+#else
     const float3 safe_ratio =
         max(neural, 1.0 / 1024.0) / max(proxy, 1.0 / 1024.0);
+#endif
     const float3 lg = log2(safe_ratio);
     const float luma = dot(lg, float3(0.212639, 0.715169, 0.072192));
     const float3 chroma = lg - luma;
@@ -367,6 +385,7 @@ float3 ResolvePixel(uint2 pixel, float3 original) {
     // Both gains come from the same forward function, so N == P stays an
     // exact identity.
     float correction = 0.0;
+#ifndef NR_PREP_RESOLVE   // DLSSNR-AMD: the Display curve's gain correction does not apply to [Preprocess]'s proxy
     if (TransferMode == 1u) {
       const float m_proxy =
           DisplayCurveInverse(max(proxy.x, max(proxy.y, proxy.z)));
@@ -382,6 +401,7 @@ float3 ResolvePixel(uint2 pixel, float3 original) {
             / (DisplayCurve(m_neural) / m_neural));
       }
     }
+#endif
     const float l = clamp(luma + correction, -2.0, 2.0);
     // Style highlight guard: bound only the NEGATIVE luma edit, and only
     // where the proxy is on the Display shoulder.  The bound eases in from

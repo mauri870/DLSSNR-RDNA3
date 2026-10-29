@@ -16,6 +16,15 @@ Encode last_encode() {
     const uint64_t e = encode_extent.load();
     return {encodes.load(), encode_hdr.load(), uint32_t(e), uint32_t(e >> 32)};
 }
+std::atomic<uint64_t> seen_count{0};
+std::atomic<bool> seen_linear{false};
+std::atomic<float> seen_white{0.f};
+EncodeSeen encode_seen() { return {seen_count.load(), seen_linear.load(), seen_white.load()}; }
+void note_encode_seen(bool linear, float white_point) {
+    seen_linear.store(linear);
+    seen_white.store(white_point);
+    seen_count.fetch_add(1);
+}
 void note_encode(bool hdr, uint32_t width, uint32_t height) {
     encode_hdr.store(hdr);
     encode_extent.store(uint64_t(width) | uint64_t(height) << 32);

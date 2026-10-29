@@ -1,12 +1,11 @@
-DLSSNR-AMD-Vulkan (Windows, experimental preview)
-=================================================
+DLSSNR-AMD-Vulkan (Windows)
+===========================
 
 Runs the neural rendering (NR) model of DLSS 5 in games on AMD graphics cards. The network is
 reimplemented in Vulkan; NVIDIA's runtime is neither needed nor called.
 
-This is an experimental preview and has not been tested much: game crashes, driver resets and
-other unexpected problems can happen. It is slower than the Linux version and updated less
-often, and some releases may be Linux only. If something breaks, uninstall with option 5 of
+It is slower than the Linux version and updated less often, and some releases may be Linux
+only. If something breaks, uninstall with option 5 of
 install.bat.
 
 DX10/11/12 games keep the system's own D3D; nothing is translated. NR runs on a Vulkan device
@@ -40,35 +39,66 @@ on.
 You can also drag the game's exe onto install.bat. Games under Program Files ask for
 administrator rights.
 
-After the route the installer asks for the network, three combinations of two settings in
-dlssnr-amd.ini:
+Networks: all three are installed, named as in NVIDIA's DLL:
 
-  1) default network, compiled by the AMD driver   ACO Mode = 0, Int4Mixed Enabled = 0 (default)
-  2) default network, ACO machine code             ACO Mode = 1, Int4Mixed Enabled = 0
-  3) int4 mixed, ACO machine code                  ACO Mode = 1, Int4Mixed Enabled = 1
+    CC_SMALL_FP8                   the default network of 310.9.16, the fastest (default)
+    CC_SILVER_AARDWOLD             the network of 310.8.0 (also preset 1 of 310.9.16)
+    CC_SILVER_AARDWOLD_INT4_MIXED  CC_SILVER_AARDWOLD with part of the work in int4 and other lower
+                                   precisions; faster, the picture differs somewhat; runs with ACO
+                                   Mode = 1 only
 
-ACO machine code: the network as machine code made in advance by the Linux driver's compiler (ACO),
-shipped in the package and loaded by the AMD driver as it is, instead of the driver compiling the
-network itself; it is faster than the driver's own compile. Tested on one driver version only (AMD
-Software 26.9.2); if it causes problems on another driver, set ACO Mode back to 0.
-int4 mixed: part of the network runs in int4 and other lower precisions; faster, the picture differs
-somewhat. It runs with ACO machine code only (with ACO Mode = 0 the default network runs). It is
-always installed (its weights are made from the model at install); Ctrl+F11 in game switches
-between it and the default network, which needs ACO Mode = 1.
-Both settings can be changed in dlssnr-amd.ini later without installing again; a change of ACO Mode
-takes effect after a game restart.
+After the route the installer asks once which one a game starts with (Enter = CC_SMALL_FP8); on the
+command line -Model <name> (the earlier -Model new / old and -Network still work). This only sets
+[Network] Model in dlssnr-amd.ini; the network can be switched in game at any time: the drop-down in
+NR Control (End) or on ReShade's Add-ons page, or Ctrl+F11 to cycle. The new network is prepared in
+the background, and the current one keeps running until it is ready. A network that cannot run is
+greyed out in the drop-down with the reason. The int4 mixed weights are made at install; if that
+fails the other two are installed and int4 mixed is greyed out.
+
+ACO Mode ([Network] ACO Mode in dlssnr-amd.ini, 1 by default; not asked, -AcoMode 0 or 1 on the
+command line, NR Control has it too): 1 = the network as machine code made in advance by the Linux
+driver's compiler (ACO), shipped in the package and loaded by the AMD driver as it is, instead of the
+driver compiling the network itself; it is faster than the driver's own compile. When it cannot be
+used, the driver's compiler is used instead and dlssnr-amd.log says why. Tested on one driver version
+only (AMD Software 26.9.2); if it causes problems on another driver, set ACO Mode = 0 (the AMD driver's
+own compiler; CC_SILVER_AARDWOLD_INT4_MIXED is not available then). A change takes effect after a game
+restart.
+
+LumeniteFX (optional, reshade-feeder routes only): motion vectors from LumeniteFX Kernel (by Afzaal
+(Kaidō), https://github.com/umar-afzaal/LumeniteFX, AGNYA licence). It is not part of this project and
+not in this package. On the ReShade routes the installer asks once (Enter = no); with y it downloads
+the version this package was tested with from its author's GitHub and installs it unchanged into the
+game folder (the downloaded zip is kept in this package's lumenite\, so later installs do not download
+again). On the command line: -Lumenite on, or -LumeniteZip <zip> with a zip you downloaded yourself
+(Code > Download ZIP on its GitHub page), which installs the version in the zip.
+After installing, Motion vectors on the Add-ons page switches between LumeniteFX Kernel and VORT
+(ReShade compiles its effects again, and until that is done the picture goes without NR; NR's history
+starts again); it is MotionVectors in dlssnr-amd.ini. At every game start the add-on checks that
+LumeniteFX works; if anything fails, VORT runs that time, the reason is on the Add-ons page and in
+dlssnr-amd.log, and the next start tries again.
 
 Last, the installer asks whether to turn on the RenoDX style (see "RenoDX style" below); Enter =
 off. On the command line: -RenoDX on or off.
 
 Model
 -----
-The package does not contain NVIDIA's model. The first install asks for nvngx_dlssnr.dll
-(version 310.8.0 only) or a zip that contains it. The installer extracts the model with
-model-tools\dlssnr_extract_model.exe (it only reads the weight data; the DLL is never loaded or
-run), checks every entry against known hashes and writes dlssnr-amd\dlssnr.bin only if all
-match. The model stays in this package, so later installs from it (into other games too) do not
-ask again; with a newer package, choose the DLL once more or copy that file over.
+The package does not contain NVIDIA's model. The first install asks for nvngx_dlssnr.dll, version
+310.9.16 or 310.8.0, or a zip that contains it (on the command line: -Dll):
+
+    dlssnr-amd\dlssnr-small.bin  CC_SMALL_FP8 (the default network of 310.9.16)
+    dlssnr-amd\dlssnr.bin        CC_SILVER_AARDWOLD (the network of 310.8.0; 310.9.16 has it too), also
+                                 the source of CC_SILVER_AARDWOLD_INT4_MIXED
+
+Use 310.9.16 when you can: it already contains the 310.8.0 network, so with it both models are
+extracted and installed; 310.8.0 gives CC_SILVER_AARDWOLD only (CC_SMALL_FP8 is then greyed out in the
+menus). The installer
+extracts the models with model-tools\dlssnr_extract_model.exe (it only reads the weight data; the
+DLL is never loaded or run), checks every entry against known hashes and writes a model file only
+if all of them match. The models stay in this package, so later installs from it (into other games
+too) do not ask again; to add CC_SMALL_FP8 to a package that has only CC_SILVER_AARDWOLD, install
+again with -Dll pointing at the 310.9.16 DLL. With a newer package, choose the DLL once more or copy
+those files over.
+CC_SMALL_FP8 and CC_SILVER_AARDWOLD run with either ACO Mode setting.
 
 Use
 ---
@@ -77,12 +107,14 @@ OptiScaler: turn on DLSS (or FSR / XeSS) in the game's graphics settings. Insert
             RenoDX style on they are in NR Control instead, see below).
             End opens NR Control, this project's own NR menu: it shows what NR is doing (frame
             and network sizes, passes, NR's cost split into the network and the rest of the
-            processing), and switches int4 mixed and Preprocess; with the RenoDX style on it also
-            holds every NR setting. Changes are written to dlssnr-amd.ini at once and apply in the
-            game within about a second. While the menu is open it takes the keyboard and mouse; End
-            or Esc closes it. The menu is drawn over the game's picture (DX11 / DX12); while it is
-            closed it draws nothing. A game that uses only raw input may still receive input while
-            the menu is open.
+            processing), selects the network, adjusts Preprocess and the settings under "Networks
+            and other settings" below, and shows the data the game hands NR (Engine data); with the
+            RenoDX style on it also holds every NR setting. Changes are written to dlssnr-amd.ini at
+            once and apply in the game within about a second (except those applied after a game
+            restart). While the menu is open it takes the keyboard and mouse; End or Esc closes it.
+            The menu is drawn over the game's picture (DX11 / DX12); while it is closed it draws
+            nothing (except the few seconds the network's name shows in a corner, see OSD). A game
+            that uses only raw input may still receive input while the menu is open.
             If the NR page keeps showing "Waiting for the upscaler to run", set
             [Spoofing] Dxgi=false in OptiScaler.ini and try again.
 ReShade:    Home opens ReShade, the settings are on the Add-ons page; the same settings are
@@ -91,8 +123,7 @@ ReShade:    Home opens ReShade, the settings are on the Add-ons page; the same s
             seconds that takes the picture is shown without NR. Switching Model passes between 1
             and 2 or more also rebuilds in the background; until it is done NR keeps running with
             the previous number of passes.
-            NoiseEveryFrame in dlssnr-amd.ini (in the file only, default false): on frames without
-            motion vectors (DLSS5_MV not bound) the network's noise seed changes every frame, as in
+            NoiseEveryFrame (default false): on frames without motion vectors (DLSS5_MV not bound) the network's noise seed changes every frame, as in
             NVIDIA's original; with no previous frame to average the noise, a still picture shimmers
             slightly. false: a fixed seed.
             When Model resolution is below 100%, Enlargement chooses how the model's result is
@@ -103,6 +134,50 @@ ReShade:    Home opens ReShade, the settings are on the Add-ons page; the same s
             HDR: scRGB (linear) HDR works; this route leaves HDR10 (PQ/HLG) pictures alone, so
             set the game to SDR or scRGB. With the RenoDX style on, HDR10 (PQ) is handled too, HLG
             is not.
+
+Networks and other settings ([Network] in dlssnr-amd.ini; in NR Control and on the Add-ons page under
+Network model and options):
+  - Residency: what is kept of a network that is no longer running. The three networks share one
+    activation memory, so what is kept is mainly the weights.
+        auto      only the weights stay in video memory, switching back is quick; when video memory
+                  runs short they move to RAM, and are freed when RAM runs short too (default)
+        resident  the whole network stays in video memory; switching back is instant, uses the most
+                  video memory
+        offload   the weights move to RAM and all video memory is freed; switching back copies them
+                  back first
+        minimal   video memory and RAM are freed; switching back builds the network again
+    With NR off for more than 10 seconds, offload and minimal treat the running network so too; auto
+    only when video memory runs short.
+  - OSD: the running network shown in a corner of the screen. switch (default) = while switching, with
+    the progress, then for 3 seconds; always = all the time; off = never.
+  - Resize History (default 0): what happens to NR's previous result when the game's render size
+    changes (dynamic resolution); only matters with NR before the upscaler. 0 = dropped, NR starts
+    again at the new size, as NVIDIA's DLL does; 1 = scaled to the new size and kept. In our tests 1
+    is steadier and closer to the picture at a constant size when the size changes often, but it is
+    not what NVIDIA's DLL does; most DLSS games jitter their input, which hides most of the flicker of
+    a restart, so the default is 0.
+  - Style Grade (default 1): the grade of the Natural and Cinematic styles. 1 = as NVIDIA's DLL, the
+    picture is graded for the style after the network; 0 = the picture of 0.0.6 and earlier (without
+    that step), for those who prefer it. Standard is not affected; applied at once.
+  - Motion Without Depth (default 1): 1 = the network fetches the previous frame with the pixel's own
+    motion vector, depth not used, as NVIDIA's DLL does; 0 = with depth, the motion vector of whichever
+    of the pixel and its four diagonal neighbours is nearest the camera. Only the edges of moving
+    objects change; applied after a game restart.
+  - ACO Mode: see "Install".
+  - Hotkey, Sound: the hotkey that cycles the networks (default Ctrl+F11) and its sound.
+  - [Log]: whether dlssnr-amd.log is written and whether it is cleared at every start; applied after a
+    game restart.
+Dynamic resolution: with NR before the upscaler and a render size that keeps changing, every new
+size is prepared in the frame it appears in (except the first range of sizes seen), so NR is no
+longer skipped for stretches of frames; its video memory is bounded.
+Engine data (NR Control and the Add-ons page): what the network actually gets, for troubleshooting -
+the colour format and HDR, the encoding the network sees, the exposure (who computes it, the white
+point or divisor), the motion vectors (size, sampling, scale), size changes, resets. What the game does
+not hand over but something else covers says who covers it; with no exposure from anywhere, a hint
+says to try Preprocess with Exposure = auto if the picture looks wrong. Depth is shown only with
+Motion Without Depth = 0 (NVIDIA's DLL does not use depth). The name at the start of each line has a
+colour: green = from the game, yellow = not from the game but filled in (what fills it in is on the
+line), orange = not from the game and nothing fills it in.
 
 Preprocess (optional, off by default): [Preprocess] in dlssnr-amd.ini in the game folder (the
 installer writes the file; ReShade also shows it on the Add-ons page). It changes the picture

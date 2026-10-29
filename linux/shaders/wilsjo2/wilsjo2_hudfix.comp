@@ -1,0 +1,226 @@
+#version 460
+// HUD FIX (NR Control's [HudFix], ours): NR's change kept off the game's HUD at Present. The composition is
+// NVIDIA DLSSNR.UICorrection's as 310.9.16's post kernel does it and RenoDX
+// v8.5.0-rc10's pre-frame-generation composition (shaders/prefg_compose.cs_5_1.hlsl, MIT, the same formula):
+//     Final = Back + (1 - a) * (Enhanced - Hudless)
+// Back the frame with its HUD, Hudless the same frame without it (where none: Back itself), Enhanced NR's answer on
+// Hudless, a the HUD's alpha. Every value in the frame's own encoding, where the game composed its HUD.
+// One file, four programs (built with one of the defines):
+//   HUD_CLEAR    u1's counts (R32_UINT, its row 0, x 0..3) set to 0. Below them two sets of the estimate's tile flags
+//                (one texel an 8 x 8 tile, ceil(W / 8) x ceil(H / 8) each), read from one and written to the other in
+//                turn (Parity): a tile reads its neighbours as the last frame left them, whatever order the GPU runs it.
+//   HUD_COUNT    per pixel of t0 (Back) against t1 (Hudless, or the previous frame for the estimate): HudMode 2 counts
+//                the HUD pixels (u1.x: beyond Epsilon, u1.y: beyond the grain-sized tolerance, prefg_compose's Stats);
+//                HudMode 3 counts the pixels that changed since the previous frame (u1.z).
+//   HUD_ESTIMATE the HUD estimated where nothing tells where it is (ours): while the frame as a whole moves (at least
+//                Threshold of its pixels changed), a pixel that stays the same and has structure around it (a step of
+//                more than 16/255 to a neighbour that stayed the same too: text, icons, frames - a flat sky or wall
+//                stays the same under a pan too, and is no HUD; a clipped highlight's rim borders a sliding gradient) is
+//                screen-fixed, and its confidence rises (1/40 a frame: an edge of the scene that
+//                lies along the motion stays the same too, until the camera moves another way); one that stays the same
+//                but flat loses it slowly (1/24), one that changes fast (1/2). A frame that hardly moves changes
+//                nothing. u0 (RGBA16F, read and written): .g the confidence, .r the alpha (smoothstep .5 .. 1), .b 1
+//                where the pixel did not change this frame. Each 8 x 8 tile's flags: bit 0 it holds confident HUD
+//                structure; bits 2..5 the moving frames it has stayed still (to 15); bit 6 it is HUD as a whole, its
+//                flat pixels too (a panel's background, which no structure test finds): still for 12 moving frames and
+//                either holding structure itself or with at least two of its four neighbours HUD - filled from a
+//                panel's edges inwards, frame by frame, while a flat stretch of the scene beside a panel (one
+//                neighbour, no structure of its own) is not.
+//   HUD_COMPOSE  u0 = the composition. HudMode 0: a = t3.r (a UI alpha), 1: a = t3.a (a UI colour's alpha), 2: the
+//                difference mask (Back == Hudless within Epsilon: scene, else HUD), with prefg_compose's limits - above
+//                HudLimit HUD pixels the mask is no HUD (Residual 1 and the grain-sized count within it: NR's change on
+//                Back where the difference is grain, else Back kept; else Enhanced whole); 3: the estimate, a = the
+//                largest t3.r of the 5 x 5 around the pixel (the HUD's antialiased edges with it), and 1 for a pixel
+//                that did not change in a panel's inside (bit 6); Hudless = Back.
+//   HUD_ESTIMATE with the game's motion vectors (t2, MotionOn): where the scene under a pixel moves a pixel or more,
+//                the pixel is HUD when it stayed the same yet differs from the frame before where its scene came from
+//                (below); elsewhere the frame-wide test above.
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D t0;
+layout(set = 0, binding = 1) uniform sampler2D t1;
+layout(set = 0, binding = 2) uniform sampler2D t2;
+layout(set = 0, binding = 3) uniform sampler2D t3;
+#if defined(HUD_ESTIMATE)
+layout(set = 0, binding = 4, rgba16f) uniform image2D u0;
+#else
+layout(set = 0, binding = 4) uniform writeonly image2D u0;
+#endif
+layout(set = 0, binding = 5, r32ui) uniform coherent uimage2D u1;
+
+// The prefix of the stage's 256-byte constants (wilsjo2_common.glsl) these programs read
+layout(push_constant, std430) uniform Constants {
+    uint Mode;            //  0
+    float WhitePoint;     //  4
+    uint Width;           //  8
+    uint Height;          // 12
+    float Unused16[2];    // 16, 20
+    uint ShowMask;        // 24 (DebugView): the HUD's alpha shown instead of the picture
+    uint Parity;          // 28 (MaxRatio's place): the tile flags read from set Parity, written to the other
+    uint Fresh;           // 32 (Passthrough): the estimate's state is new (read as 0)
+    float MvScaleX, MvScaleY;   // 36, 40 (the estimate with motion vectors: output pixels per unit)
+    uint HudLimit;        // 44 (GuideWidth): the HUD pixels above which a difference mask is no HUD
+    uint Residual;        // 48 (GuideHeight): 1 the residual form above the limit (prefg_compose Auto)
+    uint HudMode;         // 52 (CompareMode)
+    float Epsilon;        // 56 (CompareSplit): equal within, relative above 1
+    float Threshold;      // 60 (CompareZoom): the estimate's share of changed pixels for a moving frame
+    uint MotionOn;        // 64 (CompareSwap): the estimate has the game's motion vectors (t2)
+    uint MotionBase;      // 68 (Transfer): their region's origin in t2, x | y << 16
+    float MotionStepX;    // 72 (DebugScale): t2 texels per output pixel
+    float MotionStepY;    // 76 (ReversibleMode's slot)
+} cb;
+
+const float kGrainTolerance = 1.0 / 16.0;   // prefg_compose: 16 8-bit steps
+
+ivec2 tiles() { return ivec2((int(cb.Width) + 7) / 8, (int(cb.Height) + 7) / 8); }
+// tile t's texel in flag set `set`
+ivec2 flag_at(ivec2 t, uint set) { return ivec2(t.x, 1 + int(set) * tiles().y + t.y); }
+
+shared uint s_hud, s_coarse, s_changed, s_structure;
+
+bool differs(vec3 a, vec3 b, float tolerance) {
+    const vec3 scale = max(vec3(1.0), abs(b));
+    return any(greaterThan(abs(a - b), tolerance * scale));
+}
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    const bool inside = p.x < int(cb.Width) && p.y < int(cb.Height);
+#if defined(HUD_CLEAR)
+    if (p.x < 4 && p.y == 0) imageStore(u1, p, uvec4(0u));
+#elif defined(HUD_COUNT)
+    if (gl_LocalInvocationIndex == 0u) { s_hud = 0u; s_coarse = 0u; s_changed = 0u; }
+    barrier();
+    if (inside) {
+        const vec3 a = texelFetch(t0, p, 0).rgb, b = texelFetch(t1, p, 0).rgb;
+        if (cb.HudMode == 3u) {
+            if (differs(a, b, cb.Epsilon)) atomicAdd(s_changed, 1u);
+        } else {
+            if (differs(a, b, cb.Epsilon)) atomicAdd(s_hud, 1u);
+            if (differs(a, b, kGrainTolerance)) atomicAdd(s_coarse, 1u);
+        }
+    }
+    barrier();
+    if (gl_LocalInvocationIndex == 0u) {
+        if (s_hud != 0u) imageAtomicAdd(u1, ivec2(0, 0), s_hud);
+        if (s_coarse != 0u) imageAtomicAdd(u1, ivec2(1, 0), s_coarse);
+        if (s_changed != 0u) imageAtomicAdd(u1, ivec2(2, 0), s_changed);
+    }
+#elif defined(HUD_ESTIMATE)
+    if (gl_LocalInvocationIndex == 0u) { s_changed = 0u; s_structure = 0u; }
+    barrier();
+    const float moving = float(imageLoad(u1, ivec2(2, 0)).x) / max(float(cb.Width) * float(cb.Height), 1.0);
+    vec4 state = !inside || cb.Fresh != 0u ? vec4(0.0) : imageLoad(u0, p);
+    // With the game's motion vectors (MotionOn): the scene's motion under this pixel, m, in output pixels (to where it
+    // was the frame before). A pixel that stayed the same while the scene under it moved a pixel or more and that
+    // differs (8 codes) from the frame before at the place its scene came from was left behind by it: HUD. Where the
+    // scene under it hardly moves, the frame-wide test as without vectors. (A test scene: no HUD
+    // taken on the body / alley / night scenes; the test HUD's text 14.7 % of its pixels found, 12.8 without vectors.)
+    const bool use_mv = cb.MotionOn != 0u;
+    vec2 m = vec2(0.0);
+    if (inside && use_mv) {
+        const ivec2 base = ivec2(int(cb.MotionBase & 0xffffu), int(cb.MotionBase >> 16));
+        const ivec2 tq = clamp(base + ivec2((vec2(p) + 0.5) * vec2(cb.MotionStepX, cb.MotionStepY)), ivec2(0),
+                               textureSize(t2, 0) - 1);
+        m = texelFetch(t2, tq, 0).rg * vec2(cb.MvScaleX, cb.MvScaleY);
+    }
+    if (inside && (use_mv || moving >= cb.Threshold)) {
+        const vec3 c = texelFetch(t0, p, 0).rgb;
+        const bool same = !differs(c, texelFetch(t1, p, 0).rgb, cb.Epsilon);
+        bool structure = false;
+        const ivec2 hi = ivec2(int(cb.Width) - 1, int(cb.Height) - 1);
+        for (int i = 0; i < 4; ++i) {
+            const ivec2 q = clamp(p + ivec2(i == 0 ? 1 : i == 1 ? -1 : 0, i == 2 ? 1 : i == 3 ? -1 : 0), ivec2(0), hi);
+            // a step of 16 codes to a neighbour that stayed the same too: both sides of the edge screen-fixed. A
+            // clipped highlight on a slowly moving surface stays the same as well, but its rim borders a gradient that
+            // slides with the surface (a test scene: 0.13 % of the frame taken for HUD in 8 x 8 blocks on skin
+            // highlights before, none now; the test HUD's text 15.8 -> 12.8 % of its pixels found, its white cores
+            // beside see-through shadows)
+            const vec3 nq = texelFetch(t0, q, 0).rgb;
+            structure = structure || (differs(c, nq, 16.0 / 255.0) && !differs(nq, texelFetch(t1, q, 0).rgb, cb.Epsilon));
+        }
+        // where the scene under the pixel hardly moves (or there are no vectors): the frame-wide test as without them
+        if (!use_mv || (same && dot(m, m) < 1.0)) {
+            if (moving >= cb.Threshold)
+                state.g = clamp(!same ? state.g - 0.5 : structure ? state.g + 1.0 / 40.0 : state.g - 1.0 / 24.0, 0.0, 1.0);
+        } else if (!same) {
+            state.g = max(state.g - 0.5, 0.0);
+        } else {
+            const ivec2 from = clamp(ivec2(floor(vec2(p) + 0.5 + m)), ivec2(0), hi);
+            const bool left_behind = differs(c, texelFetch(t1, from, 0).rgb, 8.0 / 255.0);
+            // left behind by its scene: HUD - a flat pixel too unless bright (a clipped highlight); alike the place its
+            // scene came from: nothing told (often the HUD's own pixel beside it), held
+            const bool bright = max(c.r, max(c.g, c.b)) >= 240.0 / 255.0;
+            if (left_behind) state.g = min(state.g + (structure ? 1.0 / 40.0 : bright ? 0.0 : 1.0 / 60.0), 1.0);
+        }
+        state.b = same ? 1.0 : 0.0;
+        if (!same) atomicAdd(s_changed, 1u);
+        if (same && structure && state.g >= 0.75) atomicAdd(s_structure, 1u);
+    }
+    if (inside) {
+        state.r = smoothstep(0.5, 1.0, state.g);
+        imageStore(u0, p, vec4(state.r, state.g, state.b, 0.0));
+    }
+    barrier();
+    // the tile's flags into the set written this frame (a still frame carries the last ones over)
+    if (gl_LocalInvocationIndex == 0u) {
+        const ivec2 t = ivec2(gl_WorkGroupID.xy), n = tiles();
+        const uint last = cb.Fresh != 0u ? 0u : imageLoad(u1, flag_at(t, cb.Parity)).x;
+        uint flags = last;
+        if (moving >= cb.Threshold || cb.Fresh != 0u) {
+            const bool still = s_changed == 0u;
+            const uint count = still ? min(((last >> 2) & 15u) + 1u, 15u) : 0u;
+            uint hud_beside = 0u;
+            for (int i = 0; i < 4; ++i) {
+                const ivec2 q = t + ivec2(i == 0 ? 1 : i == 1 ? -1 : 0, i == 2 ? 1 : i == 3 ? -1 : 0);
+                if (cb.Fresh == 0u && q.x >= 0 && q.y >= 0 && q.x < n.x && q.y < n.y &&
+                    (imageLoad(u1, flag_at(q, cb.Parity)).x & 65u) != 0u)
+                    ++hud_beside;
+            }
+            const bool structure = s_structure >= 2u;
+            const bool inside = still && count >= 12u && (structure || hud_beside >= 2u);
+            flags = (structure ? 1u : 0u) | (count << 2) | (inside ? 64u : 0u);
+        }
+        imageStore(u1, flag_at(t, 1u - cb.Parity), uvec4(flags));
+    }
+#elif defined(HUD_COMPOSE)
+    if (!inside) return;
+    const vec4 back = texelFetch(t0, p, 0);
+    const vec4 hudless = cb.HudMode == 3u ? back : texelFetch(t1, p, 0);
+    const vec4 enhanced = texelFetch(t2, p, 0);
+    vec4 result;
+    if (cb.HudMode == 2u) {
+        const bool hud = differs(back.rgb, hudless.rgb, cb.Epsilon);
+        const bool coarse = differs(back.rgb, hudless.rgb, kGrainTolerance);
+        if (imageLoad(u1, ivec2(0, 0)).x > cb.HudLimit) {
+            if (cb.Residual != 0u && imageLoad(u1, ivec2(1, 0)).x <= cb.HudLimit)
+                result = coarse ? back : vec4(back.rgb + (enhanced.rgb - hudless.rgb), back.a);
+            else
+                result = vec4(enhanced.rgb, back.a);
+        } else {
+            result = hud ? back : vec4(enhanced.rgb, back.a);
+        }
+    } else {
+        float alpha;
+        if (cb.HudMode == 3u) {
+            alpha = 0.0;
+            for (int y = -2; y <= 2; ++y)
+                for (int x = -2; x <= 2; ++x) {
+                    const ivec2 q = clamp(p + ivec2(x, y), ivec2(0), ivec2(int(cb.Width) - 1, int(cb.Height) - 1));
+                    alpha = max(alpha, texelFetch(t3, q, 0).r);
+                }
+            // a panel's flat inside (the flags the estimate wrote this frame): its pixels that did not change
+            if ((imageLoad(u1, flag_at(p / 8, 1u - cb.Parity)).x & 64u) != 0u && texelFetch(t3, p, 0).b > 0.5) alpha = 1.0;
+        } else {
+            const vec4 ui = texelFetch(t3, p, 0);
+            alpha = clamp(cb.HudMode == 0u ? ui.r : ui.a, 0.0, 1.0);
+        }
+        result = alpha >= 1.0 ? back : vec4(back.rgb + (1.0 - alpha) * (enhanced.rgb - hudless.rgb), back.a);
+        if (cb.ShowMask != 0u) result = vec4(vec3(alpha), 1.0);
+    }
+    if (cb.ShowMask != 0u && cb.HudMode == 2u)
+        result = differs(back.rgb, hudless.rgb, cb.Epsilon) ? vec4(1.0) : vec4(vec3(0.0), 1.0);
+    imageStore(u0, p, result);
+#endif
+}

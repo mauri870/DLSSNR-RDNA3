@@ -1,3 +1,4 @@
+#include <atomic>
 // The network as a graph: one activation arena, one weight arena, one submit.
 //
 // Every other host in `src/` drives a single kernel against a captured gold.
@@ -1228,6 +1229,18 @@ struct Disp {
     uint32_t i4_xbase = 0xFFFFFFFFu;
 #endif
 };
+// The activation arena's device address into every push block that carries it (vitattn, the GEMMs); nothing
+// when the device has no bufferDeviceAddress (the g_*nobda.spv builds).
+static void put_act_address(std::vector<Disp>& disp, VkDeviceAddress address) {
+    if (!address) return;
+    const uint32_t lohi[2] = {uint32_t(address), uint32_t(address >> 32)};
+    for (Disp& d : disp) {
+        if (d.kern == "vitattn" && d.push.size() >= sizeof(PushVAttn))
+            std::memcpy(d.push.data() + offsetof(PushVAttn, act_lo), lohi, sizeof lohi);
+        else if (gemm_push_kern(d.kern) && d.push.size() >= sizeof(PushGemm))
+            std::memcpy(d.push.data() + offsetof(PushGemm, act_lo), lohi, sizeof lohi);
+    }
+}
 
 // The activation arena's slot table, and which lowered steps ask for each slot.
 //
@@ -1332,6 +1345,8 @@ struct NrSession {
     // NR_ARENA_GAP / NR_POISON_GAPS): where the values end, and the guard gaps.
     size_t values_end = 0;
     std::vector<std::pair<int, size_t>> gaps;   // value before it, gap offset
+    // Where the weights end in the weight blob: the rest (noise field, records) depends on the working extent.
+    size_t weights_end = 0;
     // Arena reuse (`--reuse`): a first build with `arena_probe` set stops after
     // lowering and merging, before anything touches the device, and hands back
     // a layout in which values whose lifetimes do not overlap share memory.
@@ -1359,13 +1374,154 @@ struct NrSession {
     std::vector<const Step*> run;
     std::map<int, size_t> reader_tokens;   // block -> tokens of whoever reads it
     std::map<int, int> last_layer;   // block -> its final layer
+    // The ViT blocks (CCVit1D*): 310.8 b31..b38, 310.9 small b11..b18. The block
+    // before them ends in the C512 FinalHead, the one after is the decoder input.
+    int vit_first = -1, vit_last = -1, vit_last_layer = -1;
     std::function<int(const Step&)> x_src;
     bool host_boundary = false;
     const char* seed_path = nullptr;
     const char* score_dir = nullptr;
+    // The resize path. `arenas` owns `act` and `wgt` (a build at another source extent of the same working extent
+    // may hold them too). `core` is what a full build lowered, for such a build; `share` set before build() makes
+    // this one of them (build_shared).
+    std::shared_ptr<struct GraphArenas> arenas;
+    std::shared_ptr<const struct GraphCore> core, share;
+    // The slot `share` runs in (null: its own full build's arenas). See GraphArenas.
+    std::shared_ptr<struct GraphArenas> share_slot;
+    // A full build: an activation arena to take instead of allocating one (GraphAct, RuntimeConfig::act_arena) when it
+    // has the room; `act_slack` (>= 1) the room a new one gets beyond this build's need, so another network fits it.
+    std::shared_ptr<struct GraphAct> given_act;
+    double act_slack = 1.0;
+    bool act_shared = false;   // this build took given_act
+    // Make the slot ready for this runtime's plan, in the recording: nothing when it already is.
+    void retarget(VkCommandBuffer cmd);
+    // A plan only (the resize path): build() lowers and stops before the device (returns 4) with `core` set.
+    bool plan_only = false;
+    // The arenas' room by area against this build's own need (>= 1), for plans of bigger working extents.
+    double capacity = 1.0;
+    // The weight blob past weights_end (noise field, records) and a hash of the weights before it.
+    std::vector<uint8_t> tail;
+    uint64_t weights_hash = 0;
+    size_t arena_total = 0;   // the activation arena's bytes (values, sync words, tile counters)
+    void keep_tail(const WeightBlob& wblob);
+    std::shared_ptr<const struct GraphCore> make_core(int argc, char** argv, const std::string& spv_dir);
     // 0 built, 1 a fatal setup error, 2 a flag asked for a report and nothing
     // should run.
     int build(int argc, char** argv, const std::vector<Step>* prepared_plan = nullptr);
+    int build_shared(int argc, char** argv);
+    // The input image and the two answer images at the source extent (--tex-in-format, --out0-format).
+    bool make_images(int argc, char** argv);
+    // One pipeline and set per kernel name in `disp`; `chain` is the build's g_chain_kern.
+    void create_kernels(const std::string& spv_dir, const std::set<std::string>& chain);
+};
+
+// An activation arena: the values, the persistent runs' sync words and the tile counters - one frame's working memory,
+// nothing kept from one frame to the next (the history is in images). Several networks hold one when they never run in
+// one recording interleaved with work that needs it kept (the session's: the networks of the kinds not running). `loaded`
+// is the plan (GraphCore::id) it was last zeroed for, in recording order: any other records NrSession::retarget's fill
+// first. An id, not an address: a freed plan's address can come back for another.
+struct GraphAct {
+    VkDevice device{};
+    nrvk::Buffer buf{};
+    size_t cap{};
+    uint64_t loaded{};
+    ~GraphAct() {
+        if (buf.mapped) vkUnmapMemory(device, buf.memory);
+        if (buf.handle) vkDestroyBuffer(device, buf.handle, nullptr);
+        if (buf.memory) vkFreeMemory(device, buf.memory, nullptr);
+    }
+};
+
+// The activation and weight arenas of one full build, freed with the last runtime that uses them.
+// A network's memory (the resize path's slot): the activation arena and the weight buffer - the weights, the same at
+// every working extent (weights_hash), then room for one plan's tail. `loaded` is the plan the arena and the tail
+// were last made ready for, in recording order: a runtime of another plan records NrSession::retarget first.
+struct GraphArenas {
+    VkDevice device{};
+    std::shared_ptr<GraphAct> act;   // possibly another network's too (GraphAct)
+    nrvk::Buffer wgt{};
+    size_t wgt_cap{}, weights_end{};
+    uint64_t weights_hash{};
+    uint64_t loaded{};   // GraphCore::id whose tail and noise fields the weight buffer holds, 0 none
+    size_t act_need{};   // the activation room this network's build asked for (capacity included, no slack)
+    nrvk::Kernel noise;   // g_noisefield over `wgt`, made at the first retarget
+    // The images of the runtimes built inside a recording in this memory (nrvk::ImageHeap), the region the next one
+    // takes, and the most bytes one asked for (the heap is made again bigger when that does not fit).
+    std::shared_ptr<nrvk::ImageHeap> images;
+    uint32_t next_region{};
+    // Image bytes a runtime of this memory takes per frame pixel, and the biggest frame (pixels) it runs: the heap's
+    // region size (set by the whole build that made the memory).
+    double bytes_per_px{}, max_px{};
+    double px_unfit{};   // the biggest frame (pixels) a runtime was built at without fitting the heap: the next one covers it
+    // Every pipeline a runtime of this memory used (nrvk::Context::pin): one built inside a frame later finds it made.
+    std::vector<std::shared_ptr<nrvk::SharedPipeline>> pipelines;
+    // Offloaded (offload_network): the weights [0, weights_end) in RAM, `wgt` and `act` released; act_want the arena
+    // room to get back (reload_network).
+    std::vector<uint8_t> host_weights;
+    size_t act_want{};
+    ~GraphArenas() {
+        if (noise.device) noise.destroy();
+        if (wgt.mapped) vkUnmapMemory(device, wgt.memory);
+        if (wgt.handle) vkDestroyBuffer(device, wgt.handle, nullptr);
+        if (wgt.memory) vkFreeMemory(device, wgt.memory, nullptr);
+    }
+};
+
+// A plan's tail without its noise field (filled on the GPU), in host-visible memory for an in-stream copy: `ranges`
+// are {offset in the tail, offset in `buf`, bytes}.
+struct GraphStaging {
+    VkDevice device{};
+    nrvk::Buffer buf{};
+    std::vector<VkBufferCopy> ranges;
+    ~GraphStaging() {
+        if (buf.mapped) vkUnmapMemory(device, buf.memory);
+        if (buf.handle) vkDestroyBuffer(device, buf.handle, nullptr);
+        if (buf.memory) vkFreeMemory(device, buf.memory, nullptr);
+    }
+};
+
+// ---- one lowered network, several source extents (the resize path) ----------
+//
+// The native plan pads the source to its working extent (nr_native_plan.cpp: 1918x1078 and 1920x1080 are both
+// 1920x1152 for the small model), and everything a build lowers - the dispatches, the arena layout, the weight blob
+// with its records and noise field - is a function of the working extent alone, except three things: the pre block's
+// source extent (PushPreImage source_W/H), the images sized by it (tex_in, surf0, surf1), and the dead padded rows
+// trimmed below the picture (g_post_out_h). Measured 2026-10-18: identical weight blob and dispatches but for the
+// pre block's push at 1918x1078 and 1920x1080.
+//
+// So a runtime at another source extent of the same working extent takes all of it from a full build, makes only
+// its own images and descriptor sets, and patches the pre block's push. The arenas are shared: two runtimes of one
+// graph recorded one after the other are what one runtime recorded twice already is (OptiScaler's passes), the
+// arena's sync words and tile counters counting graph executions either way. Valid for a source no taller than the
+// one the core was built at: its dead rows were trimmed from that height, and a shorter picture only has more dead
+// rows, which computing changes nothing.
+struct GraphCore {
+    uint64_t id{};   // unique for the process (GraphArenas::loaded, GraphAct::loaded)
+    std::vector<Step> plan;
+    std::vector<int> run;          // indices into plan
+    std::vector<Disp> disp;        // `s` re-pointed through disp_step
+    std::vector<int> disp_step;
+    uint32_t math_profile{};
+    std::vector<uint32_t> persist_err;
+    uint32_t tc_base{}, tc_words{};
+    std::vector<uint32_t> tc_err;
+    std::vector<NrSession::TcExpect> tc_expect;
+    std::vector<std::string> tc_pair;
+    std::set<std::string> chain_kern;
+    std::vector<uint8_t> no_barrier_after;
+    bool no_barrier{}, read_barrier{}, exec_barrier{}, storage_barrier{}, inv_barrier{};
+    uint32_t barrier_stride{1}, chunk{1};
+    std::shared_ptr<GraphArenas> arenas;   // a full build's own; null for a plan
+    std::string spv_dir;
+    uint32_t source_w{}, source_h{};
+    // What a network memory needs to run this plan (GraphSlot): the weights (identical at every working extent,
+    // checked by the hash), then this plan's tail at weights_end - the noise field, filled by `noise`, and the
+    // records - and an activation arena of act_total bytes, all zero when the plan starts.
+    size_t weights_end{}, act_total{};
+    uint64_t weights_hash{};
+    std::vector<uint8_t> tail;
+    std::vector<NoiseJob> noise;
+    std::shared_ptr<GraphStaging> staging;
 };
 
 // The layout globals above (g_chain_*, g_tc_*) are one copy for every build, and
@@ -1376,6 +1532,7 @@ struct NrSession {
 static std::recursive_mutex g_build_lock;
 
 int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_plan) {
+    if (share) return build_shared(argc, argv);   // no layout globals: not one of the builds the lock orders
     std::lock_guard<std::recursive_mutex> one_build(g_build_lock);
     // A build lays out its own persistent sync words; an epoch word left from a
     // previous build (another extent) would point into the old layout.
@@ -1528,6 +1685,12 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
 
     for (const Step& s : plan)
         last_layer[s.block] = std::max(last_layer[s.block], s.layer);
+    for (const Step& s : plan)
+        if (s.type.rfind("CCVit1D", 0) == 0) {
+            if (vit_first < 0) vit_first = s.block;
+            vit_last = s.block; vit_last_layer = s.layer;
+        }
+    if (vit_first < 0) throw std::runtime_error("plan has no ViT blocks");
 
     // ---- what runs ---------------------------------------------------------
     for (const Step& s : plan) {
@@ -1685,10 +1848,10 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         // picture.
         if (host_boundary && s.type == "CCSplitSwin16HFinalHead")
             overread[pool_key(s.block)] = std::max(overread[pool_key(s.block)], size_t(s.tokens) * 512);
-        if (host_boundary && s.block == 31 && s.layer == 0)
-            vsize[lift_key(31)] = align(size_t(s.tokens),32) * 1024;
-        if (host_boundary && s.block == 38 && s.layer == 4)
-            vsize[ups_key(38)] = align(size_t(s.tokens),32) * 1024;
+        if (host_boundary && s.block == vit_first && s.layer == 0)
+            vsize[lift_key(vit_first)] = align(size_t(s.tokens),32) * 1024;
+        if (host_boundary && s.block == vit_last && s.layer == vit_last_layer)
+            vsize[ups_key(vit_last)] = align(size_t(s.tokens),32) * 1024;
         // A partial ViT token tile still spans every channel group. M*C bytes
         // is insufficient for tile-blocked M when M is not 16-aligned. PTX
         // rounds its ViT domain to 32; preserve zero padding in separate slots.
@@ -1717,8 +1880,8 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     // the second crashes at run time, which is why `last_layer` is a member.
     x_src = [this](const Step& s) {
         if (host_boundary && s.type == "CCSplitSwin16HFinalHead") return pool_key(s.block);
-        if (host_boundary && s.block == 31 && s.layer == 0) return lift_key(31);
-        if (host_boundary && s.block == 39) return ups_key(38);
+        if (host_boundary && s.block == vit_first && s.layer == 0) return lift_key(vit_first);
+        if (host_boundary && s.type == "CCDecInputUpsample") return ups_key(vit_last);
         if (s.layer > 0) return key_of(s.block, s.layer - 1);
         const int b = s.in0 >= 0 ? s.in0 : s.block;
         return key_of(b, last_layer.count(b) ? last_layer.at(b) : 0);
@@ -2039,6 +2202,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         if (nr::g_memory_note) nr::logf("planned; %s", nr::g_memory_note().c_str());
     }
     int lowering = 0;
+    int noise_disp = -1;   // the pre block whose noise field is placed after the weights
     for (const Step* ps : run) {
         voff.step = lowering++;
         const Step& s = *ps;
@@ -2469,11 +2633,12 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                     uint32_t noise_off=0;
                     if (NR_NOISE_FIELD) {
                         // A zeroed region the build fills on the GPU after the upload
-                        // (see g_noise_jobs); f16 x4 per pixel of the working grid.
+                        // (see g_noise_jobs); f16 x4 per pixel of the working grid. Placed after
+                        // the weights (below, at "weights-unpack"), so every weight's offset is the
+                        // same at every working extent: one weight upload serves them all.
                         const uint32_t nw=d.gx*8u, nh=d.gy*8u;
-                        noise_off=uint32_t(wblob.append_zeros(size_t(nw)*nh*8u,256)/4);
-                        if(!noise_off)throw std::runtime_error("noise field at offset 0");
-                        g_noise_jobs.push_back({noise_off,nw,nh,pi.seed,pi.noise});
+                        g_noise_jobs.push_back({0u,nw,nh,pi.seed,pi.noise});
+                        noise_disp=int(disp.size());   // `d`, pushed right below
                     }
                     const PushPreImage ip{uint32_t(put(plain_lift,16)/2),pi.source_W,pi.source_H,
                         pi.seed,pi.s434,pi.aux0,pi.aux1,pi.gate0,pi.gate1,pi.noise,pi.konst,noise_off};
@@ -2627,6 +2792,8 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                     // projection/strength math. Nondefault diagnostic projection
                     // controls retain the separate output pipeline.
                     Disp& post=disp.back();post.kern="fswinimagepost32";
+                    // The tail's offset shares its word with the runtime's flags (alpha, rounding, the Style grade).
+                    if(po.w_off>0x0FFFFFFFu) throw std::runtime_error("post block weights beyond the tail's 28-bit offset");
                     const PushImageTail tail{po.w_off,po.nr_intensity};
                     const size_t offset=sizeof(PushFSwin)+sizeof(PushUps);
                     post.push.resize(offset+sizeof tail);
@@ -3323,11 +3490,11 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             // NR_REPACK_FOLD: FinalHead (gemmnores, NR_OUT_PERM=2) writes the
             // raster copy itself; the repack below only runs when it cannot.
             bool in_folded = false;
-            if (NR_REPACK_FOLD && host_boundary && s.block == 31 && s.layer == 0 &&
+            if (NR_REPACK_FOLD && host_boundary && s.block == vit_first && s.layer == 0 &&
                 s.W % 4 == 0 && s.H % 4 == 0 && !flag(argc, argv, "--no-repack-fold") &&
             !slot_reading_diagnostic(argc, argv)) {
                 for (auto it = disp.rbegin(); it != disp.rend(); ++it)
-                    if (it->s->block == 30 && it->s->layer == 4 && it->kern == "gemmnores") {
+                    if (it->s->block == vit_first - 1 && it->s->type == "CCSplitSwin16HFinalHead" && it->kern == "gemmnores") {
                         PushGemm q{};
                         std::memcpy(&q, it->push.data(), sizeof q);
                         // The slot is written by FinalHead now, so its lifetime
@@ -3337,7 +3504,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                         const int lowering_now = voff.step;
                         for (size_t i = 0; i < run.size(); ++i)
                             if (run[i] == it->s) voff.step = int(i);
-                        q.p_off = uint32_t(voff[lift_key(31)]);
+                        q.p_off = uint32_t(voff[lift_key(vit_first)]);
                         voff.step = lowering_now;
                         // PushRepack's W/H are passed as s.H/s.W: the repack's raster
                         // is s.H wide and s.W tall, so the fold uses the same.
@@ -3347,9 +3514,9 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                         break;
                     }
             }
-            if (host_boundary && s.block == 31 && s.layer == 0 && !in_folded) {
+            if (host_boundary && s.block == vit_first && s.layer == 0 && !in_folded) {
                 Disp rep{&s};
-                PushRepack p{uint32_t(voff[blk_out(30)]), uint32_t(voff[lift_key(31)]),
+                PushRepack p{uint32_t(voff[blk_out(vit_first - 1)]), uint32_t(voff[lift_key(vit_first)]),
                              uint32_t(s.H), uint32_t(s.W), 1024, 0};
                 rep.kern = "repack"; rep.gx = (p.W * p.H * (NR_REPACK_VEC ? p.C / 16u : p.C) + 63) / 64;
                 rep.gy = rep.gz = 1; rep.push.resize(sizeof p);
@@ -3762,21 +3929,21 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         // NR_REPACK_FOLD: the last ViT projection stores at the tile
         // positions the inverse repack would move its raster tokens to.
         bool out_folded = false;
-        if (NR_REPACK_FOLD && host_boundary && s.block == 38 && s.layer == 4 && d.kern == "gemmproj" &&
+        if (NR_REPACK_FOLD && host_boundary && s.block == vit_last && s.layer == vit_last_layer && d.kern == "gemmproj" &&
             s.W % 4 == 0 && s.H % 4 == 0 && !flag(argc, argv, "--no-repack-fold") &&
             !slot_reading_diagnostic(argc, argv)) {
             PushGemm q{};
             std::memcpy(&q, d.push.data(), sizeof q);
-            q.o_off = uint32_t(voff[ups_key(38)]);
+            q.o_off = uint32_t(voff[ups_key(vit_last)]);
             q.W = uint32_t(s.H); q.rows = uint32_t(s.W);   // as the repack (see b031l0)
             std::memcpy(d.push.data(), &q, sizeof q);
             d.kern = "gemmprojt";
             out_folded = true;
         }
         disp.push_back(std::move(d));
-        if (host_boundary && s.block == 38 && s.layer == 4 && !out_folded) {
+        if (host_boundary && s.block == vit_last && s.layer == vit_last_layer && !out_folded) {
             Disp rep{&s};
-            PushRepack p{uint32_t(voff[key_of(38,4)]), uint32_t(voff[ups_key(38)]),
+            PushRepack p{uint32_t(voff[key_of(vit_last,vit_last_layer)]), uint32_t(voff[ups_key(vit_last)]),
                          uint32_t(s.H), uint32_t(s.W), 1024, 1};
             rep.kern = "repack"; rep.gx = (p.W * p.H * (NR_REPACK_VEC ? p.C / 16u : p.C) + 63) / 64;
             rep.gy = rep.gz = 1; rep.push.resize(sizeof p);
@@ -3790,6 +3957,19 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         for (Disp& d : disp) d.lo = d.hi = position.at(d.s);
     }
     timer.mark("weights-unpack");
+    // Everything before this point is weights, at offsets no working extent changes; the noise field and the
+    // records below depend on the extent (GraphCore, the resize path).
+    weights_end = wblob.size();
+    if (noise_disp >= 0) {
+        NoiseJob& j = g_noise_jobs.back();
+        j.off = uint32_t(wblob.append_zeros(size_t(j.width) * j.height * 8u, 256) / 4);
+        if (!j.off) throw std::runtime_error("noise field at offset 0");
+        Disp& pre = disp[size_t(noise_disp)];
+        PushPreImage ip{};
+        std::memcpy(&ip, pre.push.data() + sizeof(PushFSwin), sizeof ip);
+        ip.noise_off = j.off;
+        std::memcpy(pre.push.data() + sizeof(PushFSwin), &ip, sizeof ip);
+    }
     if (!arena_probe && nr::g_memory_note) nr::logf("weights read; %s", nr::g_memory_note().c_str());
 #if NR_INT4
     // --int4-weights-out <file>: the install-time generator (dlssnr-amd/model-tools/dlssnr-int4-weights). Every int4
@@ -3988,7 +4168,9 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                            fp(disp[j + 1]).tiles_y == fp(disp[i]).tiles_y &&
                            fp(disp[j + 1]).x_off == fp(disp[j]).o_off)
                         ++j;
-                if (j == i) { out.push_back(std::move(disp[i])); i = j + 1; continue; }
+                // One plain layer is a run too when a DS or UPS folds into it (the small
+                // model has one plain layer a level); a lone plain layer stays as it is.
+                const bool short_run = j == i;
                 // The fused downsample that follows the run joins it as
                 // its last layer - same body, same tiles, the DS epilogue behind
                 // a wave-uniform branch in the shader.
@@ -4013,6 +4195,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                     fp(out.back()).tiles_x == fp(disp[i]).tiles_x &&
                     fp(out.back()).tiles_y == fp(disp[i]).tiles_y &&
                     fp(out.back()).o_off == fp(disp[i]).x_off;
+                if (short_run && !ds_fold && !up_fold) { out.push_back(std::move(disp[i])); i = i + 1; continue; }
                 Disp up_disp{disp[i].s};
                 if (up_fold) { up_disp = std::move(out.back()); out.pop_back(); }
                 std::vector<const Disp*> lay;
@@ -4615,181 +4798,160 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         tc_expect.resize(kept);
     }
 
+    arena_total = act_total;
     // ---- device ------------------------------------------------------------
-    if (!ctx.device) ctx.create();
-    std::printf("GPU    %s\n", ctx.gpu_name.c_str());
-    // Every pipeline this build creates, kept across runs. Empty path: no cache,
-    // which is what the kernel benches want.
-    if (const char* cache_path = arg(argc, argv, "--pipeline-cache"))
-        if (*cache_path) ctx.load_pipeline_cache(cache_path);
-    // Announced before it is asked for, not after it is got. These two are the
-    // allocations a build dies on, and until now a game's log simply stopped at
-    // the line before them with no number in it.
-    nr::logf("allocating arenas: activation %.1f MB, weights %.1f MB",
-             double(act_total) / 1e6, double(wblob.size()) / 1e6);
-    // NR_PROF (diagnostic): a word region after the arena for in-kernel
-    // clock records; shaders built with -DNR_PROF_OFF=<printed offset>.
-    g_prof_words = std::getenv("NR_PROF") ? size_t(std::atoll(std::getenv("NR_PROF"))) : 0;
-    size_t& prof_words = g_prof_words; size_t& prof_off = g_prof_off;
-    if (prof_words) {
-        act_total = align(act_total, 256);
-        prof_off = act_total / 4;
-        // A fixed offset (NR_PROF_AT, words) so one SPV set serves every host configuration.
-        if (const char* at = std::getenv("NR_PROF_AT")) {
-            const size_t want = size_t(std::atoll(at));
-            if (want < prof_off) throw std::runtime_error("NR_PROF_AT inside the arena");
-            prof_off = want; act_total = want * 4;
-        }
-        act_total += align(prof_words * 4, 256);
-        std::printf("NR_PROF region: word offset %zu, %zu words\n", prof_off, prof_words);
-    }
-    act = ctx.buffer(act_total, false, /*device_address=*/true); wgt = ctx.buffer(wblob.size());
-    // vit_attn.comp NR_VBDA reads V through a buffer_reference: the arena's address goes into
-    // every vitattn push block (PushVAttn::act_lo/act_hi).
-    nr::logf("[nr] activation arena through its device address: %s",
-             act.address ? "yes" : "no (the storage-buffer builds, g_*nobda.spv)");
-    if (act.address)
-        for (Disp& d : disp) {
-            const uint32_t lohi[2] = {uint32_t(act.address), uint32_t(act.address >> 32)};
-            if (d.kern == "vitattn" && d.push.size() >= sizeof(PushVAttn))
-                std::memcpy(d.push.data() + offsetof(PushVAttn, act_lo), lohi, sizeof lohi);
-            else if (gemm_push_kern(d.kern) && d.push.size() >= sizeof(PushGemm))
-                std::memcpy(d.push.data() + offsetof(PushGemm, act_lo), lohi, sizeof lohi);
-        }
-    // **The network's outside edge**: one sampled image in, two storage images
-    // out. Sized from the two adapter layers' own plan rows; the extent columns
-    // are (H, W) in that order, which is the transposition the gold capture
-    // records for +208/+212.
-    for (const Step& s2 : plan) {
-        if (s2.type == "CCTinlayoutFusedPreBlockSwin1H") { in_w = uint32_t(s2.H); in_h = uint32_t(s2.W); }
-        // The post block's plan row carries its *input* level, and it doubles.
-        if (s2.type == "CCTinlayoutFusedPostBlockSwin1H") { out_w = uint32_t(2 * s2.H); out_h = uint32_t(2 * s2.W); }
-    }
-    const int source_w=std::atoi(arg(argc, argv, "--source-width", "0"));
-    const int source_h=std::atoi(arg(argc, argv, "--source-height", "0"));
-    if (arg(argc,argv,"--source-width") || arg(argc,argv,"--source-height")) {
-        if (source_w <= 0 || source_h <= 0 || uint32_t(source_w)>in_w || uint32_t(source_h)>in_h) {
-            std::fprintf(stderr,"source extent must be positive and fit inside the working extent\n");
-            return 1;
-        }
-        std::printf("native working extent %ux%u; source/output %dx%d\n",in_w,in_h,source_w,source_h);
-        in_w=out_w=uint32_t(source_w);in_h=out_h=uint32_t(source_h);
-    }
-    // `--tex-in-format N` (the runtime, one pass at the frame's own extent): the
-    // input image in the caller's format, filled by a plain copy each frame.
-    // Every kernel samples it, and sampling converts exactly as the blit into
-    // RGBA32F did, so the network sees the same values for a quarter of the
-    // bytes. Nothing writes it as storage on that path.
-    const VkFormat tex_in_format = arg(argc, argv, "--tex-in-format")
-        ? VkFormat(std::atoi(arg(argc, argv, "--tex-in-format"))) : VK_FORMAT_R32G32B32A32_SFLOAT;
-    tex_in =
-        ctx.image(std::max(in_w, 1u), std::max(in_h, 1u),
-                  tex_in_format, true, true, tex_in_format == VK_FORMAT_R32G32B32A32_SFLOAT);
-    // `--out0-format N` (the runtime, native compose, one pass): the post
-    // block's answer image in the frame's own format, so the write-back is a
-    // copy. Only formats whose store converts exactly as the write-back blit
-    // did (nr_runtime.cpp); --out-image cannot read such an image back.
-    const VkFormat out0_format = arg(argc, argv, "--out0-format")
-        ? VkFormat(std::atoi(arg(argc, argv, "--out0-format"))) : VK_FORMAT_R32G32B32A32_SFLOAT;
-    surf0 =
-        ctx.image(std::max(out_w, 1u), std::max(out_h, 1u),
-                  out0_format, false);
-    surf1 =
-        ctx.image(std::max(out_w, 1u), std::max(out_h, 1u),
-                  VK_FORMAT_R32G32B32A32_SFLOAT, false);
-    nr::logf("images in %ux%u, out %ux%u (x2)", in_w, in_h, out_w, out_h);
-    timer.mark("arena-alloc");
-    nr::g_build_stage = 3;
-    // A frame to sample. `--in-image` takes an RGBA32F blob; without one the
-    // input is a gradient, which is enough to see the pipeline carry data and
-    // is *not* enough to call the result an image - the gate check applies.
-    {
-        // Written a band of rows at a time (nrvk::Context::image_rows): the
-        // frame is never held whole in host or mapped memory. The runtime
-        // overwrites this image every frame.
-        const uint32_t w = std::max(in_w, 1u), h = std::max(in_h, 1u);
-        const std::vector<uint8_t> blob = slurp(arg(argc, argv, "--in-image", ""));
-        const size_t floats = size_t(w) * h * 4;
-        if (arg(argc, argv, "--in-image") && blob.size() != floats * 4) {
-            std::fprintf(stderr, "input image has %zu bytes; plan requires %zu (%ux%u RGBA32F)\n",
-                         blob.size(), floats * 4, in_w, in_h);
-            return 1;
-        }
-        // one row of the RGBA32F picture: the blob, or a gradient (enough to
-        // see the pipeline carry data, *not* enough to call the result an image)
-        auto row_f32 = [&](uint32_t y, float* q) {
-            if (!blob.empty()) { std::memcpy(q, blob.data() + size_t(y) * w * 16, size_t(w) * 16); return; }
-            for (uint32_t x = 0; x < w; ++x, q += 4) {
-                if (y >= in_h || x >= in_w) { q[0] = q[1] = q[2] = q[3] = 0.0f; continue; }
-                q[0] = float(x) / float(in_w ? in_w : 1);
-                q[1] = float(y) / float(in_h ? in_h : 1);
-                q[2] = 0.5f; q[3] = 1.0f;
+    // A plan (GraphCore, the resize path) stops short of it: the lowering and the weight blob's extent tail are
+    // all it keeps, for a network memory (GraphSlot) that already holds the weights.
+    if (!plan_only) {
+        if (!ctx.device) ctx.create();
+        std::printf("GPU    %s\n", ctx.gpu_name.c_str());
+        // Every pipeline this build creates, kept across runs. Empty path: no cache,
+        // which is what the kernel benches want.
+        if (const char* cache_path = arg(argc, argv, "--pipeline-cache"))
+            if (*cache_path) ctx.load_pipeline_cache(cache_path);
+        // Announced before it is asked for, not after it is got. These two are the
+        // allocations a build dies on, and until now a game's log simply stopped at
+        // the line before them with no number in it.
+        nr::logf("allocating arenas: activation %.1f MB, weights %.1f MB",
+                 double(act_total) / 1e6, double(wblob.size()) / 1e6);
+        // NR_PROF (diagnostic): a word region after the arena for in-kernel
+        // clock records; shaders built with -DNR_PROF_OFF=<printed offset>.
+        g_prof_words = std::getenv("NR_PROF") ? size_t(std::atoll(std::getenv("NR_PROF"))) : 0;
+        size_t& prof_words = g_prof_words; size_t& prof_off = g_prof_off;
+        if (prof_words) {
+            act_total = align(act_total, 256);
+            prof_off = act_total / 4;
+            // A fixed offset (NR_PROF_AT, words) so one SPV set serves every host configuration.
+            if (const char* at = std::getenv("NR_PROF_AT")) {
+                const size_t want = size_t(std::atoll(at));
+                if (want < prof_off) throw std::runtime_error("NR_PROF_AT inside the arena");
+                prof_off = want; act_total = want * 4;
             }
-        };
-        if (tex_in_format == VK_FORMAT_R32G32B32A32_SFLOAT)
-            ctx.image_rows(tex_in, VkDeviceSize(floats) * 4, true, [&](uint32_t y0, uint32_t n, uint8_t* stage) {
-                for (uint32_t y = y0; y < y0 + n; ++y)
-                    row_f32(y, reinterpret_cast<float*>(stage + size_t(y - y0) * w * 16));
-            });
-        else if (tex_in_format == VK_FORMAT_B8G8R8A8_UNORM || tex_in_format == VK_FORMAT_R8G8B8A8_UNORM) {
-            // The same picture as an 8-bit frame, for checking the runtime's
-            // 8-bit input path from the command line (--in-image on k/255).
-            std::vector<float> line(size_t(w) * 4);
-            ctx.image_rows(tex_in, VkDeviceSize(floats), true, [&](uint32_t y0, uint32_t n, uint8_t* stage) {
-                for (uint32_t y = y0; y < y0 + n; ++y) {
-                    row_f32(y, line.data());
-                    uint8_t* b8 = stage + size_t(y - y0) * w * 4;
-                    for (size_t i = 0; i < line.size(); i += 4)
-                        for (int k = 0; k < 4; ++k) {
-                            const int src = tex_in_format == VK_FORMAT_B8G8R8A8_UNORM && k < 3 ? 2 - k : k;
-                            b8[i + k] = uint8_t(std::lround(std::min(std::max(line[i + src], 0.f), 1.f) * 255.f));
-                        }
+            act_total += align(prof_words * 4, 256);
+            std::printf("NR_PROF region: word offset %zu, %zu words\n", prof_off, prof_words);
+        }
+        // Room for the plans of bigger working extents too when asked (`capacity`, by area; the resize path).
+        const size_t act_bytes = size_t(double(act_total) * std::max(1.0, capacity) + 255) / 256 * 256;
+        const size_t wgt_bytes = weights_end + size_t(double(wblob.size() - weights_end) * std::max(1.0, capacity) + 255) / 256 * 256;
+        arenas = std::make_shared<GraphArenas>();
+        act_shared = given_act && given_act->device == ctx.device && given_act->cap >= act_bytes;
+        if (act_shared) {
+            arenas->act = given_act;
+            nr::logf("activation arena: taken over from another network (%.1f MB, this one needs %.1f MB)",
+                     double(given_act->cap) / 1e6, double(act_bytes) / 1e6);
+        } else {
+            const size_t room = size_t(double(act_bytes) * std::max(1.0, act_slack) + 255) / 256 * 256;
+            auto a = std::make_shared<GraphAct>();
+            a->device = ctx.device; a->buf = ctx.buffer(room, false, /*device_address=*/true); a->cap = room;
+            arenas->act = std::move(a);
+        }
+        arenas->act_need = act_bytes;
+        act = arenas->act->buf; wgt = ctx.buffer(std::max(wgt_bytes, wblob.size()));
+        // vit_attn.comp NR_VBDA reads V through a buffer_reference: the arena's address goes into
+        // every vitattn push block (PushVAttn::act_lo/act_hi).
+        nr::logf("[nr] activation arena through its device address: %s",
+                 act.address ? "yes" : "no (the storage-buffer builds, g_*nobda.spv)");
+        put_act_address(disp, act.address);
+        arenas->device = ctx.device; arenas->wgt = wgt;
+        arenas->wgt_cap = std::max(wgt_bytes, wblob.size()); arenas->weights_end = weights_end;
+        ctx.pin = &arenas->pipelines;
+        if (!make_images(argc, argv)) return 1;
+        const VkFormat tex_in_format = tex_in.format;
+        timer.mark("arena-alloc");
+        nr::g_build_stage = 3;
+        // A frame to sample. `--in-image` takes an RGBA32F blob; without one the
+        // input is a gradient, which is enough to see the pipeline carry data and
+        // is *not* enough to call the result an image - the gate check applies.
+        {
+            // Written a band of rows at a time (nrvk::Context::image_rows): the
+            // frame is never held whole in host or mapped memory. The runtime
+            // overwrites this image every frame.
+            const uint32_t w = std::max(in_w, 1u), h = std::max(in_h, 1u);
+            const std::vector<uint8_t> blob = slurp(arg(argc, argv, "--in-image", ""));
+            const size_t floats = size_t(w) * h * 4;
+            if (arg(argc, argv, "--in-image") && blob.size() != floats * 4) {
+                std::fprintf(stderr, "input image has %zu bytes; plan requires %zu (%ux%u RGBA32F)\n",
+                             blob.size(), floats * 4, in_w, in_h);
+                return 1;
+            }
+            // one row of the RGBA32F picture: the blob, or a gradient (enough to
+            // see the pipeline carry data, *not* enough to call the result an image)
+            auto row_f32 = [&](uint32_t y, float* q) {
+                if (!blob.empty()) { std::memcpy(q, blob.data() + size_t(y) * w * 16, size_t(w) * 16); return; }
+                for (uint32_t x = 0; x < w; ++x, q += 4) {
+                    if (y >= in_h || x >= in_w) { q[0] = q[1] = q[2] = q[3] = 0.0f; continue; }
+                    q[0] = float(x) / float(in_w ? in_w : 1);
+                    q[1] = float(y) / float(in_h ? in_h : 1);
+                    q[2] = 0.5f; q[3] = 1.0f;
                 }
-            });
-        }
-    }
-    timer.mark("input-image");
-    nr::logf("uploading weights: %.1f MB through a %.0f MB staging buffer",
-             double(wblob.size()) / 1e6, double(std::min<VkDeviceSize>(wblob.size(), nrvk::Context::kStageBytes)) / 1e6);
-    ctx.upload_with(wgt, 0, wblob.size(), [&](VkDeviceSize off, VkDeviceSize n, uint8_t* dst) {
-        wblob.read(size_t(off), dst, size_t(n));
-    });
-    // The host copy is not needed again; free it before the runtime allocates.
-    wblob.clear();
-    timer.mark("weights-upload");
-    // The pre-block's noise features (NR_NOISE_FIELD): a fixed function of pixel,
-    // seed and gain, filled once here into the zeroed regions the lowering put
-    // in the weight blob, by the same GLSL the pre-block would run per frame.
-    if (!g_noise_jobs.empty()) {
-        nrvk::Kernel nk;
-        nk.create(ctx, spv_dir + "/g_noisefield.spv", {wgt.handle}, uint32_t(sizeof(NoiseJob)));
-        ctx.one_shot([&](VkCommandBuffer cmd) {
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, nk.pipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, nk.layout, 0, 1, &nk.set, 0, nullptr);
-            for (const NoiseJob& j : g_noise_jobs) {
-                vkCmdPushConstants(cmd, nk.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof j, &j);
-                vkCmdDispatch(cmd, (j.width + 7u) / 8u, (j.height + 7u) / 8u, 1);
+            };
+            if (tex_in_format == VK_FORMAT_R32G32B32A32_SFLOAT)
+                ctx.image_rows(tex_in, VkDeviceSize(floats) * 4, true, [&](uint32_t y0, uint32_t n, uint8_t* stage) {
+                    for (uint32_t y = y0; y < y0 + n; ++y)
+                        row_f32(y, reinterpret_cast<float*>(stage + size_t(y - y0) * w * 16));
+                });
+            else if (tex_in_format == VK_FORMAT_B8G8R8A8_UNORM || tex_in_format == VK_FORMAT_R8G8B8A8_UNORM) {
+                // The same picture as an 8-bit frame, for checking the runtime's
+                // 8-bit input path from the command line (--in-image on k/255).
+                std::vector<float> line(size_t(w) * 4);
+                ctx.image_rows(tex_in, VkDeviceSize(floats), true, [&](uint32_t y0, uint32_t n, uint8_t* stage) {
+                    for (uint32_t y = y0; y < y0 + n; ++y) {
+                        row_f32(y, line.data());
+                        uint8_t* b8 = stage + size_t(y - y0) * w * 4;
+                        for (size_t i = 0; i < line.size(); i += 4)
+                            for (int k = 0; k < 4; ++k) {
+                                const int src = tex_in_format == VK_FORMAT_B8G8R8A8_UNORM && k < 3 ? 2 - k : k;
+                                b8[i + k] = uint8_t(std::lround(std::min(std::max(line[i + src], 0.f), 1.f) * 255.f));
+                            }
+                    }
+                });
             }
-            VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-            mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                 0, 1, &mb, 0, nullptr, 0, nullptr);
+        }
+        timer.mark("input-image");
+        nr::logf("uploading weights: %.1f MB through a %.0f MB staging buffer",
+                 double(wblob.size()) / 1e6, double(std::min<VkDeviceSize>(wblob.size(), nrvk::Context::kStageBytes)) / 1e6);
+        ctx.upload_with(wgt, 0, wblob.size(), [&](VkDeviceSize off, VkDeviceSize n, uint8_t* dst) {
+            wblob.read(size_t(off), dst, size_t(n));
         });
-        nk.destroy();
-        timer.mark("noise-field");
-    }
+        // The extent tail is kept for the resize path (GraphCore::tail); the rest of the host copy is not needed
+        // again: free it before the runtime allocates.
+        keep_tail(wblob);
+        wblob.clear();
+        timer.mark("weights-upload");
+        // The pre-block's noise features (NR_NOISE_FIELD): a fixed function of pixel,
+        // seed and gain, filled once here into the zeroed regions the lowering put
+        // in the weight blob, by the same GLSL the pre-block would run per frame.
+        if (!g_noise_jobs.empty()) {
+            nrvk::Kernel nk;
+            nk.create(ctx, spv_dir + "/g_noisefield.spv", {wgt.handle}, uint32_t(sizeof(NoiseJob)));
+            ctx.one_shot([&](VkCommandBuffer cmd) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, nk.pipeline);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, nk.layout, 0, 1, &nk.set, 0, nullptr);
+                for (const NoiseJob& j : g_noise_jobs) {
+                    vkCmdPushConstants(cmd, nk.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof j, &j);
+                    vkCmdDispatch(cmd, (j.width + 7u) / 8u, (j.height + 7u) / 8u, 1);
+                }
+                VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                     0, 1, &mb, 0, nullptr, 0, nullptr);
+            });
+            nk.destroy();
+            timer.mark("noise-field");
+        }
 
-    // **The arena is not seeded here.** It used to be filled with a plausible
-    // activation distribution, one staged 16 MB upload at a time, because an
-    // uninitialised arena is e4m3 NaN about one byte in 128 and one of those
-    // destroys the next MMA's whole accumulator tile. Then the zero fill below
-    // was added - a single vkCmdFillBuffer over the same range, for the reason
-    // its own comment gives - and it overwrites every byte of that upload
-    // before anything reads it. So the seed was doing nothing except allocating
-    // a host-visible staging buffer, submitting and fencing once per 16 MB:
-    // 0.10 s at the 309 MB arena of a 960x640 build, and ~1.3 s at the 4.07 GB
-    // one a 4K feature asks for. Removing it is bit-identical by construction.
+        // **The arena is not seeded here.** It used to be filled with a plausible
+        // activation distribution, one staged 16 MB upload at a time, because an
+        // uninitialised arena is e4m3 NaN about one byte in 128 and one of those
+        // destroys the next MMA's whole accumulator tile. Then the zero fill below
+        // was added - a single vkCmdFillBuffer over the same range, for the reason
+        // its own comment gives - and it overwrites every byte of that upload
+        // before anything reads it. So the seed was doing nothing except allocating
+        // a host-visible staging buffer, submitting and fencing once per 16 MB:
+        // 0.10 s at the 309 MB arena of a 960x640 build, and ~1.3 s at the 4.07 GB
+        // one a 4K feature asks for. Removing it is bit-identical by construction.
+    }
     // ---- does any dispatch read and write the same slot? --------------------
     // **A layer whose output offset is its input offset is a race, not an
     // optimisation.** Every dispatch in this graph is separated from the next by
@@ -4901,184 +5063,6 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         }
     }
 #endif
-    // ---- pipelines ---------------------------------------------------------
-    // Bindings differ per shader and the buffers do not: every kernel in this
-    // project reaches both arenas through push-constant offsets, which is what
-    // lets one descriptor set per *shader* serve all of that shader's layers.
-    {
-        std::set<std::string> kinds;
-        for (const Disp& d : disp) if (!kern.count(d.kern)) kinds.insert(d.kern);
-        nr::g_build_pipes_total = uint32_t(kinds.size()); nr::g_build_pipes_done = 0; nr::g_build_stage = 4;
-    }
-    for (const Disp& d : disp) {
-        if (kern.count(d.kern)) continue;
-        struct Tick { ~Tick() { ++nr::g_build_pipes_done; } } tick;
-        std::string p = spv_dir + "/g_" + d.kern + ".spv";
-        // The Windows network's vitattn and residual GEMMs read through the arena's device
-        // address (NR_VBDA, NR_RBDA); a device without bufferDeviceAddress runs the
-        // storage-buffer build of the same kernel, g_<name>nobda.spv.
-        if (!act.address) {
-            const std::string plain = spv_dir + "/g_" + d.kern + "nobda.spv";
-            if (std::ifstream(plain).good()) p = plain;
-        }
-        if (d.kern.rfind("fswindsp",0)==0)
-            kern[d.kern].create(ctx,p,{act.handle,act.handle,wgt.handle,wgt.handle,wgt.handle,act.handle},
-                                sizeof(PushFSwin)+sizeof(PushDsProj) + (NR_TCHAIN_TILES && tchain_kern(d.kern) ? 4 : 0));
-        else if (d.kern.rfind("fswinimagepreds32",0)==0)
-            kern[d.kern].create(ctx,p,{act.handle,act.handle,wgt.handle,wgt.handle,wgt.handle,act.handle},
-                                sizeof(PushFSwin)+sizeof(PushPreImage),{&tex_in});
-        else if (d.kern=="fswinimagepost32")
-            kern[d.kern].create(ctx,p,{act.handle,act.handle,wgt.handle,wgt.handle,wgt.handle},
-                                sizeof(PushFSwin)+sizeof(PushUps)+sizeof(PushImageTail),
-                                {&surf0,&surf1,&tex_in});
-        else if (d.kern.rfind("fswinfusedup",0)==0)
-            kern[d.kern].create(ctx,p,{act.handle,act.handle,wgt.handle,wgt.handle,wgt.handle},
-                                uint32_t(d.push.size()));
-        else if (d.kern=="fswinblendpost32")
-            kern[d.kern].create(ctx,p,{act.handle,act.handle,wgt.handle,wgt.handle,wgt.handle},
-                                sizeof(PushFSwin)+sizeof(PushUps));
-        else if (is_persist_kern(d.kern))
-            kern[d.kern].create(ctx, p, {act.handle, act.handle, wgt.handle,
-                                         wgt.handle, wgt.handle, act.handle},
-                                sizeof(PushPersist) + (NR_TCHAIN_TILES && tchain_kern(d.kern) ? 4 : 0));
-        else if (d.kern.rfind("fswin", 0) == 0)
-            kern[d.kern].create(ctx, p, {act.handle, act.handle, wgt.handle,
-                                         wgt.handle, wgt.handle, act.handle},
-                                sizeof(PushFSwin) + (NR_TCHAIN_TILES && tchain_kern(d.kern) ? 4 : 0));
-        else if (d.kern.rfind("pool", 0) == 0)
-            kern[d.kern].create(ctx, p, {act.handle}, sizeof(PushPool));
-        else if (d.kern == "decups")
-            kern[d.kern].create(ctx, p, {act.handle, act.handle, wgt.handle}, sizeof(PushDecoderUps));
-        else if (d.kern == "qkvnorm")
-            kern[d.kern].create(ctx, p, {act.handle, act.handle, wgt.handle}, sizeof(PushQkvNorm));
-        else if (d.kern == "repack")
-            kern[d.kern].create(ctx, p, {act.handle}, sizeof(PushRepack));
-        else if (d.kern == "upsview")
-            kern[d.kern].create(ctx, p, {act.handle}, sizeof(PushUpsView));
-        else if (d.kern.rfind("imgin", 0) == 0)
-            kern[d.kern].create(ctx, p, {act.handle, wgt.handle}, sizeof(PushImgIn),
-                                {&tex_in});
-        else if (d.kern.rfind("imgout", 0) == 0)
-            kern[d.kern].create(ctx, p, {act.handle, wgt.handle}, sizeof(PushImgOut),
-                                {&surf0, &surf1, &tex_in});
-        else if (d.kern == "vitattn")
-            kern[d.kern].create(ctx, p, {act.handle, wgt.handle, act.handle},
-                                sizeof(PushVAttn) + (g_chain_kern.count(d.kern) ? 16 : 0) + (NR_TCHAIN_TILES ? 4 : 0));
-        else if (d.kern.rfind("upsblend", 0) == 0)
-            kern[d.kern].create(ctx, p, {act.handle, wgt.handle}, sizeof(PushUps));
-        else if (NR_KBASE(d.kern) == "attn")
-            kern[d.kern].create(ctx, p, {act.handle, act.handle, wgt.handle,
-                                         wgt.handle, act.handle}, sizeof(PushAttn) + (g_chain_kern.count(d.kern) ? 16 : 0) + (NR_TCHAIN_TILES ? 4 : 0));
-        else if (d.kern == "ffwd3" || d.kern == "ffwd3w")
-            kern[d.kern].create(ctx, p, {act.handle, act.handle, act.handle,
-                                         wgt.handle, wgt.handle, act.handle},
-                                sizeof(PushFfwd3) + (g_chain_kern.count(d.kern) ? 16 : 0) + (NR_TCHAIN_TILES ? 4 : 0));
-        else
-            kern[d.kern].create(ctx, p, {act.handle, act.handle, act.handle, wgt.handle,
-                                         wgt.handle, act.handle, wgt.handle, act.handle},
-                                sizeof(PushGemm) + (g_chain_kern.count(d.kern) ? 16 : 0) +
-                                (NR_TCHAIN_TILES && tchain_kern(d.kern) ? 4 : 0));
-    }
-    for (const Disp& d : disp)   // a push longer than its pipeline's range reads garbage past the end
-        if (kern.count(d.kern) && d.push.size() > kern.at(d.kern).push_range)
-            throw std::runtime_error("push constants longer than the pipeline's range: " + d.kern);
-    const size_t cache_bytes = ctx.save_pipeline_cache();
-    timer.mark("pipelines");
-    nr::g_build_stage = 5;
-    if (nr::g_memory_note) nr::logf("pipelines created; %s", nr::g_memory_note().c_str());
-    // `--wiring` prints what each dispatch reads and writes. A producer and a
-    // consumer that disagree about a slot is invisible to the seeded board,
-    // because the seeder writes the gold into the producer's slot and the
-    // consumer is then the only one that notices.
-    if (flag(argc, argv, "--wiring")) {
-        std::printf("%-8s %-34s %12s %12s\n", "layer", "kernel", "reads", "writes");
-        for (const Disp& d : disp) {
-            const Step& s2 = *d.s;
-            std::printf("b%03dl%d %-34s %12u %12u\n", s2.block, s2.layer,
-                        d.kern.c_str(),
-                        d.push.size() >= 8 ? *reinterpret_cast<const uint32_t*>(d.push.data() + 0) : 0u,
-                        d.push.size() >= 8 ? *reinterpret_cast<const uint32_t*>(d.push.data() + 4) : 0u);
-        }
-    }
-    runner.create(ctx);
-    // **Zero the activation arena, which nothing ever did.** `Runner` has had
-    // the field since the arena was introduced and no caller ever set it, so
-    // every slot's unwritten tail held whatever the driver last left there.
-    // That tail is not small in consequence: a layer's slot is sized for the
-    // *padded* token count and the kernels address only the unpadded image, so
-    // 3840 of b001's 522240 tokens - 0.74% - were stale, and the next layer's
-    // windowed attention mixes them straight into its own output. Seeded, the
-    // gold overwrote them and every layer scored 0.99; chained, `b002` fell to
-    // **-0.29 from a 0.998-correct input**, and the whole frame followed.
-    // NVIDIA's own capture has those 3840 tokens at **exactly zero**.
-    // **Once, here, and then off.** `run_graph` records the fill at the top of
-    // its command buffer, so leaving it armed would wipe the seeds that
-    // `--seed-dir` uploads after `build` returns - which reads as "every layer
-    // is exactly zero". Fill now, disarm, and every later submit keeps what the
-    // seeder put there.
-    runner.zero_buffer = act.handle;
-    runner.zero_bytes = VkDeviceSize(act_total);
-    // **What arena reuse has to keep zero** (diagnostics, off unless asked for,
-    // one-value-one-slot layout). NR_ARENA_UNWRITTEN=1 fills the values with a
-    // pattern, runs one frame and lists every slot's bytes that were never
-    // written; NR_POISON_KEYS=k1,k2|all starts those slots non-zero, so an
-    // output that changes names a slot whose unwritten bytes are read. That is
-    // how `overread` was found - rerun both after changing a kernel's padding.
-    if (std::getenv("NR_ARENA_UNWRITTEN")) {
-        std::vector<nrvk::Runner::Step> all;
-        for (const Disp& d : disp) all.push_back({&kern[d.kern], d.gx, d.gy, d.gz, d.push.data(), uint32_t(d.push.size())});
-        // Values only: the persistent runs' sync words past them must start at zero.
-        runner.poison.push_back({0, VkDeviceSize(values_end)});
-        runner.poison_value = 0xA5A5A5A5u;
-        runner.run_graph(all, 1);
-        runner.poison.clear();
-        runner.poison_value = 0x3C3C3C3Cu;
-        std::vector<uint32_t> w(act_total / 4);
-        ctx.download(act, 0, w.data(), w.size() * 4);
-        if (!gaps.empty()) {
-            const size_t gap = size_t(std::atoll(std::getenv("NR_ARENA_GAP")));
-            for (size_t g = 0; g < gaps.size(); ++g) {
-                size_t hit = 0, last = 0;
-                for (size_t i = 0; i < gap / 4; ++i)
-                    if (w[gaps[g].second / 4 + i] != 0xA5A5A5A5u) { ++hit; last = i * 4 + 3; }
-                if (hit) std::printf("gap %zu after key %d (b%d/%d) written: %zu words, up to +%zu\n", g,
-                                     gaps[g].first, gaps[g].first / 8, gaps[g].first % 8, hit, last);
-            }
-        }
-        for (const auto& kv : vsize) {
-            if (!kv.second || !voff.count(kv.first)) continue;
-            const size_t o = voff.m.at(kv.first) / 4, n = kv.second / 4;
-            size_t cnt = 0, first = n, last = 0, runs = 0; bool in = false;
-            for (size_t i = 0; i < n; ++i) {
-                const bool u = w[o + i] == 0xA5A5A5A5u;
-                if (u) { ++cnt; first = std::min(first, i); last = i; if (!in) ++runs; }
-                in = u;
-            }
-            if (cnt) std::printf("unwritten key %d (b%d/%d) size %zu: %zu bytes in %zu runs, first %zu last %zu\n",
-                                 kv.first, kv.first / 8, kv.first % 8, kv.second, cnt * 4, runs, first * 4, last * 4 + 3);
-        }
-        std::fflush(stdout);
-    }
-    if (const char* pg = std::getenv("NR_POISON_GAPS")) {
-        const size_t gap = size_t(std::atoll(std::getenv("NR_ARENA_GAP")));
-        const std::string sel = std::string(",") + pg + ",";
-        for (size_t g = 0; g < gaps.size(); ++g)
-            if (sel == ",all," || sel.find("," + std::to_string(g) + ",") != std::string::npos)
-                runner.poison.push_back({gaps[g].second, gap});
-    }
-    if (const char* pk = std::getenv("NR_POISON_KEYS")) {
-        std::istringstream is(pk); std::string t;
-        if (std::string(pk) == "all") { for (const auto& kv : vsize) if (kv.second && voff.count(kv.first)) runner.poison.push_back({voff.m.at(kv.first), align(kv.second, 4)}); }
-        else while (std::getline(is, t, ',')) if (!t.empty()) {
-            const int k = std::atoi(t.c_str());
-            if (voff.count(k) && vsize.count(k) && vsize.at(k))
-                runner.poison.push_back({voff.m.at(k), align(vsize.at(k), 4)});
-        }
-    }
-    runner.run_graph({}, 1);
-    runner.poison.clear();
-    runner.zero_buffer = VK_NULL_HANDLE;
-    runner.zero_bytes = 0;
     // One pass of the graph a submit. A pass is a few milliseconds, which is
     // under a display frame, so the compositor is never blocked for longer than
     // that however many passes are asked for - and the GPU still boosts, because
@@ -5178,6 +5162,121 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         if (runner.no_barrier_after.size() != disp.size()) runner.no_barrier_after.assign(disp.size(), 0);
         for (size_t i = 0; i < disp.size(); ++i) if (g_tc_nobar[i]) runner.no_barrier_after[i] = 1;
     }
+    // A plan ends here (the resize path): what it lowered, for build_shared.
+    if (plan_only) {
+        keep_tail(wblob);
+        core = make_core(argc, argv, spv_dir);
+        return 4;
+    }
+    // ---- pipelines ---------------------------------------------------------
+    // Bindings differ per shader and the buffers do not: every kernel in this
+    // project reaches both arenas through push-constant offsets, which is what
+    // lets one descriptor set per *shader* serve all of that shader's layers.
+    {
+        std::set<std::string> kinds;
+        for (const Disp& d : disp) if (!kern.count(d.kern)) kinds.insert(d.kern);
+        nr::g_build_pipes_total = uint32_t(kinds.size()); nr::g_build_pipes_done = 0; nr::g_build_stage = 4;
+    }
+    create_kernels(spv_dir, g_chain_kern);
+    const size_t cache_bytes = ctx.save_pipeline_cache();
+    timer.mark("pipelines");
+    nr::g_build_stage = 5;
+    if (nr::g_memory_note) nr::logf("pipelines created; %s", nr::g_memory_note().c_str());
+    // `--wiring` prints what each dispatch reads and writes. A producer and a
+    // consumer that disagree about a slot is invisible to the seeded board,
+    // because the seeder writes the gold into the producer's slot and the
+    // consumer is then the only one that notices.
+    if (flag(argc, argv, "--wiring")) {
+        std::printf("%-8s %-34s %12s %12s\n", "layer", "kernel", "reads", "writes");
+        for (const Disp& d : disp) {
+            const Step& s2 = *d.s;
+            std::printf("b%03dl%d %-34s %12u %12u\n", s2.block, s2.layer,
+                        d.kern.c_str(),
+                        d.push.size() >= 8 ? *reinterpret_cast<const uint32_t*>(d.push.data() + 0) : 0u,
+                        d.push.size() >= 8 ? *reinterpret_cast<const uint32_t*>(d.push.data() + 4) : 0u);
+        }
+    }
+    runner.create(ctx);
+    // **Zero the activation arena, which nothing ever did.** `Runner` has had
+    // the field since the arena was introduced and no caller ever set it, so
+    // every slot's unwritten tail held whatever the driver last left there.
+    // That tail is not small in consequence: a layer's slot is sized for the
+    // *padded* token count and the kernels address only the unpadded image, so
+    // 3840 of b001's 522240 tokens - 0.74% - were stale, and the next layer's
+    // windowed attention mixes them straight into its own output. Seeded, the
+    // gold overwrote them and every layer scored 0.99; chained, `b002` fell to
+    // **-0.29 from a 0.998-correct input**, and the whole frame followed.
+    // NVIDIA's own capture has those 3840 tokens at **exactly zero**.
+    // **Once, here, and then off.** `run_graph` records the fill at the top of
+    // its command buffer, so leaving it armed would wipe the seeds that
+    // `--seed-dir` uploads after `build` returns - which reads as "every layer
+    // is exactly zero". Fill now, disarm, and every later submit keeps what the
+    // seeder put there.
+    runner.zero_buffer = act.handle;
+    runner.zero_bytes = VkDeviceSize(act_total);
+    // **What arena reuse has to keep zero** (diagnostics, off unless asked for,
+    // one-value-one-slot layout). NR_ARENA_UNWRITTEN=1 fills the values with a
+    // pattern, runs one frame and lists every slot's bytes that were never
+    // written; NR_POISON_KEYS=k1,k2|all starts those slots non-zero, so an
+    // output that changes names a slot whose unwritten bytes are read. That is
+    // how `overread` was found - rerun both after changing a kernel's padding.
+    if (std::getenv("NR_ARENA_UNWRITTEN")) {
+        std::vector<nrvk::Runner::Step> all;
+        for (const Disp& d : disp) all.push_back({&kern[d.kern], d.gx, d.gy, d.gz, d.push.data(), uint32_t(d.push.size())});
+        // Values only: the persistent runs' sync words past them must start at zero.
+        runner.poison.push_back({0, VkDeviceSize(values_end)});
+        runner.poison_value = 0xA5A5A5A5u;
+        runner.run_graph(all, 1);
+        runner.poison.clear();
+        runner.poison_value = 0x3C3C3C3Cu;
+        std::vector<uint32_t> w(act_total / 4);
+        ctx.download(act, 0, w.data(), w.size() * 4);
+        if (!gaps.empty()) {
+            const size_t gap = size_t(std::atoll(std::getenv("NR_ARENA_GAP")));
+            for (size_t g = 0; g < gaps.size(); ++g) {
+                size_t hit = 0, last = 0;
+                for (size_t i = 0; i < gap / 4; ++i)
+                    if (w[gaps[g].second / 4 + i] != 0xA5A5A5A5u) { ++hit; last = i * 4 + 3; }
+                if (hit) std::printf("gap %zu after key %d (b%d/%d) written: %zu words, up to +%zu\n", g,
+                                     gaps[g].first, gaps[g].first / 8, gaps[g].first % 8, hit, last);
+            }
+        }
+        for (const auto& kv : vsize) {
+            if (!kv.second || !voff.count(kv.first)) continue;
+            const size_t o = voff.m.at(kv.first) / 4, n = kv.second / 4;
+            size_t cnt = 0, first = n, last = 0, runs = 0; bool in = false;
+            for (size_t i = 0; i < n; ++i) {
+                const bool u = w[o + i] == 0xA5A5A5A5u;
+                if (u) { ++cnt; first = std::min(first, i); last = i; if (!in) ++runs; }
+                in = u;
+            }
+            if (cnt) std::printf("unwritten key %d (b%d/%d) size %zu: %zu bytes in %zu runs, first %zu last %zu\n",
+                                 kv.first, kv.first / 8, kv.first % 8, kv.second, cnt * 4, runs, first * 4, last * 4 + 3);
+        }
+        std::fflush(stdout);
+    }
+    if (const char* pg = std::getenv("NR_POISON_GAPS")) {
+        const size_t gap = size_t(std::atoll(std::getenv("NR_ARENA_GAP")));
+        const std::string sel = std::string(",") + pg + ",";
+        for (size_t g = 0; g < gaps.size(); ++g)
+            if (sel == ",all," || sel.find("," + std::to_string(g) + ",") != std::string::npos)
+                runner.poison.push_back({gaps[g].second, gap});
+    }
+    if (const char* pk = std::getenv("NR_POISON_KEYS")) {
+        std::istringstream is(pk); std::string t;
+        if (std::string(pk) == "all") { for (const auto& kv : vsize) if (kv.second && voff.count(kv.first)) runner.poison.push_back({voff.m.at(kv.first), align(kv.second, 4)}); }
+        else while (std::getline(is, t, ',')) if (!t.empty()) {
+            const int k = std::atoi(t.c_str());
+            if (voff.count(k) && vsize.count(k) && vsize.at(k))
+                runner.poison.push_back({voff.m.at(k), align(vsize.at(k), 4)});
+        }
+    }
+    // An arena another network holds may be in use by its frames now: it is zeroed in the stream instead, by the first
+    // recording (retarget), after them.
+    if (!act_shared) runner.run_graph({}, 1);
+    runner.poison.clear();
+    runner.zero_buffer = VK_NULL_HANDLE;
+    runner.zero_bytes = 0;
     // Diagnostic NR_DUP=k1,k2: run those kernels twice back to back (idempotent
     // layers only), so the second copy shows the kernel with warm caches.
     const std::string dupk = std::getenv("NR_DUP") ? std::string(",") + std::getenv("NR_DUP") + "," : "";
@@ -5188,9 +5287,300 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             steps.push_back(steps.back());
     }
     timer.mark("arena-zero");
+    {   // what a build at another source extent of this working extent takes over (GraphCore)
+        auto c = std::const_pointer_cast<GraphCore>(make_core(argc, argv, spv_dir));
+        c->arenas = arenas;
+        arenas->weights_hash = c->weights_hash;
+        arenas->loaded = c->id;   // uploaded and noise-filled above
+        // zeroed above; a taken arena is left alone (another network's frames may use it): this new plan's id was never
+        // loaded there, so the first recording zeroes it
+        if (!act_shared) arenas->act->loaded = c->id;
+        core = std::move(c);
+    }
     nr::logf("[nr] graph build %.2fs: %s(%u pipelines, %.1f MB of pipeline cache)",
              timer.total(), timer.text().c_str(), unsigned(kern.size()),
              double(cache_bytes) / 1e6);
+    return 0;
+}
+
+void NrSession::keep_tail(const WeightBlob& wblob) {
+    tail.assign(wblob.size() > weights_end ? wblob.size() - weights_end : 0, 0);
+    if (!tail.empty()) wblob.read(weights_end, tail.data(), tail.size());
+    // FNV-1a over 8-byte words of the weights: the same at every working extent, or a plan cannot share them.
+    uint64_t h = 1469598103934665603ull, w = 0;
+    std::vector<uint8_t> chunk(WeightBlob::kChunk);
+    for (size_t off = 0; off < weights_end; off += chunk.size()) {
+        const size_t n = std::min(chunk.size(), weights_end - off);
+        wblob.read(off, chunk.data(), n);
+        size_t i = 0;
+        for (; i + 8 <= n; i += 8) { std::memcpy(&w, chunk.data() + i, 8); h = (h ^ w) * 1099511628211ull; }
+        for (; i < n; ++i) h = (h ^ chunk[i]) * 1099511628211ull;
+    }
+    weights_hash = h ^ weights_end;
+}
+
+std::shared_ptr<const GraphCore> NrSession::make_core(int argc, char** argv, const std::string& spv_dir) {
+    static std::atomic<uint64_t> ids{0};
+    auto c = std::make_shared<GraphCore>();
+    c->id = ++ids;
+    c->plan = plan;
+    for (const Step* p : run) c->run.push_back(int(p - plan.data()));
+    c->disp = disp;
+    for (const Disp& d : disp) c->disp_step.push_back(d.s ? int(d.s - plan.data()) : -1);
+    c->math_profile = math_profile;
+    c->persist_err = persist_err;
+    c->tc_base = tc_base; c->tc_words = tc_words; c->tc_err = tc_err; c->tc_expect = tc_expect; c->tc_pair = tc_pair;
+    c->chain_kern = g_chain_kern;
+    c->no_barrier = runner.no_barrier; c->read_barrier = runner.read_barrier; c->exec_barrier = runner.exec_barrier;
+    c->storage_barrier = runner.storage_barrier; c->inv_barrier = runner.inv_barrier;
+    c->barrier_stride = runner.barrier_stride; c->chunk = runner.chunk; c->no_barrier_after = runner.no_barrier_after;
+    c->spv_dir = spv_dir;   // the one the build read (ACO Mode: the bundle's, below)
+    c->source_w = uint32_t(std::atoi(arg(argc, argv, "--source-width", "0")));
+    c->source_h = uint32_t(std::atoi(arg(argc, argv, "--source-height", "0")));
+    c->weights_end = weights_end; c->act_total = arena_total;
+    c->weights_hash = weights_hash; c->tail = tail; c->noise = g_noise_jobs;
+    // The tail but its noise fields, for NrSession::retarget.
+    std::vector<std::pair<size_t, size_t>> skip;   // noise ranges in the tail
+    for (const NoiseJob& j : c->noise)
+        if (size_t(j.off) * 4 >= weights_end) skip.push_back({size_t(j.off) * 4 - weights_end, size_t(j.width) * j.height * 8u});
+    std::sort(skip.begin(), skip.end());
+    auto st = std::make_shared<GraphStaging>();
+    size_t at = 0, bytes = 0;
+    for (const auto& [lo, n] : skip) {
+        if (lo > at) { st->ranges.push_back({at, bytes, lo - at}); bytes += lo - at; }
+        at = std::max(at, lo + n);
+    }
+    if (tail.size() > at) { st->ranges.push_back({at, bytes, tail.size() - at}); bytes += tail.size() - at; }
+    if (bytes && ctx.device) {
+        st->device = ctx.device;
+        st->buf = ctx.buffer(bytes, true);
+        for (const VkBufferCopy& r : st->ranges)
+            std::memcpy(static_cast<uint8_t*>(st->buf.mapped) + r.dstOffset, tail.data() + r.srcOffset, r.size);
+    }
+    c->staging = std::move(st);
+    return c;
+}
+
+void NrSession::retarget(VkCommandBuffer cmd) {
+    if (!arenas || !core) return;
+    const bool zero = arenas->act->loaded != core->id, tail = arenas->loaded != core->id;
+    if (!zero && !tail) return;
+    const GraphCore& c = *core;
+    // After everything the queue ran before (the previous plan's frames read the arena and the tail).
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr,
+                         0, nullptr);
+    // The arena as a build leaves it (zero), the tail as it uploads it, the noise fields as it fills them.
+    if (zero) vkCmdFillBuffer(cmd, act.handle, 0, (VkDeviceSize(c.act_total) + 3) / 4 * 4, 0);
+    if (tail && c.staging && c.staging->buf.handle) {
+        std::vector<VkBufferCopy> r = c.staging->ranges;
+        for (VkBufferCopy& x : r) { std::swap(x.srcOffset, x.dstOffset); x.dstOffset += c.weights_end; }
+        vkCmdCopyBuffer(cmd, c.staging->buf.handle, wgt.handle, uint32_t(r.size()), r.data());
+    }
+    if (tail && !c.noise.empty()) {
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0,
+                             nullptr, 0, nullptr);
+        nrvk::Kernel& nk = arenas->noise;
+        if (!nk.device) nk.create(ctx, c.spv_dir + "/g_noisefield.spv", {wgt.handle}, uint32_t(sizeof(NoiseJob)));
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, nk.pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, nk.layout, 0, 1, &nk.set, 0, nullptr);
+        for (const NoiseJob& j : c.noise) {
+            vkCmdPushConstants(cmd, nk.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof j, &j);
+            vkCmdDispatch(cmd, (j.width + 7u) / 8u, (j.height + 7u) / 8u, 1);
+        }
+    }
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    arenas->loaded = core->id;
+    arenas->act->loaded = core->id;
+}
+
+bool NrSession::make_images(int argc, char** argv) {
+    // **The network's outside edge**: one sampled image in, two storage images
+    // out. Sized from the two adapter layers' own plan rows; the extent columns
+    // are (H, W) in that order, which is the transposition
+    // `artifacts/gold/README.txt` records for +208/+212.
+    for (const Step& s2 : plan) {
+        if (s2.type == "CCTinlayoutFusedPreBlockSwin1H") { in_w = uint32_t(s2.H); in_h = uint32_t(s2.W); }
+        // The post block's plan row carries its *input* level, and it doubles.
+        if (s2.type == "CCTinlayoutFusedPostBlockSwin1H") { out_w = uint32_t(2 * s2.H); out_h = uint32_t(2 * s2.W); }
+    }
+    const int source_w=std::atoi(arg(argc, argv, "--source-width", "0"));
+    const int source_h=std::atoi(arg(argc, argv, "--source-height", "0"));
+    if (arg(argc,argv,"--source-width") || arg(argc,argv,"--source-height")) {
+        if (source_w <= 0 || source_h <= 0 || uint32_t(source_w)>in_w || uint32_t(source_h)>in_h) {
+            std::fprintf(stderr,"source extent must be positive and fit inside the working extent\n");
+            return false;
+        }
+        std::printf("native working extent %ux%u; source/output %dx%d\n",in_w,in_h,source_w,source_h);
+        in_w=out_w=uint32_t(source_w);in_h=out_h=uint32_t(source_h);
+    }
+    // `--tex-in-format N` (the runtime, one pass at the frame's own extent): the
+    // input image in the caller's format, filled by a plain copy each frame.
+    // Every kernel samples it, and sampling converts exactly as the blit into
+    // RGBA32F did, so the network sees the same values for a quarter of the
+    // bytes. Nothing writes it as storage on that path.
+    const VkFormat tex_in_format = arg(argc, argv, "--tex-in-format")
+        ? VkFormat(std::atoi(arg(argc, argv, "--tex-in-format"))) : VK_FORMAT_R32G32B32A32_SFLOAT;
+    tex_in =
+        ctx.image(std::max(in_w, 1u), std::max(in_h, 1u),
+                  tex_in_format, true, true, tex_in_format == VK_FORMAT_R32G32B32A32_SFLOAT);
+    // `--out0-format N` (the runtime, native compose, one pass): the post
+    // block's answer image in the frame's own format, so the write-back is a
+    // copy. Only formats whose store converts exactly as the write-back blit
+    // did (nr_runtime.cpp); --out-image cannot read such an image back.
+    const VkFormat out0_format = arg(argc, argv, "--out0-format")
+        ? VkFormat(std::atoi(arg(argc, argv, "--out0-format"))) : VK_FORMAT_R32G32B32A32_SFLOAT;
+    surf0 =
+        ctx.image(std::max(out_w, 1u), std::max(out_h, 1u),
+                  out0_format, false);
+    surf1 =
+        ctx.image(std::max(out_w, 1u), std::max(out_h, 1u),
+                  VK_FORMAT_R32G32B32A32_SFLOAT, false);
+    nr::logf("images in %ux%u, out %ux%u (x2)", in_w, in_h, out_w, out_h);
+    return true;
+}
+
+void NrSession::create_kernels(const std::string& spv_dir, const std::set<std::string>& chain) {
+    for (const Disp& d : disp) {
+        if (kern.count(d.kern)) continue;
+        struct Tick { ~Tick() { ++nr::g_build_pipes_done; } } tick;
+        std::string p = spv_dir + "/g_" + d.kern + ".spv";
+        // The Windows network's vitattn and residual GEMMs read through the arena's device
+        // address (NR_VBDA, NR_RBDA); a device without bufferDeviceAddress runs the
+        // storage-buffer build of the same kernel, g_<name>nobda.spv.
+        if (!act.address) {
+            const std::string plain = spv_dir + "/g_" + d.kern + "nobda.spv";
+            if (std::ifstream(plain).good()) p = plain;
+        }
+        if (d.kern.rfind("fswindsp",0)==0)
+            kern[d.kern].create(ctx,p,{act.handle,act.handle,wgt.handle,wgt.handle,wgt.handle,act.handle},
+                                sizeof(PushFSwin)+sizeof(PushDsProj) + (NR_TCHAIN_TILES && tchain_kern(d.kern) ? 4 : 0));
+        else if (d.kern.rfind("fswinimagepreds32",0)==0)
+            kern[d.kern].create(ctx,p,{act.handle,act.handle,wgt.handle,wgt.handle,wgt.handle,act.handle},
+                                sizeof(PushFSwin)+sizeof(PushPreImage),{&tex_in});
+        else if (d.kern=="fswinimagepost32")
+            kern[d.kern].create(ctx,p,{act.handle,act.handle,wgt.handle,wgt.handle,wgt.handle},
+                                sizeof(PushFSwin)+sizeof(PushUps)+sizeof(PushImageTail),
+                                {&surf0,&surf1,&tex_in});
+        else if (d.kern.rfind("fswinfusedup",0)==0)
+            kern[d.kern].create(ctx,p,{act.handle,act.handle,wgt.handle,wgt.handle,wgt.handle},
+                                uint32_t(d.push.size()));
+        else if (d.kern=="fswinblendpost32")
+            kern[d.kern].create(ctx,p,{act.handle,act.handle,wgt.handle,wgt.handle,wgt.handle},
+                                sizeof(PushFSwin)+sizeof(PushUps));
+        else if (is_persist_kern(d.kern))
+            kern[d.kern].create(ctx, p, {act.handle, act.handle, wgt.handle,
+                                         wgt.handle, wgt.handle, act.handle},
+                                sizeof(PushPersist) + (NR_TCHAIN_TILES && tchain_kern(d.kern) ? 4 : 0));
+        else if (d.kern.rfind("fswin", 0) == 0)
+            kern[d.kern].create(ctx, p, {act.handle, act.handle, wgt.handle,
+                                         wgt.handle, wgt.handle, act.handle},
+                                sizeof(PushFSwin) + (NR_TCHAIN_TILES && tchain_kern(d.kern) ? 4 : 0));
+        else if (d.kern.rfind("pool", 0) == 0)
+            kern[d.kern].create(ctx, p, {act.handle}, sizeof(PushPool));
+        else if (d.kern == "decups")
+            kern[d.kern].create(ctx, p, {act.handle, act.handle, wgt.handle}, sizeof(PushDecoderUps));
+        else if (d.kern == "qkvnorm")
+            kern[d.kern].create(ctx, p, {act.handle, act.handle, wgt.handle}, sizeof(PushQkvNorm));
+        else if (d.kern == "repack")
+            kern[d.kern].create(ctx, p, {act.handle}, sizeof(PushRepack));
+        else if (d.kern == "upsview")
+            kern[d.kern].create(ctx, p, {act.handle}, sizeof(PushUpsView));
+        else if (d.kern.rfind("imgin", 0) == 0)
+            kern[d.kern].create(ctx, p, {act.handle, wgt.handle}, sizeof(PushImgIn),
+                                {&tex_in});
+        else if (d.kern.rfind("imgout", 0) == 0)
+            kern[d.kern].create(ctx, p, {act.handle, wgt.handle}, sizeof(PushImgOut),
+                                {&surf0, &surf1, &tex_in});
+        else if (d.kern == "vitattn")
+            kern[d.kern].create(ctx, p, {act.handle, wgt.handle, act.handle},
+                                sizeof(PushVAttn) + (chain.count(d.kern) ? 16 : 0) + (NR_TCHAIN_TILES ? 4 : 0));
+        else if (d.kern.rfind("upsblend", 0) == 0)
+            kern[d.kern].create(ctx, p, {act.handle, wgt.handle}, sizeof(PushUps));
+        else if (NR_KBASE(d.kern) == "attn")
+            kern[d.kern].create(ctx, p, {act.handle, act.handle, wgt.handle,
+                                         wgt.handle, act.handle}, sizeof(PushAttn) + (chain.count(d.kern) ? 16 : 0) + (NR_TCHAIN_TILES ? 4 : 0));
+        else if (d.kern == "ffwd3" || d.kern == "ffwd3w")
+            kern[d.kern].create(ctx, p, {act.handle, act.handle, act.handle,
+                                         wgt.handle, wgt.handle, act.handle},
+                                sizeof(PushFfwd3) + (chain.count(d.kern) ? 16 : 0) + (NR_TCHAIN_TILES ? 4 : 0));
+        else
+            kern[d.kern].create(ctx, p, {act.handle, act.handle, act.handle, wgt.handle,
+                                         wgt.handle, act.handle, wgt.handle, act.handle},
+                                sizeof(PushGemm) + (chain.count(d.kern) ? 16 : 0) +
+                                (NR_TCHAIN_TILES && tchain_kern(d.kern) ? 4 : 0));
+    }
+    for (const Disp& d : disp)   // a push longer than its pipeline's range reads garbage past the end
+        if (kern.count(d.kern) && d.push.size() > kern.at(d.kern).push_range)
+            throw std::runtime_error("push constants longer than the pipeline's range: " + d.kern);
+}
+
+// A runtime at another source extent of `share`'s working extent (GraphCore): its lowering, arenas and barriers, with
+// this build's own images, descriptor sets and pre-block source extent. Nothing is lowered, packed, allocated in the
+// arenas or uploaded, and the arena is not zeroed - it is in use.
+int NrSession::build_shared(int argc, char** argv) {
+    nr::PhaseTimer timer;
+    const GraphCore& c = *share;
+    const uint32_t sw = uint32_t(std::atoi(arg(argc, argv, "--source-width", "0")));
+    const uint32_t sh = uint32_t(std::atoi(arg(argc, argv, "--source-height", "0")));
+    // The directory build() reads: ACO Mode's bundle when it is on, the round-fp16 builds below it.
+    std::string spv_dir = arg(argc, argv, "--spv-dir", "build");
+    if (!nr::binary::directory().empty()) spv_dir = nr::binary::directory() + "/shaders";
+    if (std::string(arg(argc, argv, "--accumulation", "fp32")) == "round-fp16") spv_dir += "/round-fp16";
+    if (!sw || !sh || sh > c.source_h || spv_dir != c.spv_dir)
+        throw std::runtime_error("shared network: not this source extent's");
+    const std::shared_ptr<GraphArenas> slot = share_slot ? share_slot : c.arenas;
+    if (!slot || slot->weights_hash != c.weights_hash || slot->weights_end != c.weights_end ||
+        slot->act->cap < c.act_total || slot->wgt_cap < c.weights_end + c.tail.size())
+        throw std::runtime_error("shared network: the network memory does not fit this plan");
+    plan = c.plan;
+    run.clear();
+    for (int i : c.run) run.push_back(&plan[size_t(i)]);
+    disp = c.disp;
+    for (size_t i = 0; i < disp.size(); ++i) disp[i].s = c.disp_step[i] >= 0 ? &plan[size_t(c.disp_step[i])] : nullptr;
+    math_profile = c.math_profile;
+    persist_err = c.persist_err;
+    tc_base = c.tc_base; tc_words = c.tc_words; tc_err = c.tc_err; tc_expect = c.tc_expect; tc_pair = c.tc_pair;
+    arenas = slot; act = arenas->act->buf; wgt = arenas->wgt;
+    put_act_address(disp, act.address);   // the slot's arena, which need not be the one the core was built in
+    core = share;
+    ctx.pin = &arenas->pipelines;
+    // The pre block's source extent (as the full build writes it from --source-width/--source-height).
+    int pre = 0;
+    for (Disp& d : disp)
+        if (d.kern.rfind("fswinimagepreds32", 0) == 0 && d.push.size() >= sizeof(PushFSwin) + sizeof(PushPreImage)) {
+            PushPreImage p{};
+            std::memcpy(&p, d.push.data() + sizeof(PushFSwin), sizeof p);
+            p.source_W = sw; p.source_H = sh;
+            std::memcpy(d.push.data() + sizeof(PushFSwin), &p, sizeof p);
+            ++pre;
+        }
+    if (pre != 1) throw std::runtime_error("shared network: no pre block to give the source extent");
+    if (!ctx.device) ctx.create();
+    // Inside a recording every pipeline comes from the ones made already (Context::registry_only): no cache to read.
+    if (!ctx.registry_only)
+        if (const char* cache_path = arg(argc, argv, "--pipeline-cache"))
+            if (*cache_path) ctx.load_pipeline_cache(cache_path);
+    if (!make_images(argc, argv)) return 1;
+    timer.mark("images");
+    create_kernels(spv_dir, c.chain_kern);
+    timer.mark("pipelines");
+    runner.create(ctx);
+    runner.no_barrier = c.no_barrier; runner.read_barrier = c.read_barrier; runner.exec_barrier = c.exec_barrier;
+    runner.storage_barrier = c.storage_barrier; runner.inv_barrier = c.inv_barrier;
+    runner.barrier_stride = c.barrier_stride; runner.chunk = c.chunk; runner.no_barrier_after = c.no_barrier_after;
+    steps.clear();
+    for (const Disp& d : disp)
+        steps.push_back({&kern[d.kern], d.gx, d.gy, d.gz, d.push.data(), uint32_t(d.push.size())});
+    nr::logf("[nr] graph shared with the %ux%u build (same working extent) %.3fs: %s(%u pipelines)", c.source_w,
+             c.source_h, timer.total(), timer.text().c_str(), unsigned(kern.size()));
     return 0;
 }
 
@@ -5211,6 +5601,7 @@ int main(int argc, char** argv) try {
     auto& steps = S.steps; auto& x_src = S.x_src; auto& run = S.run;
     auto& reader_tokens = S.reader_tokens;
     auto& persist_err = S.persist_err;
+    auto& vit_first = S.vit_first; auto& vit_last = S.vit_last; auto& vit_last_layer = S.vit_last_layer;
     const bool host_boundary = S.host_boundary;
     auto& in_w = S.in_w; auto& in_h = S.in_h;
     auto& out_w = S.out_w; auto& out_h = S.out_h;
@@ -5540,16 +5931,16 @@ int main(int argc, char** argv) try {
                                     s2.block, s2.layer, cap);
                     continue;
                 }
-                if (host_boundary && s2.block==38 && s2.layer==4) {
-                    const auto side=slurp(std::string(seed_dir)+"/b038l4_2d.bin");
+                if (host_boundary && s2.block==vit_last && s2.layer==vit_last_layer) {
+                    const auto side=slurp(std::string(seed_dir)+"/b"+(vit_last<100?"0":"")+(vit_last<10?"0":"")+std::to_string(vit_last)+"l"+std::to_string(vit_last_layer)+"_2d.bin");
                     const size_t M=size_t(s2.W)*s2.H,C=1024;
                     if(side.size()<M*C) { std::fprintf(stderr,"missing b38 repacked side tensor\n");return 1; }
                     std::vector<uint8_t> canon(M*C);
                     for(size_t t=0;t<M;++t)for(size_t c=0;c<C;++c)canon[t*C+c]=side[tin::byte_of(t,c,C)];
-                    put_slot(ups_key(38),canon,M,C);
+                    put_slot(ups_key(vit_last),canon,M,C);
                 }
                 if (host_boundary && (s2.type == "CCSplitSwin16HProjPool" ||
-                                      (s2.block == 31 && s2.layer == 0))) {
+                                      (s2.block == vit_first && s2.layer == 0))) {
                     char sidepath[256];
                     std::snprintf(sidepath, sizeof sidepath, "%s/b%03dl%d_o1.bin",
                                   seed_dir, s2.block, s2.layer);
@@ -5564,7 +5955,7 @@ int main(int argc, char** argv) try {
                     std::vector<uint8_t> canon(M*C);
                     for (size_t t=0; t<M; ++t)
                         for (size_t c=0; c<C; ++c) canon[t*C+c]=side[tin::byte_of(t,c,C)];
-                    put_slot(pool ? pool_key(s2.block) : lift_key(31), canon, M, C);
+                    put_slot(pool ? pool_key(s2.block) : lift_key(vit_first), canon, M, C);
                 }
                 // **`CCVit1DQKV` has three outputs, in three layouts.** Our own
                 // GEMM writes one 3C tensor, so seeding this slot means
@@ -6292,7 +6683,7 @@ int main(int argc, char** argv) try {
                 const size_t PH = ogrid ? size_t(s2.gy) * 8 : VH;
                 const size_t TW = size_t(tiles_of(int(VW))) * 4;
                 double sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
-                size_t n = 0, same2 = 0, tot = 0, near = 0;
+                size_t n = 0, same2 = 0, tot = 0, near_codes = 0;
                 for (size_t y = 0; y < std::min(PH, VH); ++y)
                     for (size_t x = 0; x < std::min(PW, VW); ++x) {
                         const size_t t = tin::token_of(x, y, TW);
@@ -6302,7 +6693,7 @@ int main(int argc, char** argv) try {
                             const uint8_t a = ours[t * C + c], b = ref[o];
                             ++tot;
                             if (a == b) ++same2;
-                            if (e4m3_codes_apart(a, b) <= 1) ++near;
+                            if (e4m3_codes_apart(a, b) <= 1) ++near_codes;
                             const double u = tin::e4m3_to_f(a), v = tin::e4m3_to_f(b);
                             if (u != u || v != v) continue;
                             sx += u; sy += v; sxx += u * u; syy += v * v; sxy += u * v; ++n;
@@ -6317,7 +6708,7 @@ int main(int argc, char** argv) try {
                 std::printf("%-6s %-26s %9zu %8.2f%%  r=%+.4f  u1 %5.2f%%  outview %zux%zu\n",
                             tag, s2.type.c_str(), tot,
                             100.0 * double(same2) / double(tot ? tot : 1), rr,
-                            100.0 * double(near) / double(tot ? tot : 1), VW, VH);
+                            100.0 * double(near_codes) / double(tot ? tot : 1), VW, VH);
             } else if (sh.fam == F_DS || pre_ds) {
                 // Compare every value the next inpview layer reads. Its PTX
                 // uses the logical extent for both row and channel-plane
@@ -6329,7 +6720,7 @@ int main(int argc, char** argv) try {
                 const size_t TW = size_t(tiles_of(int(VW))) * 4;
                 const size_t TH = size_t(tiles_of(int(VH))) * 4;
                 double sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
-                size_t n = 0, near = 0;
+                size_t n = 0, near_codes = 0;
                 for (size_t y = 0; y < TH; ++y)
                     for (size_t x = 0; x < TW; ++x) {
                         const size_t t = tin::token_of(x, y, TW);
@@ -6338,7 +6729,7 @@ int main(int argc, char** argv) try {
                             if (o >= ref.size() || t * C + c >= ours.size()) continue;
                             const uint8_t a = ours[t * C + c], b = ref[o];
                             if (a == b) ++same;
-                            if (e4m3_codes_apart(a, b) <= 1) ++near;
+                            if (e4m3_codes_apart(a, b) <= 1) ++near_codes;
                             const double u = tin::e4m3_to_f(a), v = tin::e4m3_to_f(b);
                             if (u != u || v != v) continue;
                             sx += u; sy += v; sxx += u * u; syy += v * v; sxy += u * v; ++n;
@@ -6354,7 +6745,7 @@ int main(int argc, char** argv) try {
                 std::snprintf(tag, sizeof tag, "b%03dl%d", s2.block, s2.layer);
                 std::printf("%-6s %-26s %9zu %8.2f%%  r=%+.4f  g=%.3f o=%+.4f  u1 %5.2f%%  consumer-view %zux%zu\n",
                             tag, s2.type.c_str(), n, 100.0 * double(same) / dn, rr, vgain, voffs,
-                            100.0 * double(near) / dn, VW, VH);
+                            100.0 * double(near_codes) / dn, VW, VH);
             } else {
                 // **Byte agreement is the wrong end-to-end metric and it took a
                 // while to see it.** Our accumulator is f32 where NVIDIA's is a
@@ -6366,7 +6757,7 @@ int main(int argc, char** argv) try {
                 // 3% bytes at 0.0 is a broken one, and the byte column cannot
                 // tell them apart.
                 double sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
-                size_t n = 0, zo = 0, zr = 0, near = 0;
+                size_t n = 0, zo = 0, zr = 0, near_codes = 0;
                 // **A pooled r cannot tell a wrong kernel from a partly wrong
                 // gold, and this project has now been fooled by that twice.**
                 // `CCVit1DFfnExpand` scored r=+0.2384 for weeks: 3072 of its
@@ -6385,7 +6776,7 @@ int main(int argc, char** argv) try {
                     for (size_t c = 0; c < C; ++c) {
                         const uint8_t a = ours[t * C + c], b = ref[tin::byte_of(t, c, C)];
                         if (a == b) ++same;
-                        if (e4m3_codes_apart(a, b) <= 1) ++near;
+                        if (e4m3_codes_apart(a, b) <= 1) ++near_codes;
                         if (!(a & 0x7F)) ++zo;
                         if (!(b & 0x7F)) ++zr;
                         const double u = tin::e4m3_to_f(a), v = tin::e4m3_to_f(b);
@@ -6426,7 +6817,7 @@ int main(int argc, char** argv) try {
                             "zero %2.0f%%/%2.0f%%  rms %.3g/%.3g  g=%.3f o=%+.4f\n",
                             tag, s2.type.c_str(),
                             M * C, 100.0 * double(same) / double(M * C), r,
-                            100.0 * double(near) / double(M * C),
+                            100.0 * double(near_codes) / double(M * C),
                             100.0 * double(cgood) / double(C),
                             100.0 * double(zo) / double(M * C),
                             100.0 * double(zr) / double(M * C),

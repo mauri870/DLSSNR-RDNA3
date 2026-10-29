@@ -1,0 +1,41 @@
+#version 460
+// NR Control's comparison of two frames, for any NR layer of any processing:
+// t0 = the frame before the compared layers (NR off), t1 = the same frame after them (NR on), u0 = the frame shown.
+// Both are in the frame's own values: pixels are picked or resampled, never decoded or encoded.
+//   CompareMode 1 side by side: each half shows the whole frame at its own proportions; CompareZoom 1 fits it (bars
+//                above and below), 2 fills the half (its sides cropped).
+//   CompareMode 2 wipe: the frame cut at CompareSplit (0..1 of the width).
+//   CompareSwap: NR on the left. A one-pixel divider between the halves.
+//   ApplyModel 0: the frame before (the layers ran, their answer is not shown).
+#extension GL_GOOGLE_include_directive : require
+#include "wilsjo2_common.glsl"
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(cb.Width) || p.y >= int(cb.Height)) return;
+    if (cb.ApplyModel == 0u) {
+        imageStore(u0, p, texelFetch(t0, p, 0));
+        return;
+    }
+    const vec2 uv = (vec2(p) + 0.5) / vec2(float(cb.Width), float(cb.Height));
+    bool off_side = false, divider = false, outside = false;
+    vec2 at = uv;
+    if (cb.CompareMode == 1u) {
+        off_side = (uv.x < 0.5) != (cb.CompareSwap != 0u);
+        // the half's own coordinates, centred: x across the half, y down the frame
+        const vec2 c = vec2(uv.x < 0.5 ? uv.x * 2.0 : uv.x * 2.0 - 1.0, uv.y) - 0.5;
+        // the whole frame in half the width keeps its shape at half the height: zoom 1 fits it, 2 fills the half
+        at = vec2(0.5 + c.x / cb.CompareZoom, 0.5 + c.y * 2.0 / cb.CompareZoom);
+        outside = at.x < 0.0 || at.x > 1.0 || at.y < 0.0 || at.y > 1.0;
+        divider = abs(uv.x - 0.5) < 1.0 / float(cb.Width);
+    } else if (cb.CompareMode == 2u) {
+        off_side = (uv.x < cb.CompareSplit) != (cb.CompareSwap != 0u);
+        divider = cb.CompareSplit > 0.0 && cb.CompareSplit < 1.0 && abs(uv.x - cb.CompareSplit) < 1.0 / float(cb.Width);
+    }
+    vec4 v;
+    if (divider) v = vec4(1.0);
+    else if (outside) v = vec4(0.0, 0.0, 0.0, 1.0);
+    else if (cb.CompareMode == 1u) v = off_side ? textureLod(t0, at, 0.0) : textureLod(t1, at, 0.0);
+    else v = off_side ? texelFetch(t0, p, 0) : texelFetch(t1, p, 0);
+    imageStore(u0, p, v);
+}

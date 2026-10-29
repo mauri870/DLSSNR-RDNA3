@@ -39,6 +39,13 @@ struct Settings {
     bool auto_mask = false;             // NRAutoMask
     // The stack: passes 2..4 with their own controls once "Same as pass 1" is off (NRPass2FollowPass1 ...).
     uint32_t passes = 1;                // NRPasses 1..4 (1..30 with NRUnlockPasses)
+    uint32_t passes_mode = 0;           // NRPassesMode: 0 legacy, 1 fast
+    uint32_t fast_method = 0;           // NRFastMethod: 0 Extrapolation, 1 Feedback, 2 Hybrid, 3 Edit strength
+    // Each method's own settings, [0] Extrapolation, [1] Feedback, [2] Hybrid (NRFast<Method>Passes / HaloLimit / Fine)
+    float fast_passes[3] = {3.0f, 3.0f, 3.0f};       // 1..8, referred to legacy pass counts
+    bool fast_halo_limit[3] = {false, false, false};
+    float fast_fine[3] = {0.0f, 1.0f, 1.0f};         // 0..2: the strengthening's fine-detail part, x (1: as made)
+    float fast_edit_strength = 2.0f;    // NRFastEditStrength 0..4: Edit strength's stops x (the look's Edit strength)
     bool unlock_passes = false;         // NRUnlockPasses: ours, as OptiScaler's UnlockPasses (passes 5.. take pass 4's)
     float pass_intensity[3] = {1.0f, 1.0f, 1.0f};
     bool pass_follow[3] = {true, true, true};
@@ -48,9 +55,15 @@ struct Settings {
     float pass_skin_structure[3] = {-1.0f, -1.0f, -1.0f};
     bool pass_auto_mask[3] = {false, false, false};
     // Where NR runs on the OptiScaler route (NRHookPoint): 0 after the upscaler, 1 before it (not with Ray
-    // Reconstruction). The ReShade routes are RenoDX's Present hook point.
-    uint32_t hook_point = 0;
+    // Reconstruction), 2 at the game's Present (the default).
+    // The ReShade routes are RenoDX's Present hook point.
+    uint32_t hook_point = 2;
     uint32_t present_guides = 0;        // NRPresentGuides: 0 optional, 1 required, 2 never (neutral guides)
+    // The .asi's Present layers under frame generation (RenoDX's NRPresentFrames / NRPresentFgSource): 0 NR on every
+    // present, the motion scaled by 1 / the presents a game frame; 1 on the first present after each game frame only.
+    // How that multiplier is found: 0 DLSSG.MultiFrameCount, else stable timing; 1 stable timing; 2 the old timing rule.
+    uint32_t present_frames = 0;
+    uint32_t present_fg_source = 0;
     uint32_t depth_mode = 0;            // NRDepthMode: 0 the game's flag, 1 normal, 2 inverted
     float mvec_scale_x = 1.0f, mvec_scale_y = 1.0f;   // NRMVecScaleX / Y: the motion vectors scaled
 
@@ -75,7 +88,7 @@ struct Settings {
     float norm_attack_stops = 4.0f;     // NRNormAttackStops
     float norm_release_stops = 0.5f;    // NRNormReleaseStops
     float norm_slew_stops = 0.02f;      // NRNormSlewStops
-    uint32_t detail_stability = 0;      // NRDetailStability: 0 auto, 1 off, 2 always
+    uint32_t detail_stability = 1;      // NRDetailStability: 0 auto, 1 off (default), 2 always
     float resolution_scale = 1.0f;      // NRResolutionScale: the network at 0.33..1 of the frame
     bool follow_input_res = false;      // NRFollowInputRes: the network at the game's render resolution
     uint32_t look_upsample = 0;         // NRLookUpsample: 0 auto, 1 edge-aware, 2 classic, 3 area input
@@ -105,6 +118,10 @@ struct Settings {
     float pass_transfer[3] = {1.0f, 1.0f, 1.0f};   // NRPass2Transfer .. NRPass4Transfer 0..1
     float pass_color[3] = {1.0f, 1.0f, 1.0f};      // NRPass2Color .. NRPass4Color 0..1
     bool chained_history = true;        // NRChainedHistory: passes 2+ keep their history (off: they restart every frame)
+    bool noise_every_frame = true;      // NRNoiseEveryFrame (ours): the network's noise seed moves every frame, as the
+                                        // DLL's; off: seed 0 every frame (Controls::seed_fixed)
+    uint32_t debug_view = 0;            // not a key: NR Control's [Inspect] DebugView for the layer it chose
+                                        // (renodx_debug.comp: 1 the network's input, 2 its answer, 3 its change x20)
     // NRSkinIndependent: with the Character mask on, Structure is sent at most 1 and a "stock" Skin as 1, so a
     // Structure change no longer moves faces (dlssnr.hpp SentSkinSteering). Applied to the network's controls.
     bool skin_independent = true;
@@ -114,6 +131,7 @@ struct Settings {
     uint32_t present_white_source = 0;  // NRPresentWhiteSource: 0 auto (a RenoDX mod's, else Windows'), 1 Windows'
 };
 inline uint32_t stack_passes(const Settings& s) {
+    if (s.passes_mode == 1u) return 1u;
     const uint32_t most = s.unlock_passes ? kMaxUnlockedPasses : 4u;
     return s.passes < 1u ? 1u : s.passes > most ? most : s.passes;
 }
@@ -144,6 +162,7 @@ struct StageConfig {
 };
 
 struct StageFrame {
+    bool fast_motion_available = true;   // A bound neutral texture is not a provider for temporal fast passes.
     ColourFrame colour;     // read
     ColourFrame output;     // written; may be the same image as `colour`
     bool reset = false;     // DLSSNR.Reset
@@ -175,6 +194,7 @@ class Stage {
 public:
     Stage(const HostDevice&, const StageConfig&);
     ~Stage();
+    bool recordings_done() const;
     Stage(const Stage&) = delete;
     Stage& operator=(const Stage&) = delete;
 
@@ -190,9 +210,34 @@ public:
     // ran the network (0: NR off, or every pass at zero strength - the frame copied through as it is).
     uint32_t record(VkCommandBuffer, const StageFrame&, const Network&);
 
+    // What the last record() decided about the frame, for the menus' engine-data panel.
+    struct Facts {
+        float fast_passes = 0.f;
+        bool motion = false, fast_fallback = false;
+        uint8_t hdr_mode = 0;        // 0 SDR, 1 linear HDR, 2 PQ
+        bool absolute = false;       // absolute units: the frame's own nits, no divisor
+        bool prep_exposure = false;  // [Preprocess]'s exposure replaced the divisor
+        int feed = -1;               // the divisor's feed: -1 none (SDR, absolute, Preprocess), 0 the content meter,
+                                     // 1 the game's exposure texture, 2 fixed 1
+        int exposure_texture = -1;   // -1 not looked at, 0 none, 1 readable, 2 not a format the feed reads
+        // The divisor the encode applied to the linear frame (the scale texel's .r, read back every 32nd frame a few
+        // frames late); 0 not known (SDR, absolute units, not read yet).
+        float divisor = 0.f;
+    };
+    Facts facts() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+// How a frame's values read, as the stage reads them (NRSourceEncoding, else the format and the game's HDR flag): for an
+// NR screenshot of a frame that is not the presented one. mode 0 display codes, 1 linear light, 2 PQ; unit_nits = the
+// nits of 1.0 for absolute linear units (NRLinearUnitNits), 0 for relative ones (no nits known).
+struct FrameUnits {
+    uint8_t mode = 0;
+    float unit_nits = 0.f;
+};
+FrameUnits frame_units(const Settings& s, VkFormat format, bool hdr_flag);
 
 }  // namespace nr::renodx

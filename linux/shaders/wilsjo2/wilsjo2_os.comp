@@ -1,0 +1,232 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// WorkingScale above 1: OptiScaler's output-scaling filters, as the fork instantiates them with NR's own
+// ScalingDownscaler - our own code for what they compute, in the order they compute it. t0 = the source (its extent
+// from the texture), u0 = the destination at the dispatch extent (Width x Height).
+//   mode 30  the bicubic upsampler (Keys, a = -0.5, weights at 16 phases; source texels outside the texture read 0, as
+//            the original's tile loads do), the proxy to the work extent for every ScalingDownscaler but FSR1
+//   mode 31  the downsampler of ScalingDownscaler (DebugView): 1 bicubic (Keys a = -0.6), 2 Catmull-Rom (a = -0.5, its
+//            source position offset 0.45), each as four bilinear taps clamped to their range; 3 / 4 Lanczos2 / 3 and
+//            5 / 6 Kaiser2 / 3 (beta 5 / 6), normalised separable taps at texel centres, clamped to the taps' range;
+//            7 MAGIC (the magic kernel, radius 1.5, by the original's 8 x 8 group tiles); alpha 1
+//   mode 32  ScalingDownscaler 0 ("FSR1") both ways: as the original runs it, a bilinear sample (see below)
+#include "wilsjo2_common.glsl"
+
+ivec2 source_size() { return textureSize(t0, 0); }
+
+// ---- mode 30 ------------------------------------------------------------------------------------------------------
+float keys_w1(float x, float a) {   // |x| < 1
+    precise float r = x * x * ((a + 2.0) * x - (a + 3.0)) + 1.0;
+    return r;
+}
+float keys_w2(float x, float a) {   // 1 <= |x| < 2
+    precise float r = a * (x * (x * (x - 5.0) + 8.0) - 4.0);
+    return r;
+}
+vec4 up_weights(float phase) {
+    const float d1 = (float(uint(phase * 16.0)) + 0.5) / 16.0;
+    return vec4(keys_w2(1.0 + d1, -0.5), keys_w1(d1, -0.5), keys_w1(1.0 - d1, -0.5), keys_w2(2.0 - d1, -0.5));
+}
+vec3 up_texel(ivec2 p, ivec2 size) {
+    return any(lessThan(p, ivec2(0))) || any(greaterThanEqual(p, size)) ? vec3(0.0) : texelFetch(t0, p, 0).rgb;
+}
+vec3 dot4(vec3 a, vec3 b, vec3 c, vec3 d, vec4 w) { return a * w.x + b * w.y + c * w.z + d * w.w; }
+vec3 bicubic_up(uvec2 p) {
+    const ivec2 size = source_size();
+    const vec2 rcp_scale = vec2(float(size.x) / float(cb.Width), float(size.y) / float(cb.Height));
+    const vec2 top_left = (vec2(p) + 0.5) * rcp_scale - 1.5;
+    const vec2 phase = top_left - floor(top_left);
+    const ivec2 t = ivec2(floor(top_left));
+    const vec4 xw = up_weights(phase.x), yw = up_weights(phase.y);
+    vec3 rows[4];
+    for (int j = 0; j < 4; ++j)
+        rows[j] = dot4(up_texel(t + ivec2(0, j), size), up_texel(t + ivec2(1, j), size), up_texel(t + ivec2(2, j), size),
+                       up_texel(t + ivec2(3, j), size), xw);
+    return dot4(rows[0], rows[1], rows[2], rows[3], yw);
+}
+
+// ---- mode 31 ------------------------------------------------------------------------------------------------------
+// In the operation order of the original's compiled shader (its compiler contracts to these fused multiply-adds; the
+// products here are rounded where its are): inside 1, (a + 2) x^3 - (a + 3) x^2 + 1; up to 2,
+// a x^3 - 5a x^2 + 8a x - 4a.
+float keys(float x, float a) {
+    x = abs(x);
+    const float x2 = x * x, x3 = x * x2;
+    if (x < 1.0) return fma(x3, a + 2.0, -(x2 * (a + 3.0))) + 1.0;
+    if (x < 2.0) return fma(x, 8.0 * a, fma(x3, a, -(x2 * (5.0 * a)))) + -4.0 * a;
+    return 0.0;
+}
+// four Keys taps as two bilinear pairs: their weights and offsets
+void keys_axis(float t, float a, out float w01, out float w23, out float o01, out float o23) {
+    const float w0 = keys(1.0 + t, a), w1 = keys(t, a), w2 = keys(1.0 - t, a), w3 = keys(2.0 - t, a);
+    w01 = w0 + w1;
+    w23 = w2 + w3;
+    const float i01 = w01 != 0.0 ? 1.0 / w01 : 0.0, i23 = w23 != 0.0 ? 1.0 / w23 : 0.0;
+    o01 = fma(w1, i01, -1.0);
+    o23 = fma(w3, i23, 1.0);
+}
+vec3 keys_down(uvec2 p, float a, float offset) {
+    const ivec2 size = source_size();
+    const vec2 dst = vec2(float(p.x) + 0.5, float(p.y) + 0.5);
+    const vec2 scale = vec2(float(size.x) / float(cb.Width), float(size.y) / float(cb.Height));
+    const vec2 pos = fma(dst, scale, vec2(-offset));
+    const vec2 ip = floor(pos), f = pos - ip, base = ip - 1.0;
+    float wx01, wx23, ox01, ox23, wy01, wy23, oy01, oy23;
+    keys_axis(f.x, a, wx01, wx23, ox01, ox23);
+    keys_axis(f.y, a, wy01, wy23, oy01, oy23);
+    const vec2 inv = 1.0 / vec2(float(size.x), float(size.y));
+    const vec3 s00 = textureLod(t0, (base + vec2(ox01, oy01) + 0.5) * inv, 0.0).rgb;
+    const vec3 s10 = textureLod(t0, (base + vec2(ox23, oy01) + 0.5) * inv, 0.0).rgb;
+    const vec3 s01 = textureLod(t0, (base + vec2(ox01, oy23) + 0.5) * inv, 0.0).rgb;
+    const vec3 s11 = textureLod(t0, (base + vec2(ox23, oy23) + 0.5) * inv, 0.0).rgb;
+    const vec3 c = fma(fma(s00, vec3(wx01), wx23 * s10), vec3(wy01), wy23 * fma(s01, vec3(wx01), wx23 * s11));
+    return clamp(c, min(min(s00, s10), min(s01, s11)), max(max(s00, s10), max(s01, s11)));
+}
+float sinc(float x) {
+    x *= 3.1415926535;
+    if (abs(x) < 1e-5) return 1.0;
+    return sin(x) / x;
+}
+float lanczos(float x, float a) { return abs(x) >= a ? 0.0 : sinc(x) * sinc(x / a); }
+float bessel_i0(float x) {
+    const float ax = abs(x);
+    if (ax < 3.75) {
+        const float t = x / 3.75, t2 = t * t;
+        return 1.0 + t2 * (3.5156229 + t2 * (3.0899424 + t2 * (1.2067492 + t2 * (0.2659732 + t2 * (0.0360768 + t2 * 0.0045813)))));
+    }
+    const float t = 3.75 / ax;
+    return (exp(ax) / sqrt(ax)) *
+           (0.39894228 + t * (0.01328592 + t * (0.00225319 + t * (-0.00157565 + t * (0.00916281 + t * (-0.02057706 +
+            t * (0.02635537 + t * (-0.01647633 + t * 0.00392377))))))));
+}
+float kaiser(float x, float a, float beta, float inv_i0_beta) {
+    const float ax = abs(x);
+    if (ax >= a) return 0.0;
+    const float r = ax / a;
+    return sinc(x) * (bessel_i0(beta * sqrt(saturate1(1.0 - r * r))) * inv_i0_beta);
+}
+// taps = 4 or 6; kind 0 Lanczos, 1 Kaiser
+vec3 windowed_down(uvec2 p, int taps, float a, int kind, float beta) {
+    const ivec2 size = source_size();
+    const vec2 dst = vec2(float(p.x) + 0.5, float(p.y) + 0.5);
+    const vec2 scale = vec2(float(size.x) / float(cb.Width), float(size.y) / float(cb.Height));
+    const vec2 pos = dst * scale - 0.5;
+    const vec2 ip = floor(pos), f = pos - ip;
+    const int back = taps / 2 - 1;
+    const ivec2 base = ivec2(ip) - ivec2(back);
+    const float inv_i0_beta = kind == 1 ? 1.0 / bessel_i0(beta) : 0.0;
+    float wx[6], wy[6];
+    float sx = 0.0, sy = 0.0;
+    for (int i = 0; i < taps; ++i) {
+        const float dx = float(i) - float(back) - f.x, dy = float(i) - float(back) - f.y;
+        wx[i] = kind == 0 ? lanczos(dx, a) : kaiser(dx, a, beta, inv_i0_beta);
+        sx += wx[i];
+        wy[i] = kind == 0 ? lanczos(dy, a) : kaiser(dy, a, beta, inv_i0_beta);
+        sy += wy[i];
+    }
+    const float ix = sx != 0.0 ? 1.0 / sx : 0.0, iy = sy != 0.0 ? 1.0 / sy : 0.0;
+    for (int i = 0; i < taps; ++i) {
+        wx[i] *= ix;
+        wy[i] *= iy;
+    }
+    const vec2 inv = 1.0 / vec2(float(size.x), float(size.y));
+    vec3 acc = vec3(0.0), lo = vec3(1e30), hi = vec3(-1e30);
+    for (int j = 0; j < taps; ++j) {
+        const int y = clamp(base.y + j, 0, size.y - 1);
+        const float wyj = wy[j];
+        for (int i = 0; i < taps; ++i) {
+            const int x = clamp(base.x + i, 0, size.x - 1);
+            const float w = wx[i] * wyj;
+            const vec3 s = textureLod(t0, vec2(float(x) + 0.5, float(y) + 0.5) * inv, 0.0).rgb;
+            lo = min(lo, s);
+            hi = max(hi, s);
+            acc += s * w;
+        }
+    }
+    return clamp(acc, lo, hi);
+}
+float magic(float x) {
+    if (abs(x) >= 1.5) return 0.0;
+    if (x <= -0.5) {
+        const float t = x + 1.5;
+        return 0.5 * t * t;
+    }
+    if (x < 0.5) return 0.75 - x * x;
+    const float t = x - 1.5;
+    return 0.5 * t * t;
+}
+const int kMagicTile = 32, kMagicTaps = 12;
+vec3 magic_down(uvec2 p) {
+    const ivec2 size = source_size();
+    const vec2 k = vec2(float(cb.Width) / float(size.x), float(cb.Height) / float(size.y));
+    // the 8 x 8 group's staged tile of the source (the original's LDS): its start and extent
+    const ivec2 out_base = ivec2(gl_WorkGroupID.xy * 8u);
+    const vec2 o_min = vec2(out_base) + 0.5, o_max = vec2(out_base + ivec2(7)) + 0.5;
+    const ivec2 g0 = ivec2(ceil((o_min - 1.5) / k - 0.5)), g1 = ivec2(floor((o_max + 1.5) / k - 0.5));
+    const ivec2 tile = clamp(g1 - g0 + 1, ivec2(1), ivec2(kMagicTile));
+    const ivec2 start = clamp(g0, ivec2(0), max(size - tile, ivec2(0)));
+    const vec2 o = vec2(p) + 0.5;
+    ivec2 lo = ivec2(ceil((o - 1.5) / k - 0.5)), hi = ivec2(floor((o + 1.5) / k - 0.5));
+    lo = clamp(lo, ivec2(0), size - 1);
+    hi = clamp(hi, ivec2(0), size - 1);
+    const ivec2 n = clamp(hi - lo + 1, ivec2(1), ivec2(kMagicTaps));
+    const float ub = k.x * (float(lo.x) + 0.5) - o.x, vb = k.y * (float(lo.y) + 0.5) - o.y;
+    float wx[12], wy[12];
+    float sx = 0.0, sy = 0.0;
+    for (int i = 0; i < kMagicTaps; ++i) {
+        wx[i] = i < n.x ? magic(ub + k.x * float(i)) : 0.0;
+        sx += i < n.x ? wx[i] : 0.0;
+        wy[i] = i < n.y ? magic(vb + k.y * float(i)) : 0.0;
+        sy += i < n.y ? wy[i] : 0.0;
+    }
+    const float ix = sx > 0.0 ? 1.0 / sx : 0.0, iy = sy > 0.0 ? 1.0 / sy : 0.0;
+    const ivec2 bl = clamp(lo - start, ivec2(0), tile - n);
+    vec3 acc = vec3(0.0);
+    for (int j = 0; j < n.y; ++j) {
+        const float wyj = wy[j] * iy;
+        const int ty = bl.y + j;
+        for (int i = 0; i < kMagicTaps; ++i) {
+            if (i >= n.x) continue;
+            const ivec2 src = clamp(start + ivec2(bl.x + i, ty), ivec2(0), size - 1);
+            acc += texelFetch(t0, src, 0).rgb * ((wx[i] * ix) * wyj);
+        }
+    }
+    return acc;
+}
+
+// ---- mode 32 ------------------------------------------------------------------------------------------------------
+// OptiScaler's "FSR1" output scaling runs its EASU only for 16 x 16 groups within a radius of a centre it never sets
+// (both zero): every group takes its other branch, a bilinear sample at the EASU constants' position. That is what this
+// mode computes, so the picture is the original's (the four words of FsrEasuCon in ExposureAnchors 0..15).
+vec3 fsr1_bilinear(uvec2 p) {
+    const vec2 c0xy = vec2(cb.ExposureAnchors[0], cb.ExposureAnchors[1]);
+    const vec2 c0zw = vec2(cb.ExposureAnchors[2], cb.ExposureAnchors[3]);
+    const vec2 c1xy = vec2(cb.ExposureAnchors[4], cb.ExposureAnchors[5]);
+    return textureLod(t0, c1xy * (vec2(p) * c0xy + c0zw + 0.5), 0.0).rgb;
+}
+
+void main() {
+    const uvec2 p = gl_GlobalInvocationID.xy;
+    if (cb.Mode == 31u && cb.DebugView == 7u) {   // MAGIC: every invocation of the group takes part in its tile maths
+        if (outside(p)) return;
+        imageStore(u0, ivec2(p), vec4(magic_down(p), 1.0));
+        return;
+    }
+    if (outside(p)) return;
+    vec3 c;
+    if (cb.Mode == 30u) {
+        c = bicubic_up(p);
+    } else if (cb.Mode == 32u) {
+        c = fsr1_bilinear(p);
+    } else {
+        switch (cb.DebugView) {
+            case 2u: c = keys_down(p, -0.5, 0.45); break;
+            case 3u: c = windowed_down(p, 4, 2.0, 0, 0.0); break;
+            case 4u: c = windowed_down(p, 6, 3.0, 0, 0.0); break;
+            case 5u: c = windowed_down(p, 4, 2.0, 1, 5.0); break;
+            case 6u: c = windowed_down(p, 6, 3.0, 1, 6.0); break;
+            default: c = keys_down(p, -0.6, 0.5); break;
+        }
+    }
+    imageStore(u0, ivec2(p), vec4(c, 1.0));
+}

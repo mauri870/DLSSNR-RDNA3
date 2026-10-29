@@ -7,6 +7,9 @@
 #   dlssnr-amd/shaders/runtime/       the passes around it
 #   dlssnr-amd/shaders/temporal/      the temporal variants and motion estimator
 #   dlssnr-amd/shaders/renodx/        the RenoDX-style option's shaders (RenoDX's own, MIT)
+#   dlssnr-amd/shaders/wilsjo2/       the wilsjo2 stage's (HUD FIX on the ReShade routes too; the .asi brings its own)
+#   dlssnr-amd/experimental/shaders/  CC_SMALL_FP8_EXPERIMENTAL's network and temporal variants (its weights are made
+#                                     at install, linux/build/experimental_weights.py)
 #
 #   assemble_product_data.sh <parent dir> [--model dlssnr.bin [--small-model dlssnr-small.bin]]
 set -euo pipefail
@@ -27,6 +30,19 @@ done
 cp -- "$NR_PRODUCT_SPV"/runtime/* "$dst/shaders/runtime/"
 cp -- "$NR_PRODUCT_SPV"/temporal/* "$dst/shaders/temporal/"
 bash linux/build/build_renodx.sh "$dst/shaders/renodx" > /dev/null   # the RenoDX-style option
+bash linux/build/build_wilsjo2.sh "$dst/shaders/wilsjo2" > /dev/null   # HUD FIX on every route
+# wilsjo2_classic.spv carries AMD FidelityFX Super Resolution 1 (MIT): its notice goes with it
+cp -- linux/shaders/passes/include/fsr1/LICENSE.txt "$dst/shaders/wilsjo2/FidelityFX-FSR1-LICENSE.txt"
+# The experimental network exists for RDNA4 only (no pipelines-experimental.json for RDNA3)
+if [[ -f "linux/shaders/$NR_GPU_ARCH/pipelines-experimental.json" ]]; then
+    xs="$dst/experimental/shaders"; mkdir -p -- "$xs/temporal"
+    python3 linux/build/build_network.py "$NR_GPU_ARCH" --experimental --out "$NR_PRODUCT_SPV-experimental" > /dev/null
+    cp -- "$NR_PRODUCT_SPV-experimental"/g_*.spv "$xs/"
+    for f in accumulation.txt swin-bias-storage.txt coherent-act.txt shader-constants.txt fixed-attention.txt; do
+        cp -- "$NR_PRODUCT_SPV-experimental/$f" "$xs/"
+    done
+    cp -- "$NR_PRODUCT_SPV-experimental"/temporal/* "$xs/temporal/"
+fi
 cp -- linux/shaders/renodx/LICENSE "$dst/shaders/renodx/RenoDX-LICENSE.txt"
 
 # The weights are NVIDIA's and are never part of this repository: --model takes a dlssnr.bin and

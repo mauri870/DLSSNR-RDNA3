@@ -1,0 +1,82 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Mode 11, automatic exposure: t0 = the 64 x 64 meter, u0 = the 1x1 exposure (32-bit float RGBA). One group
+// of 64 lanes: the frame's mean luminance from the tile means (each weighted by its pixel count), optionally with the
+// highlights compressed in log2, as a white point (r) for the encode and the resolve (ExposureMode 3).
+#include "wilsjo2_common.glsl"
+
+shared float sum_a[64], sum_b[64], sum_n[64];
+
+// Pairwise sums over the lanes, strides 32, 16, 8, 4, 2, 1 (as the meter); every lane reads the total.
+void reduce3(uint lane, inout float a, inout float b, inout float n) {
+    sum_a[lane] = a; sum_b[lane] = b; sum_n[lane] = n;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            sum_a[lane] += sum_a[lane + stride];
+            sum_b[lane] += sum_b[lane + stride];
+            sum_n[lane] += sum_n[lane + stride];
+        }
+        barrier();
+    }
+    a = sum_a[0]; b = sum_b[0]; n = sum_n[0];
+    barrier();
+}
+float reduce1(uint lane, float v) {
+    sum_a[lane] = v;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) sum_a[lane] += sum_a[lane + stride];
+        barrier();
+    }
+    return sum_a[0];
+}
+
+// The pixel count of tile (tx, ty) of the measured frame (at least one a side).
+float tile_pixels(uint tx, uint ty, uint w, uint h) {
+    const uint x0 = (tx * w) / 64u, x1 = ((tx + 1u) * w) / 64u;
+    const uint y0 = (ty * h) / 64u, y1 = ((ty + 1u) * h) / 64u;
+    return float(max(x1 - x0, 1u)) * float(max(y1 - y0, 1u));
+}
+
+float tile_mean(uint tx, uint ty) { return max(sanitize1(texelFetch(t0, ivec2(tx, ty), 0).r, 0.0), 0.0); }
+
+void main() {
+    const uint lane = gl_LocalInvocationID.y * 8u + gl_LocalInvocationID.x;
+    const float pe = finite1(cb.PreExposure) && cb.PreExposure > 1e-6 ? cb.PreExposure : 1.0;
+    const float prot = saturate1(cb.ExposureProtection * 0.01);
+    const uint src_w = max(cb.ExposureSourceWidth, 1u), src_h = max(cb.ExposureSourceHeight, 1u);
+    // Lane i takes tiles i, i + 64, ... (tile column i, rows in order).
+    float a = 0.0, b = 0.0, n = 0.0;
+    for (uint index = lane; index < 4096u; index += 64u) {
+        const uint tx = index % 64u, ty = index / 64u;
+        const float pixels = tile_pixels(tx, ty, src_w, src_h);
+        const float mean = tile_mean(tx, ty);
+        a += mean * pixels;
+        n += pixels;
+        if (prot > 0.0) b += clamp(log2(max(mean / pe, 1e-8)), -24.0, 24.0) * pixels;
+    }
+    reduce3(lane, a, b, n);
+    const float avg = n > 0.0 ? a / n : 0.0;
+    float metered = avg / pe;
+    // Highlight protection: log2 luminance above the log2 mean by more than the knee is compressed by the slope.
+    if (prot > 0.0 && n > 0.0) {
+        const float ref = b / n;
+        const float knee = lerp1(3.0, 1.0, prot);
+        const float slope = lerp1(1.0, 0.35, prot);
+        float s = 0.0;
+        for (uint index = lane; index < 4096u; index += 64u) {
+            const uint tx = index % 64u, ty = index / 64u;
+            const float pixels = tile_pixels(tx, ty, src_w, src_h);
+            const float log_l = clamp(log2(max(tile_mean(tx, ty) / pe, 1e-8)), -24.0, 24.0);
+            const float delta = log_l - ref;
+            const float comp = delta > knee ? ref + knee + (delta - knee) * slope : log_l;
+            s += exp2(clamp(comp, -24.0, 24.0)) * pixels;
+        }
+        const float protected_avg = reduce1(lane, s) / n;
+        if (finite1(protected_avg) && protected_avg > 1e-8) metered = protected_avg;
+    }
+    // 0.82 / 0.18 as one 32-bit constant (the same float whether divided in 32 or 64 bits).
+    const float white = pe * metered * 4.5555553;
+    if (lane == 0u) imageStore(u0, ivec2(0, 0), vec4(finite1(white) && white > 1e-8 ? white : 1.0, 0.0, 0.0, 1.0));
+}

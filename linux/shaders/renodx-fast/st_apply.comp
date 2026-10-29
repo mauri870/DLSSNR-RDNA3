@@ -1,0 +1,281 @@
+#version 460
+// Passes (fast): accepted Extrapolation / Feedback / Hybrid arithmetic, and Edit strength (mode 10).
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0, rgba16f) uniform image2D P;
+layout(set = 0, binding = 1) uniform texture2D Fine;
+layout(set = 0, binding = 2) uniform texture2D CA;
+layout(set = 0, binding = 3) uniform texture2D CB;
+layout(set = 0, binding = 4, rgba16f) uniform image2D N;
+layout(set = 0, binding = 5) uniform texture2D FineH;
+layout(set = 0, binding = 6, rgba32f) uniform writeonly image2D OutA;
+layout(set = 0, binding = 7, rgba32f) uniform writeonly image2D OutB;
+layout(push_constant) uniform Push { uvec2 size, low; float k; uint mode; float halo, chroma; uint satkeep; float fine, base, rho, lam, dcol, cfloor, ring, ccap, nohalo; uint restored; float ocap, darkcol; } pc;
+#include "st_math.glsl"
+// The answer's OKLab with its chroma and hue direction (per pixel; every at7 call of the pixel shares them).
+struct Ans { vec3 O; float co; vec2 uo; };
+Ans answer(vec3 O) { Ans a; a.O = O; a.co = length(O.yz); a.uo = a.co > 0.0 ? O.yz / a.co : vec2(0.0); return a; }
+vec3 at7(Ans a, float amp, vec2 dab, float f, float t) {
+    const vec3 O = a.O;
+    const float L = st_soft(O.x, (t - 1.0) * amp);
+    float g = pc.mode >= 7u ? pow(L / max(O.x, 1e-4), uintBitsToFloat(pc.satkeep)) : 1.0;
+    if (pc.mode >= 8u) g = min(g, 1.0);
+    float tc = t;
+    if (pc.ccap > 1.0) { const float e = (t - 1.0) / (pc.ccap - 1.0); tc = 1.0 + (t - 1.0) / pow(1.0 + e * e * e * e, 0.25); }
+    vec2 ab = (O.yz + (tc - 1.0) * f * dab) * g;
+    const float c = length(ab);
+    if (pc.rho > 0.0 && a.co > 0.005 && c > 1e-6) {
+        // the hue turned toward the answer's by rho of the angle between them (wrapped to [-pi, pi]): the unit vector
+        // rotated by rho times that angle
+        const vec2 u = ab / c;
+        const float d = atan(u.x * a.uo.y - u.y * a.uo.x, dot(u, a.uo)), r = pc.rho * d;
+        const float sr = sin(r), cr = cos(r);
+        ab = c * vec2(u.x * cr - u.y * sr, u.x * sr + u.y * cr);
+    }
+    return vec3(L, ab);
+}
+// The overlay of the answer (OKLab A) over x (OKLab X): its strength k, or the largest in [1, k] that stays in gamut.
+// Hybrid's two overlays out of gamut at strength k: the search for that strength is done by the whole workgroup from a
+// queue in shared memory (a wave would otherwise run its twelve steps for the few pixels that need them; 4K: ~9 % of
+// the pixels, ~45 % of the waves); a full queue leaves a pixel its own search.
+const uint kQueue = 128u, kInline = 0xffffffffu, kDone = 0xfffffffeu;
+shared vec4 s_qa[kQueue], s_qb[kQueue];   // the answer's OKLab and amp, its hue direction and dab; then the result
+shared vec2 s_qc[kQueue];                 // f, the answer's chroma
+shared uint s_qn;
+struct Ov { vec2 dab; float f, amp; vec3 l; uint slot; };
+Ov ov_begin(vec3 X, Ans A, float amp_in) {
+    Ov v;
+    const vec3 O = A.O;
+    v.dab = O.yz - X.yz;
+    const float rel = length(v.dab) / (length(X.yz) + 0.01) / pc.chroma;
+    const float fl = pc.cfloor * smoothstep(0.4, 0.65, O.x);
+    v.f = fl + (1.0 - fl) / (1.0 + rel * rel);
+    v.amp = amp_in > -1e8 ? amp_in : O.x - X.x;
+    v.l = st_lin(at7(A, v.amp, v.dab, v.f, pc.k));
+    v.slot = kDone;
+    if (!st_in(v.l)) {
+        v.slot = atomicAdd(s_qn, 1u);
+        if (v.slot < kQueue) { s_qa[v.slot] = vec4(O, v.amp); s_qb[v.slot] = vec4(A.uo, v.dab); s_qc[v.slot] = vec2(v.f, A.co); }
+        else v.slot = kInline;
+    }
+    return v;
+}
+vec3 ov_search(Ans A, float amp, vec2 dab, float f) {
+    float lo = 1.0, hi = pc.k;
+    for (int i = 0; i < 12; ++i) { const float m = 0.5 * (lo + hi); if (st_in(st_lin(at7(A, amp, dab, f, m)))) lo = m; else hi = m; }
+    return st_lin(at7(A, amp, dab, f, lo));
+}
+// The queue's searches, by every thread of the workgroup (uniform control flow: called by all).
+void ov_drain() {
+    barrier();
+    const uint n = min(s_qn, kQueue);
+    for (uint i = gl_LocalInvocationIndex; i < n; i += 256u) {
+        const vec4 a = s_qa[i], b = s_qb[i]; const vec2 c = s_qc[i];
+        Ans A; A.O = a.xyz; A.co = c.y; A.uo = b.xy;
+        s_qa[i].xyz = ov_search(A, a.w, b.zw, c.x);
+    }
+    barrier();
+}
+vec3 ov_end(Ov v, Ans A, vec3 o) {
+    vec3 l = v.l;
+    if (v.slot == kInline) l = ov_search(A, v.amp, v.dab, v.f);
+    else if (v.slot != kDone) l = s_qa[v.slot].xyz;
+    return st_in(l) ? st_enc(l) : o;
+}
+vec3 st_dadd(vec3 n, vec3 Ln, vec3 add) {
+    if (pc.darkcol > 0.0) {
+        const vec3 N0 = Ln, Y0 = st_lab(clamp(n + add, 0.0, 1.0));
+        const float cs = (pc.dcol >= 1.0 ? 1.0 : max(pc.dcol, 0.0)) * smoothstep(0.0, pc.darkcol, N0.x);
+        return st_enc(st_lin(vec3(Y0.x, N0.yz + cs * (Y0.yz - N0.yz)))) - n;
+    }
+    if (pc.dcol >= 1.0) return add;
+    const vec3 N = Ln, Y = st_lab(clamp(n + add, 0.0, 1.0));
+    if (pc.dcol < 0.0) {
+        const vec2 ab = N.yz * (Y.x / max(N.x, 1e-3)) - pc.dcol * (Y.yz - N.yz);
+        return st_enc(st_lin(vec3(Y.x, ab))) - n;
+    }
+    return st_enc(st_lin(vec3(Y.x, N.yz + pc.dcol * (Y.yz - N.yz)))) - n;
+}
+float st_fit(vec3 base, vec3 add) {
+    float s = 1.0;
+    for (int c = 0; c < 3; ++c) {
+        if (add[c] > 1e-7) s = min(s, max(1.0 - base[c], 0.0) / add[c]);
+        else if (add[c] < -1e-7) s = min(s, max(base[c], 0.0) / -add[c]);
+    }
+    return s;
+}
+vec3 st_nohalo(vec3 o, vec3 alt) {
+    if (pc.nohalo > 1.5) return st_lab(o).x > st_lab(alt).x ? alt : o;
+    return mix(o, alt, clamp(pc.nohalo, 0.0, 1.0));
+}
+vec3 st_fb_ring(vec3 o, vec3 Ln, ivec2 px) {
+    float r0 = 1e9;
+    for (int y = -1; y <= 1; ++y)
+        for (int x = -1; x <= 1; ++x)
+            r0 = min(r0, texelFetch(FineH, clamp(px + ivec2(x, y), ivec2(0), ivec2(pc.size) - 1), 0).g);
+    const vec3 O = st_lab(o);
+    const float floor_l = min(Ln.x, r0);
+    if (O.x >= floor_l) return o;
+    const vec3 l = st_lin(vec3(floor_l, O.yz));
+    return st_in(l) ? st_enc(l) : o;
+}
+// The edit's chroma change against the pixel's own (without the feedback) held in.
+vec3 ocap_tail(uvec2 px, vec3 p, vec3 o) {
+    if (pc.ocap != 0.0 && (pc.mode == 6u || pc.mode == 8u)) {
+        const vec3 own = p - texelFetch(Fine, ivec2(px), 0).rgb;
+        const vec3 Xo = st_lab(own), Y = st_lab(o);
+        const vec2 dab = Y.yz - Xo.yz;
+        const float c0 = length(Xo.yz);
+        const vec2 u0 = c0 > 1e-4 ? Xo.yz / c0 : vec2(0.0);
+        const vec2 desat = pc.ocap < 0.0 ? min(dot(dab, u0), 0.0) * u0 : vec2(0.0);
+        const vec2 rest = dab - desat;
+        const float lim = abs(pc.ocap) * (c0 + 0.01), m = length(rest);
+        if (m > 1e-6) {
+            const float e = m / lim, mo = m / pow(1.0 + e * e * e * e, 0.25);
+            const vec3 l = st_lin(vec3(Y.x, Xo.yz + desat + rest * (mo / m)));
+            if (st_in(l)) o = st_enc(l);
+        }
+    }
+    return o;
+}
+// Hybrid up to its overlays' searches (state for hybrid_end in g_*).
+vec3 g_ofb; vec4 g_fa; Ov g_v1, g_v2;
+void hybrid_begin(uvec2 px, vec4 n, vec3 p, Ans A) {
+    const vec3 X = st_lab(p);
+    float mI, vI;
+    const vec4 fa = texelFetch(Fine, ivec2(px), 0);
+    const vec3 q = st_gfq(CA, CB, vec2(px) + 0.5, X.x, pc.low, mI, vI);
+    const vec3 pp = p - fa.rgb, Xp = st_lab(pp);
+    vec3 ofb;
+    {
+        const vec3 add = st_dadd(n.rgb, A.O, pc.halo * ((n.rgb - p) - q));
+        ofb = n.rgb + st_fit(n.rgb, add) * add;
+        g_v1 = ov_begin(Xp, A, -1e9);
+    }
+    if (pc.nohalo > 0.0) {
+        const float F = texelFetch(FineH, ivec2(px), 0).r, fF = pc.halo * F;
+        ofb = st_nohalo(ofb, fF != 0.0 ? st_relight(A.O, A.O.x, fF) : n.rgb);
+        if (pc.ring > 0.0) ofb = st_fb_ring(ofb, A.O, ivec2(px));
+        const float Bl = st_lab(clamp(pp + q, 0.0, 1.0)).x - Xp.x;
+        g_v2 = ov_begin(Xp, A, Bl + pc.fine * F);   // pc.fine: Fine detail (1 as made)
+    }
+    g_ofb = ofb; g_fa = fa;
+}
+vec3 hybrid_end(uvec2 px, vec4 n, vec3 p, Ans A) {
+    vec3 oov = ov_end(g_v1, A, n.rgb);
+    if (pc.nohalo > 0.0) oov = st_nohalo(oov, ov_end(g_v2, A, n.rgb));
+    return ocap_tail(px, p, mix(oov, g_ofb, clamp(g_fa.a, 0.0, 1.0)));
+}
+// What an RGBA16F store keeps of x (RDNA4: rounded toward zero, half denormals kept).
+float st_h(float x) {
+    return abs(x) >= 6.103515625e-05 ? uintBitsToFloat(floatBitsToUint(x) & 0xffffe000u) : trunc(x * 16777216.0) * 5.9604644775390625e-08;
+}
+vec3 st_h(vec3 x) { return vec3(st_h(x.r), st_h(x.g), st_h(x.b)); }
+shared vec4 s_iv[16][16];
+// N strengthened; with `restored` (Feedback / Hybrid) P given back (the feedback, kept in Fine, taken out) and the
+// guided filter's 4 x 4 cell means of the given-back P and the new N (the next frame's feedback) into OutA / OutB.
+vec3 strengthened(uvec2 px, vec4 n, vec3 p) {
+    const vec3 X = st_lab(p);
+    const Ans A = answer(st_lab(n.rgb));
+    float mI, vI;
+    vec3 o = n.rgb;
+    if (pc.mode == 9u) {   // (Hybrid: hybrid_begin / hybrid_end)
+        const vec3 O = A.O;
+        const float dL = O.x - X.x;
+        const float B = st_gfq(CA, CB, vec2(px) + 0.5, X.x, pc.low, mI, vI).r;
+        const float F = texelFetch(FineH, ivec2(px), 0).r;
+        const float amp = pc.base * B + pc.fine * F + (pc.nohalo > 0.5 ? 0.0 : pc.halo) * (dL - B - F);
+        const vec2 dab = O.yz - X.yz;
+        const float rel = length(dab) / (length(X.yz) + 0.01) / pc.chroma;
+        const float fl = pc.cfloor * smoothstep(0.4, 0.65, O.x);
+        const float f = fl + (1.0 - fl) / (1.0 + rel * rel);
+        float tt = pc.k;
+        vec3 lab = at7(A, amp, dab, f, pc.k), l = st_lin(lab);
+        if (!st_in(l)) {
+            float lo = 1.0, hi = pc.k;
+            for (int i = 0; i < 12; ++i) { const float m = 0.5 * (lo + hi); if (st_in(st_lin(at7(A, amp, dab, f, m)))) lo = m; else hi = m; }
+            tt = lo; lab = at7(A, amp, dab, f, lo); l = st_lin(lab);
+        }
+        if (pc.ring > 0.0 && pc.fine != 1.0) {
+            float r0 = 1e9, r1 = -1e9;
+            for (int y = -1; y <= 1; ++y)
+                for (int x = -1; x <= 1; ++x) {
+                    const float v = texelFetch(FineH, clamp(ivec2(px) + ivec2(x, y), ivec2(0), ivec2(pc.size) - 1), 0).g;
+                    r0 = min(r0, v); r1 = max(r1, v);
+                }
+            const float lnf = st_soft(O.x, (tt - 1.0) * (amp - (pc.fine - 1.0) * F));
+            lab.x = pc.ring > 1.5 ? max(lab.x, min(lnf, r0)) : clamp(lab.x, min(lnf, r0), max(lnf, r1));
+            const vec3 l2 = st_lin(lab);
+            if (st_in(l2)) l = l2;
+        }
+        if (st_in(l)) o = st_enc(l);
+    } else if (pc.mode == 6u) {
+        const vec3 add = st_dadd(n.rgb, A.O, pc.k * ((n.rgb - p) - st_gfq(CA, CB, vec2(px) + 0.5, X.x, pc.low, mI, vI)));
+        o = n.rgb + st_fit(n.rgb, add) * add;
+        if (pc.nohalo > 0.0) {
+            const float fF = pc.k * texelFetch(FineH, ivec2(px), 0).r;
+            o = st_nohalo(o, fF != 0.0 ? st_relight(A.O, A.O.x, fF) : n.rgb);
+        }
+        if (pc.nohalo > 0.0 && pc.ring > 0.0) o = st_fb_ring(o, A.O, ivec2(px));
+    }
+    return ocap_tail(px, p, o);
+}
+// Edit strength (mode 10): RenoDX's "Adjust NR's look" at Edit strength k with every other look setting at its default
+// (linux/shaders/renodx/look_common.hlsli ShapeEdit: e' = k e; look_compose: N' = n 2^(t (e' - e)), t the proxy's floor
+// trust): each channel's edit in stops scaled by k. No band split, no motion vectors, no history.
+vec3 st_edit(vec3 nE, vec3 pE) {
+    const vec3 p = st_dec(clamp(pE, 0.0, 1.0)), n = st_dec(clamp(nE, 0.0, 1.0));
+    const vec3 e = log2(max(n, vec3(1.0 / 1024.0))) - log2(max(p, vec3(1.0 / 1024.0)));
+    const float t = smoothstep(1.0 / 1024.0, 1.0 / 64.0, max(p.x, max(p.y, p.z)));
+    return st_enc(n * exp2(t * (pc.k - 1.0) * e));
+}
+void main() {
+    const uvec2 px = gl_GlobalInvocationID.xy;
+    const bool inside = all(lessThan(px, pc.size));
+    const bool hybrid = pc.mode == 8u;
+    if (hybrid) {
+        if (gl_LocalInvocationIndex == 0u) s_qn = 0u;
+        barrier();
+    }
+    vec4 n = vec4(0.0), p = vec4(0.0);
+    vec3 o = vec3(0.0);
+    Ans ans;
+    if (inside) {
+        n = imageLoad(N, ivec2(px));
+        p = imageLoad(P, ivec2(px));
+        if (hybrid) {
+            ans = answer(st_lab(n.rgb));
+            hybrid_begin(px, n, p.rgb, ans);
+        } else o = pc.mode == 10u ? st_edit(n.rgb, p.rgb) : strengthened(px, n, p.rgb);
+    }
+    if (hybrid) {
+        ov_drain();
+        if (inside) o = hybrid_end(px, n, p.rgb, ans);
+    }
+    if (inside) {
+        imageStore(N, ivec2(px), vec4(o, n.a));
+        if (pc.restored != 0u) {
+            const vec3 back = p.rgb - texelFetch(Fine, ivec2(px), 0).rgb;
+            imageStore(P, ivec2(px), vec4(back, p.a));
+            const vec3 pk = st_h(back);
+            s_iv[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = vec4(st_lab(pk).x, st_h(o) - pk);
+        }
+    }
+    if (pc.restored == 0u) return;
+    barrier();
+    const uvec2 lid = gl_LocalInvocationID.xy;
+    if (lid.x >= 4u || lid.y >= 4u) return;
+    const uvec2 q = gl_WorkGroupID.xy * 4u + lid;
+    if (any(greaterThanEqual(q, pc.low))) return;
+    vec4 A = vec4(0.0), B = vec4(0.0); float c = 0.0;
+    for (uint y = 0u; y < 4u; ++y)
+        for (uint x = 0u; x < 4u; ++x) {
+            const uvec2 t = q * 4u + uvec2(x, y);
+            if (any(greaterThanEqual(t, pc.size))) continue;
+            const vec4 iv = s_iv[t.y - gl_WorkGroupID.y * 16u][t.x - gl_WorkGroupID.x * 16u];
+            const float I = iv.x; const vec3 v = iv.yzw;
+            A += vec4(I, I * I, v.r, v.g); B += vec4(v.b, I * v); c += 1.0;
+        }
+    imageStore(OutA, ivec2(q), A / max(c, 1.0)); imageStore(OutB, ivec2(q), B / max(c, 1.0));
+}
