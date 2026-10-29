@@ -1090,6 +1090,7 @@ struct Kernel {
         pli.pushConstantRangeCount = push_bytes ? 1 : 0; pli.pPushConstantRanges = &pcr;
         NRVK_CHECK(vkCreatePipelineLayout(device, &pli, nullptr, &out.layout));
 
+        const std::vector<uint32_t> code = read_spirv(spirv_path);
         VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         smi.codeSize = code.size() * 4; smi.pCode = code.data();
         NRVK_CHECK(vkCreateShaderModule(device, &smi, nullptr, &out.module));

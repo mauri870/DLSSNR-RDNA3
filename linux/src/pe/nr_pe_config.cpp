@@ -352,7 +352,7 @@ bool parse(const std::string& path, Config& c, bool& legacy) {
         if (name == "renodx") { parse_renodx_key(c.renodx, key, value); continue; }
         if (name == "reuse") {
             if (key == "every") c.controls.reuse_every = std::clamp(std::atoi(value.c_str()), 0, 8);
-            else if (key == "gate") c.controls.reuse_gate = number(value, 1, 400);
+            else if (key == "gate") c.controls.reuse_gate = number(value, 1, 400, c.controls.reuse_gate);
             continue;
         }
         if (name == "log") {
@@ -438,7 +438,7 @@ bool parse_preprocess_file(const std::string& path, PreprocessConfig& p) {
         if (name == "preprocess") parse_preprocess_key(p, key, value);
         else if (name == "reuse") {
             if (key == "every") p.reuse_every = std::clamp(std::atoi(value.c_str()), 0, 8);
-            else if (key == "gate") p.reuse_gate = number(value, 1, 400);
+            else if (key == "gate") p.reuse_gate = number(value, 1, 400, p.reuse_gate);
         }
     }
     std::fclose(file);
